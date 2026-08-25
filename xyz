@@ -47,8 +47,9 @@ WHERE c.column_name IS NULL
 ORDER BY 1, 3, 4;
 
 
+=================================================================
 
-2 - SELECT 'Q5_ONLY_IN_CURRENT' AS comparison, COUNT(*) AS row_count
+SELECT 'Q5_ONLY_IN_CURRENT' AS comparison, COUNT(*) AS row_count
 FROM (
     SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST
     MINUS
