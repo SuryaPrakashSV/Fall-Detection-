@@ -82,3 +82,45 @@ FROM (
     MINUS
     SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST
 );
+
+
+=================================================================
+
+
+WITH current_keys AS (
+    SELECT DISTINCT
+        RECORD_TYPE,
+        GRANULARITY_LEVEL,
+        FISCYEAR,
+        FISCMONTH,
+        EMPLOYEE_ROLE,
+        EMPLOYEE_TYPE,
+        GEO,
+        PROJECT_TYPE
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST
+),
+new_keys AS (
+    SELECT DISTINCT
+        RECORD_TYPE,
+        GRANULARITY_LEVEL,
+        FISCYEAR,
+        FISCMONTH,
+        EMPLOYEE_ROLE,
+        EMPLOYEE_TYPE,
+        GEO,
+        PROJECT_TYPE
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW
+)
+SELECT 'KEYS_ONLY_IN_CURRENT' AS comparison, COUNT(*) AS row_count
+FROM (
+    SELECT * FROM current_keys
+    MINUS
+    SELECT * FROM new_keys
+)
+UNION ALL
+SELECT 'KEYS_ONLY_IN_NEW', COUNT(*)
+FROM (
+    SELECT * FROM new_keys
+    MINUS
+    SELECT * FROM current_keys
+);
