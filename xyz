@@ -251,436 +251,75 @@ SELECT
 FROM scored
 ORDER BY query_name;
 ===============================================================
-1 - WITH table_pairs AS (
-    SELECT 'QUERY_5' AS query_name,
-           'DEMAND_FORECAST' AS current_table,
-           'DEMAND_FORECAST_NEW' AS new_table
-    UNION ALL
-    SELECT 'QUERY_6',
-           'SUPPLY_FORECAST',
-           'SUPPLY_FORECAST_NEW'
-),
-current_columns AS (
-    SELECT
-        p.query_name,
-        c.column_name,
-        c.ordinal_position,
-        c.data_type
-    FROM table_pairs p
-    JOIN GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS c
-      ON c.table_schema = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-     AND c.table_name = p.current_table
-),
-new_columns AS (
-    SELECT
-        p.query_name,
-        c.column_name,
-        c.ordinal_position,
-        c.data_type
-    FROM table_pairs p
-    JOIN GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS c
-      ON c.table_schema = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-     AND c.table_name = p.new_table
-)
-SELECT
-    COALESCE(c.query_name, n.query_name) AS query_name,
-    COALESCE(c.column_name, n.column_name) AS column_name,
-    c.ordinal_position AS current_position,
-    n.ordinal_position AS new_position,
-    c.data_type AS current_type,
-    n.data_type AS new_type
-FROM current_columns c
-FULL OUTER JOIN new_columns n
-  ON c.query_name = n.query_name
- AND c.column_name = n.column_name
-WHERE c.column_name IS NULL
-   OR n.column_name IS NULL
-   OR c.ordinal_position <> n.ordinal_position
-   OR c.data_type <> n.data_type
-ORDER BY 1, 3, 4;
 
-
-=================================================================
-
-SELECT 'Q5_ONLY_IN_CURRENT' AS comparison, COUNT(*) AS row_count
-FROM (
-    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST
-    MINUS
-    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW
-)
-
-UNION ALL
-
-SELECT 'Q5_ONLY_IN_NEW', COUNT(*)
-FROM (
-    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW
-    MINUS
-    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST
-)
-
-UNION ALL
-
-SELECT 'Q6_ONLY_IN_CURRENT', COUNT(*)
-FROM (
-    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST
-    MINUS
-    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST_NEW
-)
-
-UNION ALL
-
-SELECT 'Q6_ONLY_IN_NEW', COUNT(*)
-FROM (
-    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST_NEW
-    MINUS
-    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST
-);
-
-
-=================================================================
-
-
-WITH current_keys AS (
+WITH CURRENT_KEYS AS (
     SELECT DISTINCT
-        RECORD_TYPE,
         GRANULARITY_LEVEL,
-        FISCYEAR,
-        FISCMONTH,
+        GEO,
         EMPLOYEE_ROLE,
         EMPLOYEE_TYPE,
-        GEO,
-        PROJECT_TYPE
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST
-),
-new_keys AS (
-    SELECT DISTINCT
-        RECORD_TYPE,
-        GRANULARITY_LEVEL,
+        PROJECT_TYPE,
         FISCYEAR,
         FISCMONTH,
+        STD_FISCAL_PERIOD_NAME,
+        PERIOD_DISPLAY_NAME
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST
+),
+
+NEW_KEYS AS (
+    SELECT DISTINCT
+        GRANULARITY_LEVEL,
+        GEO,
         EMPLOYEE_ROLE,
         EMPLOYEE_TYPE,
-        GEO,
-        PROJECT_TYPE
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW
+        PROJECT_TYPE,
+        FISCYEAR,
+        FISCMONTH,
+        STD_FISCAL_PERIOD_NAME,
+        PERIOD_DISPLAY_NAME
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST_NEW
 )
-SELECT 'KEYS_ONLY_IN_CURRENT' AS comparison, COUNT(*) AS row_count
+
+SELECT
+    'CURRENT_KEY_ONLY' AS DIFFERENCE_SOURCE,
+    C.*
 FROM (
-    SELECT * FROM current_keys
+    SELECT * FROM CURRENT_KEYS
     MINUS
-    SELECT * FROM new_keys
-)
+    SELECT * FROM NEW_KEYS
+) C
+
 UNION ALL
-SELECT 'KEYS_ONLY_IN_NEW', COUNT(*)
+
+SELECT
+    'NEW_KEY_ONLY' AS DIFFERENCE_SOURCE,
+    N.*
 FROM (
-    SELECT * FROM new_keys
+    SELECT * FROM NEW_KEYS
     MINUS
-    SELECT * FROM current_keys
-);
-
-=================================================================
-WITH current_keys AS (
-    SELECT DISTINCT
-        RECORD_TYPE, GRANULARITY_LEVEL, FISCYEAR, FISCMONTH,
-        EMPLOYEE_ROLE, EMPLOYEE_TYPE, GEO, PROJECT_TYPE
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST
-),
-new_keys AS (
-    SELECT DISTINCT
-        RECORD_TYPE, GRANULARITY_LEVEL, FISCYEAR, FISCMONTH,
-        EMPLOYEE_ROLE, EMPLOYEE_TYPE, GEO, PROJECT_TYPE
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW
-)
-SELECT 'ONLY_IN_CURRENT' AS comparison, *
-FROM (
-    SELECT * FROM current_keys
-    MINUS
-    SELECT * FROM new_keys
-)
-UNION ALL
-SELECT 'ONLY_IN_NEW', *
-FROM (
-    SELECT * FROM new_keys
-    MINUS
-    SELECT * FROM current_keys
-)
-ORDER BY comparison, FISCYEAR, FISCMONTH;
-
-=================================================================
-
-
-WITH current_keys AS (
-    SELECT DISTINCT
-        RECORD_TYPE,
-        GRANULARITY_LEVEL,
-        FISCYEAR,
-        FISCMONTH,
-        EMPLOYEE_ROLE,
-        EMPLOYEE_TYPE,
-        GEO,
-        PROJECT_TYPE
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST
-),
-new_keys AS (
-    SELECT DISTINCT
-        RECORD_TYPE,
-        GRANULARITY_LEVEL,
-        FISCYEAR,
-        FISCMONTH,
-        EMPLOYEE_ROLE,
-        EMPLOYEE_TYPE,
-        GEO,
-        PROJECT_TYPE
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW
-),
-diff AS (
-    SELECT 'ONLY_IN_CURRENT' AS comparison, *
-    FROM (
-        SELECT * FROM current_keys
-        MINUS
-        SELECT * FROM new_keys
-    )
-
-    UNION ALL
-
-    SELECT 'ONLY_IN_NEW' AS comparison, *
-    FROM (
-        SELECT * FROM new_keys
-        MINUS
-        SELECT * FROM current_keys
-    )
-)
-SELECT
-    comparison,
-    COUNT(*) AS total_keys,
-    COUNT_IF(PROJECT_TYPE IS NULL) AS null_project_type_keys,
-    COUNT_IF(PROJECT_TYPE IS NOT NULL) AS populated_project_type_keys
-FROM diff
-GROUP BY comparison
-ORDER BY comparison;
-
-=================================================================
-
-
-WITH current_keys AS (
-    SELECT DISTINCT
-        RECORD_TYPE, GRANULARITY_LEVEL, FISCYEAR, FISCMONTH,
-        EMPLOYEE_ROLE, EMPLOYEE_TYPE, GEO, PROJECT_TYPE
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST
-),
-new_keys AS (
-    SELECT DISTINCT
-        RECORD_TYPE, GRANULARITY_LEVEL, FISCYEAR, FISCMONTH,
-        EMPLOYEE_ROLE, EMPLOYEE_TYPE, GEO, PROJECT_TYPE
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW
-),
-diff AS (
-    SELECT 'ONLY_IN_CURRENT' AS comparison, *
-    FROM (SELECT * FROM current_keys MINUS SELECT * FROM new_keys)
-
-    UNION ALL
-
-    SELECT 'ONLY_IN_NEW' AS comparison, *
-    FROM (SELECT * FROM new_keys MINUS SELECT * FROM current_keys)
-)
-SELECT
-    comparison,
-    PROJECT_TYPE,
-    COUNT(*) AS key_count
-FROM diff
-GROUP BY comparison, PROJECT_TYPE
-ORDER BY comparison, key_count DESC;
-
-=====================================================================
-
-WITH counts AS (
-
-    SELECT
-        'QUERY_1' AS query_name,
-        'OWNER_PROJECT_WEEKLY_AGG' AS current_table,
-        'OWNER_PROJECT_WEEKLY_AGG_NEW' AS new_table,
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.OWNER_PROJECT_WEEKLY_AGG) AS current_count,
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.OWNER_PROJECT_WEEKLY_AGG_NEW) AS new_count
-
-    UNION ALL
-
-    SELECT
-        'QUERY_2',
-        'WRIKE_OOO_OWNER',
-        'WRIKE_OOO_OWNER_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_OOO_OWNER),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_OOO_OWNER_NEW)
-
-    UNION ALL
-
-    SELECT
-        'QUERY_3',
-        'RAINBOW_OWNER_BYHOURS_FINAL',
-        'RAINBOW_OWNER_BYHOURS_FINAL_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.RAINBOW_OWNER_BYHOURS_FINAL),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.RAINBOW_OWNER_BYHOURS_FINAL_NEW)
-
-    UNION ALL
-
-    SELECT
-        'QUERY_4',
-        'WRIKE_PROJECT_ASSIGNEE_DETAIL',
-        'WRIKE_PROJECT_ASSIGNEE_DETAIL_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_PROJECT_ASSIGNEE_DETAIL),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_PROJECT_ASSIGNEE_DETAIL_NEW)
-
-    UNION ALL
-
-    SELECT
-        'QUERY_5',
-        'DEMAND_FORECAST',
-        'DEMAND_FORECAST_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW)
-
-    UNION ALL
-
-    SELECT
-        'QUERY_6',
-        'SUPPLY_FORECAST',
-        'SUPPLY_FORECAST_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST_NEW)
-),
-
-table_metadata AS (
-    SELECT
-        TABLE_NAME,
-        LAST_ALTERED
-    FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.TABLES
-    WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-)
-
-SELECT
-    CURRENT_TIMESTAMP() AS check_time,
-    c.query_name,
-    c.current_table,
-    c.new_table,
-    c.current_count,
-    c.new_count,
-    c.new_count - c.current_count AS signed_difference,
-    ABS(c.new_count - c.current_count) AS absolute_difference,
-    IFF(
-        GREATEST(c.current_count, c.new_count) = 0,
-        100,
-        ROUND(
-            100 * LEAST(c.current_count, c.new_count)
-                / GREATEST(c.current_count, c.new_count),
-            2
-        )
-    ) AS alignment_percentage,
-    current_meta.LAST_ALTERED AS current_refresh,
-    new_meta.LAST_ALTERED AS new_refresh
-FROM counts c
-LEFT JOIN table_metadata current_meta
-    ON current_meta.TABLE_NAME = c.current_table
-LEFT JOIN table_metadata new_meta
-    ON new_meta.TABLE_NAME = c.new_table
-ORDER BY c.query_name;
+    SELECT * FROM CURRENT_KEYS
+) N;
 
 
 
-==================================================================
-WITH counts AS (
 
-    SELECT
-        'QUERY_1' AS query_name,
-        'OWNER_PROJECT_WEEKLY_AGG' AS current_table,
-        'OWNER_PROJECT_WEEKLY_AGG_NEW' AS new_table,
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.OWNER_PROJECT_WEEKLY_AGG) AS current_count,
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.OWNER_PROJECT_WEEKLY_AGG_NEW) AS new_count
 
-    UNION ALL
 
-    SELECT
-        'QUERY_2',
-        'WRIKE_OOO_OWNER',
-        'WRIKE_OOO_OWNER_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_OOO_OWNER),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_OOO_OWNER_NEW)
 
-    UNION ALL
 
-    SELECT
-        'QUERY_3',
-        'RAINBOW_OWNER_BYHOURS_FINAL',
-        'RAINBOW_OWNER_BYHOURS_FINAL_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.RAINBOW_OWNER_BYHOURS_FINAL),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.RAINBOW_OWNER_BYHOURS_FINAL_NEW)
 
-    UNION ALL
 
-    SELECT
-        'QUERY_4',
-        'WRIKE_PROJECT_ASSIGNEE_DETAIL',
-        'WRIKE_PROJECT_ASSIGNEE_DETAIL_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_PROJECT_ASSIGNEE_DETAIL),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_PROJECT_ASSIGNEE_DETAIL_NEW)
 
-    UNION ALL
 
-    SELECT
-        'QUERY_5',
-        'DEMAND_FORECAST',
-        'DEMAND_FORECAST_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW)
 
-    UNION ALL
 
-    SELECT
-        'QUERY_6',
-        'SUPPLY_FORECAST',
-        'SUPPLY_FORECAST_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST_NEW)
-),
 
-table_metadata AS (
-    SELECT
-        TABLE_NAME,
-        LAST_ALTERED
-    FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.TABLES
-    WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-      AND TABLE_NAME IN (
-          'OWNER_PROJECT_WEEKLY_AGG',
-          'OWNER_PROJECT_WEEKLY_AGG_NEW',
-          'WRIKE_OOO_OWNER',
-          'WRIKE_OOO_OWNER_NEW',
-          'RAINBOW_OWNER_BYHOURS_FINAL',
-          'RAINBOW_OWNER_BYHOURS_FINAL_NEW',
-          'WRIKE_PROJECT_ASSIGNEE_DETAIL',
-          'WRIKE_PROJECT_ASSIGNEE_DETAIL_NEW',
-          'DEMAND_FORECAST',
-          'DEMAND_FORECAST_NEW',
-          'SUPPLY_FORECAST',
-          'SUPPLY_FORECAST_NEW'
-      )
-)
 
-SELECT
-    c.query_name,
-    c.current_table,
-    c.new_table,
-    c.current_count,
-    c.new_count,
-    c.new_count - c.current_count AS difference,
-    ABS(c.new_count - c.current_count) AS absolute_difference,
-    ROUND(
-        100 * LEAST(c.current_count, c.new_count)
-        / NULLIF(GREATEST(c.current_count, c.new_count), 0),
-        2
-    ) AS alignment_percentage,
-    current_meta.last_altered AS current_refresh,
-    new_meta.last_altered AS new_refresh
-FROM counts c
-LEFT JOIN table_metadata current_meta
-    ON current_meta.table_name = c.current_table
-LEFT JOIN table_metadata new_meta
-    ON new_meta.table_name = c.new_table
-ORDER BY c.query_name;
+
+
+
+
+
+
+
+ 
