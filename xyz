@@ -1,0 +1,83 @@
+1 - WITH table_pairs AS (
+    SELECT 'QUERY_5' AS query_name,
+           'DEMAND_FORECAST' AS current_table,
+           'DEMAND_FORECAST_NEW' AS new_table
+    UNION ALL
+    SELECT 'QUERY_6',
+           'SUPPLY_FORECAST',
+           'SUPPLY_FORECAST_NEW'
+),
+current_columns AS (
+    SELECT
+        p.query_name,
+        c.column_name,
+        c.ordinal_position,
+        c.data_type
+    FROM table_pairs p
+    JOIN GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS c
+      ON c.table_schema = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+     AND c.table_name = p.current_table
+),
+new_columns AS (
+    SELECT
+        p.query_name,
+        c.column_name,
+        c.ordinal_position,
+        c.data_type
+    FROM table_pairs p
+    JOIN GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS c
+      ON c.table_schema = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+     AND c.table_name = p.new_table
+)
+SELECT
+    COALESCE(c.query_name, n.query_name) AS query_name,
+    COALESCE(c.column_name, n.column_name) AS column_name,
+    c.ordinal_position AS current_position,
+    n.ordinal_position AS new_position,
+    c.data_type AS current_type,
+    n.data_type AS new_type
+FROM current_columns c
+FULL OUTER JOIN new_columns n
+  ON c.query_name = n.query_name
+ AND c.column_name = n.column_name
+WHERE c.column_name IS NULL
+   OR n.column_name IS NULL
+   OR c.ordinal_position <> n.ordinal_position
+   OR c.data_type <> n.data_type
+ORDER BY 1, 3, 4;
+
+
+
+2 - SELECT 'Q5_ONLY_IN_CURRENT' AS comparison, COUNT(*) AS row_count
+FROM (
+    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST
+    MINUS
+    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW
+)
+
+UNION ALL
+
+SELECT 'Q5_ONLY_IN_NEW', COUNT(*)
+FROM (
+    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW
+    MINUS
+    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST
+)
+
+UNION ALL
+
+SELECT 'Q6_ONLY_IN_CURRENT', COUNT(*)
+FROM (
+    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST
+    MINUS
+    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST_NEW
+)
+
+UNION ALL
+
+SELECT 'Q6_ONLY_IN_NEW', COUNT(*)
+FROM (
+    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST_NEW
+    MINUS
+    SELECT * FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST
+);
