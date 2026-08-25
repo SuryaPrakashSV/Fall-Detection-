@@ -237,3 +237,95 @@ SELECT
 FROM diff
 GROUP BY comparison, PROJECT_TYPE
 ORDER BY comparison, key_count DESC;
+
+=====================================================================
+
+WITH counts AS (
+
+    SELECT
+        'QUERY_1' AS query_name,
+        'OWNER_PROJECT_WEEKLY_AGG' AS current_table,
+        'OWNER_PROJECT_WEEKLY_AGG_NEW' AS new_table,
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.OWNER_PROJECT_WEEKLY_AGG) AS current_count,
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.OWNER_PROJECT_WEEKLY_AGG_NEW) AS new_count
+
+    UNION ALL
+
+    SELECT
+        'QUERY_2',
+        'WRIKE_OOO_OWNER',
+        'WRIKE_OOO_OWNER_NEW',
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_OOO_OWNER),
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_OOO_OWNER_NEW)
+
+    UNION ALL
+
+    SELECT
+        'QUERY_3',
+        'RAINBOW_OWNER_BYHOURS_FINAL',
+        'RAINBOW_OWNER_BYHOURS_FINAL_NEW',
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.RAINBOW_OWNER_BYHOURS_FINAL),
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.RAINBOW_OWNER_BYHOURS_FINAL_NEW)
+
+    UNION ALL
+
+    SELECT
+        'QUERY_4',
+        'WRIKE_PROJECT_ASSIGNEE_DETAIL',
+        'WRIKE_PROJECT_ASSIGNEE_DETAIL_NEW',
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_PROJECT_ASSIGNEE_DETAIL),
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_PROJECT_ASSIGNEE_DETAIL_NEW)
+
+    UNION ALL
+
+    SELECT
+        'QUERY_5',
+        'DEMAND_FORECAST',
+        'DEMAND_FORECAST_NEW',
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST),
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW)
+
+    UNION ALL
+
+    SELECT
+        'QUERY_6',
+        'SUPPLY_FORECAST',
+        'SUPPLY_FORECAST_NEW',
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST),
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST_NEW)
+),
+
+table_metadata AS (
+    SELECT
+        TABLE_NAME,
+        LAST_ALTERED
+    FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.TABLES
+    WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+)
+
+SELECT
+    CURRENT_TIMESTAMP() AS check_time,
+    c.query_name,
+    c.current_table,
+    c.new_table,
+    c.current_count,
+    c.new_count,
+    c.new_count - c.current_count AS signed_difference,
+    ABS(c.new_count - c.current_count) AS absolute_difference,
+    IFF(
+        GREATEST(c.current_count, c.new_count) = 0,
+        100,
+        ROUND(
+            100 * LEAST(c.current_count, c.new_count)
+                / GREATEST(c.current_count, c.new_count),
+            2
+        )
+    ) AS alignment_percentage,
+    current_meta.LAST_ALTERED AS current_refresh,
+    new_meta.LAST_ALTERED AS new_refresh
+FROM counts c
+LEFT JOIN table_metadata current_meta
+    ON current_meta.TABLE_NAME = c.current_table
+LEFT JOIN table_metadata new_meta
+    ON new_meta.TABLE_NAME = c.new_table
+ORDER BY c.query_name;
