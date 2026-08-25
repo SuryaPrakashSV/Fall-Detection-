@@ -1,0 +1,24 @@
+Use these exact commands.
+
+To show the live HTTP 403 blocker:
+
+cd "$HOME/Documents/wrike_project_status_history/read_only_probe"
+python3 wrike_project_status_history_probe.py
+
+Paste the token when prompted. Then display the evidence:
+
+python3 -m json.tool wrike_status_probe_output/probe_summary.json
+
+To run the offline implementation:
+
+cd "$HOME/Documents/wrike_project_status_history/full_implementation"
+python3 -m unittest -v test_full_implementation.py
+python3 status_history_cli.py webhook-normalize \
+  --input sample_project_status_events.json \
+  --output demo_output
+python3 status_history_cli.py enrich-csv \
+  --wrike-stg sample_wrike_stg.csv \
+  --history demo_output/project_status_history.csv \
+  --output demo_output/Wrike_STG_STATUS_HISTORY_POC.csv
+
+Do not run the probe using unittest; execute it directly as shown above.
