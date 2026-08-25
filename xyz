@@ -1,3 +1,256 @@
+WITH counts AS (
+
+    SELECT
+        'QUERY_1' AS query_name,
+        'OWNER_PROJECT_WEEKLY_AGG' AS current_table,
+        'OWNER_PROJECT_WEEKLY_AGG_NEW' AS new_table,
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.OWNER_PROJECT_WEEKLY_AGG),
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.OWNER_PROJECT_WEEKLY_AGG_NEW)
+
+    UNION ALL
+
+    SELECT
+        'QUERY_2',
+        'WRIKE_OOO_OWNER',
+        'WRIKE_OOO_OWNER_NEW',
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_OOO_OWNER),
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_OOO_OWNER_NEW)
+
+    UNION ALL
+
+    SELECT
+        'QUERY_3',
+        'RAINBOW_OWNER_BYHOURS_FINAL',
+        'RAINBOW_OWNER_BYHOURS_FINAL_NEW',
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.RAINBOW_OWNER_BYHOURS_FINAL),
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.RAINBOW_OWNER_BYHOURS_FINAL_NEW)
+
+    UNION ALL
+
+    SELECT
+        'QUERY_4',
+        'WRIKE_PROJECT_ASSIGNEE_DETAIL',
+        'WRIKE_PROJECT_ASSIGNEE_DETAIL_NEW',
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_PROJECT_ASSIGNEE_DETAIL),
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_PROJECT_ASSIGNEE_DETAIL_NEW)
+
+    UNION ALL
+
+    SELECT
+        'QUERY_5',
+        'DEMAND_FORECAST',
+        'DEMAND_FORECAST_NEW',
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST),
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW)
+
+    UNION ALL
+
+    SELECT
+        'QUERY_6',
+        'SUPPLY_FORECAST',
+        'SUPPLY_FORECAST_NEW',
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST),
+        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST_NEW)
+),
+
+table_metadata AS (
+    SELECT
+        TABLE_NAME,
+        LAST_ALTERED
+    FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.TABLES
+    WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+),
+
+schema_signatures AS (
+    SELECT
+        TABLE_NAME,
+        COUNT(*) AS column_count,
+        LISTAGG(
+            ORDINAL_POSITION || ':' ||
+            COLUMN_NAME || ':' ||
+            DATA_TYPE || ':' ||
+            COALESCE(TO_VARCHAR(CHARACTER_MAXIMUM_LENGTH), '') || ':' ||
+            COALESCE(TO_VARCHAR(NUMERIC_PRECISION), '') || ':' ||
+            COALESCE(TO_VARCHAR(NUMERIC_SCALE), ''),
+            '|'
+        ) WITHIN GROUP (ORDER BY ORDINAL_POSITION) AS schema_signature
+    FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+    GROUP BY TABLE_NAME
+),
+
+manual_uat AS (
+    SELECT
+        column1 AS query_name,
+        column2 AS dashboard_result,
+        column3 AS manual_note
+    FROM VALUES
+        (
+            'QUERY_1',
+            'ALIGNED - MINOR EXPECTED DIFFERENCES',
+            'Capacity Utilization and Operational Insights aligned.'
+        ),
+        (
+            'QUERY_2',
+            'ALIGNED - MINOR EXPECTED DIFFERENCES',
+            'Capacity Utilization and Operational Insights aligned.'
+        ),
+        (
+            'QUERY_3',
+            'ALIGNED - MINOR EXPECTED DIFFERENCES',
+            'Capacity Utilization and Operational Insights aligned.'
+        ),
+        (
+            'QUERY_4',
+            'ALIGNED - MINOR EXPECTED DIFFERENCES',
+            'Capacity Utilization and Operational Insights aligned.'
+        ),
+        (
+            'QUERY_5',
+            'SNOWFLAKE FORECAST UAT',
+            'Rerun bidirectional row and key comparison after aligned refresh.'
+        ),
+        (
+            'QUERY_6',
+            'SNOWFLAKE FORECAST UAT',
+            'Previous bidirectional comparison returned zero differences.'
+        )
+),
+
+results AS (
+    SELECT
+        CURRENT_TIMESTAMP() AS check_time,
+        CURRENT_DATE() AS check_date,
+        c.query_name,
+        c.current_table,
+        c.new_table,
+        c.current_count,
+        c.new_count,
+        c.new_count - c.current_count AS signed_difference,
+        ABS(c.new_count - c.current_count) AS absolute_difference,
+
+        IFF(
+            GREATEST(c.current_count, c.new_count) = 0,
+            100,
+            ROUND(
+                100 * LEAST(c.current_count, c.new_count)
+                    / GREATEST(c.current_count, c.new_count),
+                2
+            )
+        ) AS alignment_percentage,
+
+        current_meta.last_altered AS current_refresh,
+        new_meta.last_altered AS new_refresh,
+
+        ROUND(
+            ABS(
+                DATEDIFF(
+                    'minute',
+                    current_meta.last_altered,
+                    new_meta.last_altered
+                )
+            ) / 60.0,
+            2
+        ) AS refresh_gap_hours,
+
+        current_schema.column_count AS current_column_count,
+        new_schema.column_count AS new_column_count,
+
+        IFF(
+            current_schema.schema_signature = new_schema.schema_signature,
+            'MATCH',
+            'MISMATCH'
+        ) AS schema_status,
+
+        u.dashboard_result,
+        u.manual_note
+
+    FROM counts c
+
+    LEFT JOIN table_metadata current_meta
+        ON current_meta.table_name = c.current_table
+
+    LEFT JOIN table_metadata new_meta
+        ON new_meta.table_name = c.new_table
+
+    LEFT JOIN schema_signatures current_schema
+        ON current_schema.table_name = c.current_table
+
+    LEFT JOIN schema_signatures new_schema
+        ON new_schema.table_name = c.new_table
+
+    LEFT JOIN manual_uat u
+        ON u.query_name = c.query_name
+),
+
+scored AS (
+    SELECT
+        *,
+        IFF(
+            current_count = new_count,
+            'MATCH',
+            'DIFFERENCE'
+        ) AS row_count_status,
+
+        CASE
+            WHEN schema_status = 'MISMATCH'
+                THEN 'FAIL - SCHEMA MISMATCH'
+
+            WHEN refresh_gap_hours > 2
+                THEN 'PENDING - ALIGNED REFRESH RECHECK'
+
+            WHEN current_count = new_count
+                THEN 'PASS - ROW COUNTS MATCH'
+
+            WHEN alignment_percentage >= 99.90
+                THEN 'PASS - MINOR ROW DIFFERENCE'
+
+            ELSE 'REVIEW REQUIRED'
+        END AS validation_status
+
+    FROM results
+)
+
+SELECT
+    check_time,
+    check_date,
+    query_name,
+    current_table,
+    new_table,
+    current_count,
+    new_count,
+    signed_difference,
+    absolute_difference,
+    alignment_percentage,
+    current_refresh,
+    new_refresh,
+    refresh_gap_hours,
+    current_column_count,
+    new_column_count,
+    schema_status,
+    row_count_status,
+    validation_status,
+    dashboard_result,
+
+    manual_note || ' ' ||
+    CASE
+        WHEN current_count = new_count
+            THEN 'Row counts match.'
+        ELSE
+            'Absolute row difference: ' ||
+            absolute_difference || '.'
+    END ||
+    CASE
+        WHEN refresh_gap_hours > 2
+            THEN ' Refreshes are ' || refresh_gap_hours ||
+                 ' hours apart; aligned-refresh recheck required.'
+        ELSE
+            ' Refresh timing is aligned.'
+    END AS notes
+
+FROM scored
+ORDER BY query_name;
+===============================================================
 1 - WITH table_pairs AS (
     SELECT 'QUERY_5' AS query_name,
            'DEMAND_FORECAST' AS current_table,
