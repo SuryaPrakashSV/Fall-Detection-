@@ -390,7 +390,23 @@ print("Workflow status IDs retrieved:", len(status_names))
 PY
 
 
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+python3 - <<'PY'
+from getpass import getpass
+import requests
 
+url = getpass("Paste approved callback URL (hidden): ")
+
+try:
+    response = requests.post(url, timeout=30)
+    allowed = {200, 201, 202, 204}
+
+    print("\nHTTP status:", response.status_code)
+    print("Callback connectivity:", "PASS" if response.status_code in allowed else "FAIL")
+except requests.RequestException as exc:
+    print("\nCallback connectivity: FAIL")
+    print("Error type:", type(exc).__name__)
+PY
 
 
 
