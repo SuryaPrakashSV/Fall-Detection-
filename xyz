@@ -338,7 +338,26 @@ FROM (
 
 
 
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+python3 - <<'PY'
+from getpass import getpass
+from wrike_status_api import WrikeClient
 
+PROJECT_ID = "MQAAAAEGPpOb"
+
+token = getpass("Paste Wrike token (hidden): ")
+client = WrikeClient(token)
+
+project = client.project(PROJECT_ID)
+status_id = str(project.get("customStatusId") or "")
+status_names = client.status_names()
+
+print("\nProject:", project.get("title"))
+print("Project ID:", PROJECT_ID)
+print("Current customStatusId:", status_id)
+print("Readable status name:", status_names.get(status_id, "NOT FOUND IN WORKFLOWS"))
+print("Workflow status IDs retrieved:", len(status_names))
+PY
 
 
 
