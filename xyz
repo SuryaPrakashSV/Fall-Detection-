@@ -252,4 +252,4 @@ FROM scored
 ORDER BY query_name;
 ===============================================================
 
-python3 -c 'import json; h=json.load(open("webhook_registration_response.json"))["data"][0]; print("Saved webhook registration response:"); print({"id":h.get("id"),"status":h.get("status"),"folderId":h.get("folderId"),"accountId":h.get("accountId")})'
+grep -ni "403\|audit\|export\|permission" ../wrike_status_probe_output/probe_summary.json
