@@ -252,4 +252,7 @@ FROM scored
 ORDER BY query_name;
 ===============================================================
 
-grep -ni "403\|audit\|export\|permission" ../read_only_probe/wrike_status_probe_output/probe_summary.json
+The Active webhook registration and API recheck are live Wrike results.
+The four passed tests, two history rows, and lifecycle result use the offline sample payload.
+Audit Log and Data Export return 403 because my token does not have the required permissions.
+A real callback payload is not included because I cannot access the callback endpoint logs.
