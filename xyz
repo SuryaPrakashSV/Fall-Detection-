@@ -252,35 +252,4 @@ FROM scored
 ORDER BY query_name;
 ===============================================================
 
-    elif args.command == "register-webhook":
-        from wrike_status_api import WrikeClient
-
-        hook_url = getpass.getpass(
-            "Paste approved callback URL (hidden): "
-        ).strip()
-        if not hook_url.startswith("https://"):
-            raise SystemExit("Callback URL must start with https://")
-
-        client = WrikeClient(token())
-        response = client.create_project_status_webhook(
-            args.project_id,
-            hook_url,
-        )
-
-        output = Path("webhook_registration_response.json")
-        output.write_text(
-            json.dumps(response, indent=2, default=str)
-        )
-
-        hooks = response.get("data", [])
-        if not hooks:
-            raise SystemExit(
-                "Wrike returned no webhook registration data."
-            )
-
-        hook = hooks[0]
-        print(
-            f"Webhook registered: id={hook.get('id')}; "
-            f"status={hook.get('status')}"
-        )
-        print(f"Wrote registration response to {output}")
+  python3 -c 'import json; from status_history_cli import token; from wrike_status_api import WrikeClient; target=json.load(open("webhook_registration_response.json"))["data"][0]["id"]; hooks=WrikeClient(token()).list_webhooks(); print([{"id":h.get("id"),"status":h.get("status"),"folderId":h.get("folderId")} for h in hooks if h.get("id")==target])'
