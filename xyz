@@ -252,4 +252,4 @@ FROM scored
 ORDER BY query_name;
 ===============================================================
 
-python3 -c 'import pandas as pd; df=pd.read_csv("webhook_verification_output/project_status_lifecycle.csv"); print(f"Lifecycle rows: {len(df)}\n"); print(df.to_string(index=False))'
+python3 -c 'import json; h=json.load(open("webhook_registration_response.json"))["data"][0]; print("Saved webhook registration response:"); print({"id":h.get("id"),"status":h.get("status"),"folderId":h.get("folderId"),"accountId":h.get("accountId")})'
