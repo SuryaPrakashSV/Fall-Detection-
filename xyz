@@ -252,36 +252,35 @@ FROM scored
 ORDER BY query_name;
 ===============================================================
 
+    elif args.command == "register-webhook":
+        from wrike_status_api import WrikeClient
 
+        hook_url = getpass.getpass(
+            "Paste approved callback URL (hidden): "
+        ).strip()
+        if not hook_url.startswith("https://"):
+            raise SystemExit("Callback URL must start with https://")
 
+        client = WrikeClient(token())
+        response = client.create_project_status_webhook(
+            args.project_id,
+            hook_url,
+        )
 
-    def post(
-        self,
-        path: str,
-        payload: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        url = f"{self.base_url}/{path.lstrip('/')}"
-        for attempt in range(4):
-            response = self.session.post(
-                url,
-                json=dict(payload),
-                timeout=self.timeout,
+        output = Path("webhook_registration_response.json")
+        output.write_text(
+            json.dumps(response, indent=2, default=str)
+        )
+
+        hooks = response.get("data", [])
+        if not hooks:
+            raise SystemExit(
+                "Wrike returned no webhook registration data."
             )
-            if response.status_code in {401, 403}:
-                raise WrikePermissionError(
-                    f"POST /{path.lstrip('/')} returned HTTP "
-                    f"{response.status_code}; required permission/scope "
-                    "is unavailable."
-                )
-            if response.status_code == 429 or response.status_code >= 500:
-                if attempt < 3:
-                    time.sleep(min(2 ** attempt, 8))
-                    continue
-            response.raise_for_status()
-            response_payload = response.json()
-            if not isinstance(response_payload, dict):
-                raise ValueError(
-                    f"Wrike returned a non-object response for {path}"
-                )
-            return response_payload
-        raise RuntimeError(f"Wrike request failed after retries: {path}")
+
+        hook = hooks[0]
+        print(
+            f"Webhook registered: id={hook.get('id')}; "
+            f"status={hook.get('status')}"
+        )
+        print(f"Wrote registration response to {output}")
