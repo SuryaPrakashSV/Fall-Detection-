@@ -252,4 +252,4 @@ FROM scored
 ORDER BY query_name;
 ===============================================================
 
-  python3 -c 'import json; from status_history_cli import token; from wrike_status_api import WrikeClient; target=json.load(open("webhook_registration_response.json"))["data"][0]["id"]; hooks=WrikeClient(token()).list_webhooks(); print([{"id":h.get("id"),"status":h.get("status"),"folderId":h.get("folderId")} for h in hooks if h.get("id")==target])'
+python3 -c 'import json, pandas as pd; p="webhook_verification_output"; h=pd.read_csv(f"{p}/project_status_history.csv"); d=json.load(open(f"{p}/diagnostics.json")); print({"history_rows":len(h), "source":d.get("source"), "columns":h.columns.tolist()})'
