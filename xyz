@@ -252,4 +252,4 @@ FROM scored
 ORDER BY query_name;
 ===============================================================
 
-grep -ni "403\|audit\|export\|permission" ../wrike_status_probe_output/probe_summary.json
+grep -ni "403\|audit\|export\|permission" ../read_only_probe/wrike_status_probe_output/probe_summary.json
