@@ -252,166 +252,36 @@ FROM scored
 ORDER BY query_name;
 ===============================================================
 
-WITH CURRENT_KEYS AS (
-    SELECT DISTINCT
-        GRANULARITY_LEVEL,
-        GEO,
-        EMPLOYEE_ROLE,
-        EMPLOYEE_TYPE,
-        PROJECT_TYPE,
-        FISCYEAR,
-        FISCMONTH,
-        STD_FISCAL_PERIOD_NAME,
-        PERIOD_DISPLAY_NAME
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST
-),
-
-NEW_KEYS AS (
-    SELECT DISTINCT
-        GRANULARITY_LEVEL,
-        GEO,
-        EMPLOYEE_ROLE,
-        EMPLOYEE_TYPE,
-        PROJECT_TYPE,
-        FISCYEAR,
-        FISCMONTH,
-        STD_FISCAL_PERIOD_NAME,
-        PERIOD_DISPLAY_NAME
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST_NEW
-)
-
-SELECT
-    'CURRENT_KEY_ONLY' AS DIFFERENCE_SOURCE,
-    C.*
-FROM (
-    SELECT * FROM CURRENT_KEYS
-    MINUS
-    SELECT * FROM NEW_KEYS
-) C
-
-UNION ALL
-
-SELECT
-    'NEW_KEY_ONLY' AS DIFFERENCE_SOURCE,
-    N.*
-FROM (
-    SELECT * FROM NEW_KEYS
-    MINUS
-    SELECT * FROM CURRENT_KEYS
-) N;
 
 
 
-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-SELECT
-    'CURRENT_ONLY' AS DIFFERENCE_SOURCE,
-    C.*
-FROM (
-    SELECT *
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST
-    WHERE FISCMONTH = 10
-
-    MINUS
-
-    SELECT *
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST_NEW
-    WHERE FISCMONTH = 10
-) C
-
-UNION ALL
-
-SELECT
-    'NEW_ONLY' AS DIFFERENCE_SOURCE,
-    N.*
-FROM (
-    SELECT *
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST_NEW
-    WHERE FISCMONTH = 10
-
-    MINUS
-
-    SELECT *
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST
-    WHERE FISCMONTH = 10
-) N;
-
-
-
-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-python3 - <<'PY'
-from getpass import getpass
-from wrike_status_api import WrikeClient
-
-PROJECT_ID = "MQAAAAEGPpOb"
-
-token = getpass("Paste Wrike token (hidden): ")
-client = WrikeClient(token)
-
-project = client.project(PROJECT_ID)
-status_id = str(project.get("customStatusId") or "")
-status_names = client.status_names()
-
-print("\nProject:", project.get("title"))
-print("Project ID:", PROJECT_ID)
-print("Current customStatusId:", status_id)
-print("Readable status name:", status_names.get(status_id, "NOT FOUND IN WORKFLOWS"))
-print("Workflow status IDs retrieved:", len(status_names))
-PY
-
-
-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-python3 - <<'PY'
-from getpass import getpass
-from wrike_status_api import WrikeClient
-
-PROJECT_ID = "MQAAAAEGPpOb"
-
-token = getpass("Paste Wrike token (hidden): ")
-client = WrikeClient(token)
-
-folder = client.project(PROJECT_ID)
-project_details = folder.get("project") or {}
-
-status_id = str(
-    project_details.get("customStatusId")
-    or folder.get("customStatusId")
-    or ""
-)
-
-status_names = client.status_names()
-
-print("\nProject:", folder.get("title"))
-print("Project ID:", PROJECT_ID)
-print("Project-detail fields:", sorted(project_details.keys()))
-print("Current customStatusId:", status_id or "MISSING")
-print("Readable status name:", status_names.get(status_id, "NOT FOUND IN WORKFLOWS"))
-print("Workflow status IDs retrieved:", len(status_names))
-PY
-
-
-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-python3 - <<'PY'
-from getpass import getpass
-import requests
-
-url = getpass("Paste approved callback URL (hidden): ")
-
-try:
-    response = requests.post(url, timeout=30)
-    allowed = {200, 201, 202, 204}
-
-    print("\nHTTP status:", response.status_code)
-    print("Callback connectivity:", "PASS" if response.status_code in allowed else "FAIL")
-except requests.RequestException as exc:
-    print("\nCallback connectivity: FAIL")
-    print("Error type:", type(exc).__name__)
-PY
-
-
-
-
-
-
-
- 
+    def post(
+        self,
+        path: str,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        for attempt in range(4):
+            response = self.session.post(
+                url,
+                json=dict(payload),
+                timeout=self.timeout,
+            )
+            if response.status_code in {401, 403}:
+                raise WrikePermissionError(
+                    f"POST /{path.lstrip('/')} returned HTTP "
+                    f"{response.status_code}; required permission/scope "
+                    "is unavailable."
+                )
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < 3:
+                    time.sleep(min(2 ** attempt, 8))
+                    continue
+            response.raise_for_status()
+            response_payload = response.json()
+            if not isinstance(response_payload, dict):
+                raise ValueError(
+                    f"Wrike returned a non-object response for {path}"
+                )
+            return response_payload
+        raise RuntimeError(f"Wrike request failed after retries: {path}")
