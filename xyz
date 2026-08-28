@@ -257,9 +257,9 @@ SELECT DISTINCT
     "child_folder_title" AS project_name,
     "parent_folder_id",
     "parent_folder_title",
-    "title" AS item_title,
+    "title",
     "is_project",
-    "id" AS item_id,
+    "id",
     "key",
     "status",
     "customStatusId",
@@ -269,9 +269,5 @@ SELECT DISTINCT
     "endDate",
     "completedDate"
 FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG
-WHERE "child_folder_id" = 'MQAAAAEGPpOb'
-  AND (
-       "id" = 'MQAAAAEGPpOb'
-       OR "key" = 'MQAAAAEGPpOb'
-       OR TRIM("title") = '[FR] Mac APR Update'
-  );
+WHERE "id" = 'MQAAAAEGPpOb'
+  AND "key" = 'MQAAAAEGPpOb';
