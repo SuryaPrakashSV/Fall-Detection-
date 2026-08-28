@@ -251,26 +251,41 @@ SELECT
 FROM scored
 ORDER BY query_name;
 ===============================================================
+WITH project_status_by_date AS (
+
+    SELECT
+        'PROJECT_AGGLEVEL' AS source_table,
+        PROJECT_ID,
+        PROJECT_NAME,
+        CUSTOM_STATUS_ID AS status_value,
+        DATE_WEEK AS record_date
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.PROJECT_AGGLEVEL
+    WHERE PROJECT_ID = 'MQAAAAEGPpOb'
+
+    UNION ALL
+
+    SELECT
+        'PROJECT_DAILYLEVELNEW' AS source_table,
+        PROJECT_ID,
+        PROJECT_NAME,
+        CUSTOM_STATUS_ID AS status_value,
+        CALENDAR_DATE AS record_date
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.PROJECT_DAILYLEVELNEW
+    WHERE PROJECT_ID = 'MQAAAAEGPpOb'
+)
+
 SELECT
-    table_name,
-    ordinal_position,
-    column_name,
-    data_type
-FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
-WHERE table_schema = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-  AND table_name IN (
-      'WRIKE_API_BAU_PROJECT_LEVEL',
-      'OWNER_PROJECT_WEEKLY_AGG',
-      'RAINBOW_OWNER_BYHOURS_FINAL',
-      'WRIKE_PROJECT_ASSIGNEE_DETAIL',
-      'PROJECT_AGGLEVEL',
-      'PROJECT_DAILYLEVEL_NEW'
-  )
-  AND (
-       column_name ILIKE '%PROJECT%'
-       OR column_name ILIKE '%STATUS%'
-       OR column_name ILIKE '%DATE%'
-       OR column_name ILIKE '%TIME%'
-       OR column_name ILIKE '%ID%'
-  )
-ORDER BY table_name, ordinal_position;
+    source_table,
+    PROJECT_ID,
+    PROJECT_NAME,
+    status_value,
+    MIN(record_date) AS first_date,
+    MAX(record_date) AS last_date,
+    COUNT(*) AS row_count
+FROM project_status_by_date
+GROUP BY
+    source_table,
+    PROJECT_ID,
+    PROJECT_NAME,
+    status_value
+ORDER BY source_table, first_date;
