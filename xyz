@@ -252,7 +252,11 @@ FROM scored
 ORDER BY query_name;
 ===============================================================
 
-The Active webhook registration and API recheck are live Wrike results.
-The four passed tests, two history rows, and lifecycle result use the offline sample payload.
-Audit Log and Data Export return 403 because my token does not have the required permissions.
-A real callback payload is not included because I cannot access the callback endpoint logs.
+SELECT
+    ordinal_position,
+    column_name,
+    data_type
+FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
+WHERE table_schema = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+  AND table_name = 'WRIKE_STG'
+ORDER BY ordinal_position;
