@@ -253,14 +253,24 @@ ORDER BY query_name;
 ===============================================================
 SELECT
     table_name,
+    ordinal_position,
     column_name,
     data_type
 FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
 WHERE table_schema = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+  AND table_name IN (
+      'WRIKE_API_BAU_PROJECT_LEVEL',
+      'OWNER_PROJECT_WEEKLY_AGG',
+      'RAINBOW_OWNER_BYHOURS_FINAL',
+      'WRIKE_PROJECT_ASSIGNEE_DETAIL',
+      'PROJECT_AGGLEVEL',
+      'PROJECT_DAILYLEVEL_NEW'
+  )
   AND (
-       column_name ILIKE '%STATUS%'
-       OR column_name ILIKE '%WORKFLOW%'
-       OR column_name ILIKE '%HISTORY%'
-       OR column_name ILIKE '%CHANGE%'
+       column_name ILIKE '%PROJECT%'
+       OR column_name ILIKE '%STATUS%'
+       OR column_name ILIKE '%DATE%'
+       OR column_name ILIKE '%TIME%'
+       OR column_name ILIKE '%ID%'
   )
 ORDER BY table_name, ordinal_position;
