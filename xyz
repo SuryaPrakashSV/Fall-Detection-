@@ -251,23 +251,16 @@ SELECT
 FROM scored
 ORDER BY query_name;
 ===============================================================
-
-SELECT DISTINCT
-    "child_folder_id" AS project_id,
-    "child_folder_title" AS project_name,
-    "parent_folder_id",
-    "parent_folder_title",
-    "title",
-    "is_project",
-    "id",
-    "key",
-    "status",
-    "customStatusId",
-    "createdDate",
-    "updatedDate",
-    "startDate",
-    "endDate",
-    "completedDate"
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG
-WHERE "id" = 'MQAAAAEGPpOb'
-  AND "key" = 'MQAAAAEGPpOb';
+SELECT
+    table_name,
+    column_name,
+    data_type
+FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
+WHERE table_schema = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+  AND (
+       column_name ILIKE '%STATUS%'
+       OR column_name ILIKE '%WORKFLOW%'
+       OR column_name ILIKE '%HISTORY%'
+       OR column_name ILIKE '%CHANGE%'
+  )
+ORDER BY table_name, ordinal_position;
