@@ -252,11 +252,49 @@ FROM scored
 ORDER BY query_name;
 ===============================================================
 
-SELECT
-    ordinal_position,
-    column_name,
-    data_type
-FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
-WHERE table_schema = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-  AND table_name = 'WRIKE_STG'
-ORDER BY ordinal_position;
+SELECT DISTINCT
+    CASE
+        WHEN "Space_Id" = 'MQAAAAEGPpOb' THEN 'Space_Id'
+        WHEN "parent_folder_id" = 'MQAAAAEGPpOb' THEN 'parent_folder_id'
+        WHEN "child_folder_id" = 'MQAAAAEGPpOb' THEN 'child_folder_id'
+        WHEN "grandchild_folder_id" = 'MQAAAAEGPpOb' THEN 'grandchild_folder_id'
+        WHEN "baby_folder_id" = 'MQAAAAEGPpOb' THEN 'baby_folder_id'
+        WHEN "grandbaby_folder_id" = 'MQAAAAEGPpOb' THEN 'grandbaby_folder_id'
+        WHEN "id" = 'MQAAAAEGPpOb' THEN 'id'
+        WHEN "key" = 'MQAAAAEGPpOb' THEN 'key'
+    END AS matched_id_column,
+
+    "Space_Name",
+    "parent_folder_id",
+    "parent_folder_title",
+    "child_folder_id",
+    "child_folder_title",
+    "grandchild_folder_id",
+    "grandchild_folder_title",
+    "baby_folder_id",
+    "baby_folder_title",
+    "grandbaby_folder_id",
+    "grandbaby_folder_title",
+    "title",
+    "is_project",
+    "id",
+    "key",
+    "status",
+    "customStatusId",
+    "createdDate",
+    "updatedDate",
+    "startDate",
+    "endDate",
+    "completedDate",
+    "permalink"
+
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG
+
+WHERE "Space_Id" = 'MQAAAAEGPpOb'
+   OR "parent_folder_id" = 'MQAAAAEGPpOb'
+   OR "child_folder_id" = 'MQAAAAEGPpOb'
+   OR "grandchild_folder_id" = 'MQAAAAEGPpOb'
+   OR "baby_folder_id" = 'MQAAAAEGPpOb'
+   OR "grandbaby_folder_id" = 'MQAAAAEGPpOb'
+   OR "id" = 'MQAAAAEGPpOb'
+   OR "key" = 'MQAAAAEGPpOb';
