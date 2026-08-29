@@ -251,41 +251,99 @@ SELECT
 FROM scored
 ORDER BY query_name;
 ===============================================================
-WITH project_status_by_date AS (
+WITH candidate_hits AS (
 
     SELECT
-        'PROJECT_AGGLEVEL' AS source_table,
+        'Wrike_STG' AS source_table,
+        "id" AS project_id,
+        "title" AS project_name,
+        COALESCE("status", "customStatusId") AS status_value,
+        COALESCE("completedDate", "updatedDate") AS available_date
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG
+    WHERE "id" = 'MQAAAAEGPpOb'
+      AND "key" = 'MQAAAAEGPpOb'
+
+    UNION ALL
+
+    SELECT
+        'WRIKE_API_BAU_PROJECT_LEVEL',
         PROJECT_ID,
         PROJECT_NAME,
-        CUSTOM_STATUS_ID AS status_value,
-        DATE_WEEK AS record_date
+        CUSTOM_STATUS,
+        NULL
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_API_BAU_PROJECT_LEVEL
+    WHERE PROJECT_ID = 'MQAAAAEGPpOb'
+
+    UNION ALL
+
+    SELECT
+        'OWNER_PROJECT_WEEKLY_AGG',
+        PROJECT_ID,
+        PROJECT_NAME,
+        COALESCE(STATUS, CUSTOM_STATUS_ID),
+        NULL
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.OWNER_PROJECT_WEEKLY_AGG
+    WHERE PROJECT_ID = 'MQAAAAEGPpOb'
+
+    UNION ALL
+
+    SELECT
+        'PROJECT_AGGLEVEL',
+        PROJECT_ID,
+        PROJECT_NAME,
+        CUSTOM_STATUS_ID,
+        TO_VARCHAR(DATE_WEEK)
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.PROJECT_AGGLEVEL
     WHERE PROJECT_ID = 'MQAAAAEGPpOb'
 
     UNION ALL
 
     SELECT
-        'PROJECT_DAILYLEVELNEW' AS source_table,
+        'PROJECT_DAILYLEVEL_NEW',
         PROJECT_ID,
         PROJECT_NAME,
-        CUSTOM_STATUS_ID AS status_value,
-        CALENDAR_DATE AS record_date
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.PROJECT_DAILYLEVELNEW
+        CUSTOM_STATUS_ID,
+        TO_VARCHAR(CALENDAR_DATE)
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.PROJECT_DAILYLEVEL_NEW
+    WHERE PROJECT_ID = 'MQAAAAEGPpOb'
+
+    UNION ALL
+
+    SELECT
+        'WRIKE_PROJECT_ASSIGNEE_DETAIL',
+        PROJECT_ID,
+        PROJECT_NAME,
+        PROJECT_CUSTOM_STATUS,
+        PROJECT_DATA_REFRESH
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_PROJECT_ASSIGNEE_DETAIL
+    WHERE PROJECT_ID = 'MQAAAAEGPpOb'
+
+    UNION ALL
+
+    SELECT
+        'RAINBOW_OWNER_BYHOURS_FINAL',
+        PROJECT_ID,
+        PROJECT_NAME,
+        STATUS,
+        NULL
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.RAINBOW_OWNER_BYHOURS_FINAL
     WHERE PROJECT_ID = 'MQAAAAEGPpOb'
 )
 
 SELECT
     source_table,
-    PROJECT_ID,
-    PROJECT_NAME,
+    project_id,
+    project_name,
     status_value,
-    MIN(record_date) AS first_date,
-    MAX(record_date) AS last_date,
+    MIN(available_date) AS first_available_date,
+    MAX(available_date) AS last_available_date,
     COUNT(*) AS row_count
-FROM project_status_by_date
+FROM candidate_hits
+WHERE status_value ILIKE '%IN PROGRESS%'
+   OR status_value ILIKE '%COMPLETED%'
 GROUP BY
     source_table,
-    PROJECT_ID,
-    PROJECT_NAME,
+    project_id,
+    project_name,
     status_value
-ORDER BY source_table, first_date;
+ORDER BY source_table, status_value;
