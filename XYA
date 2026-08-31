@@ -1,24 +1,102 @@
-Use these exact commands.
+"""Snowflake persistence helpers. All targets are non-production ``_NEW`` objects."""
 
-To show the live HTTP 403 blocker:
+from __future__ import annotations
 
-cd "$HOME/Documents/wrike_project_status_history/read_only_probe"
-python3 wrike_project_status_history_probe.py
+import uuid
 
-Paste the token when prompted. Then display the evidence:
+import pandas as pd
 
-python3 -m json.tool wrike_status_probe_output/probe_summary.json
 
-To run the offline implementation:
+DATABASE = "GBI_RETAIL_BAP_DB"
+SCHEMA = "ASO_OPS_WSA_SNDBX_BIZ_APP"
+TABLE = "WRIKE_PROJECT_STATUS_HISTORY_NEW"
+FQN = f'{DATABASE}.{SCHEMA}.{TABLE}'
 
-cd "$HOME/Documents/wrike_project_status_history/full_implementation"
-python3 -m unittest -v test_full_implementation.py
-python3 status_history_cli.py webhook-normalize \
-  --input sample_project_status_events.json \
-  --output demo_output
-python3 status_history_cli.py enrich-csv \
-  --wrike-stg sample_wrike_stg.csv \
-  --history demo_output/project_status_history.csv \
-  --output demo_output/Wrike_STG_STATUS_HISTORY_POC.csv
 
-Do not run the probe using unittest; execute it directly as shown above.
+def ensure_table(connection) -> None:
+    ddl = f"""
+    CREATE TABLE IF NOT EXISTS {FQN} (
+      PROJECT_ID VARCHAR NOT NULL,
+      PROJECT_NAME VARCHAR,
+      OLD_STATUS_ID VARCHAR,
+      OLD_STATUS_NAME VARCHAR,
+      STATUS_ID VARCHAR,
+      STATUS_NAME VARCHAR,
+      STATUS_CHANGED_AT TIMESTAMP_TZ,
+      STATUS_CHANGED_DATE DATE,
+      STATUS_CHANGED_YEAR NUMBER(4,0),
+      EVENT_SEQUENCE NUMBER,
+      EVENT_AUTHOR_ID VARCHAR,
+      SOURCE VARCHAR NOT NULL,
+      SOURCE_EVENT_ID VARCHAR NOT NULL,
+      SOURCE_PAYLOAD VARIANT,
+      INGESTED_AT TIMESTAMP_TZ,
+      PRIMARY KEY (SOURCE, SOURCE_EVENT_ID)
+    )
+    """
+    cursor = connection.cursor()
+    try:
+        cursor.execute(ddl)
+    finally:
+        cursor.close()
+
+
+def merge_history(connection, history: pd.DataFrame) -> int:
+    """Idempotently MERGE canonical rows using Snowflake's write_pandas."""
+    if history.empty:
+        return 0
+    from snowflake.connector.pandas_tools import write_pandas
+
+    ensure_table(connection)
+    stage = f"WRIKE_PROJECT_STATUS_HISTORY_STAGE_{uuid.uuid4().hex[:10].upper()}"
+    data = history.copy()
+    data.columns = [str(c).upper() for c in data.columns]
+    data["SOURCE_PAYLOAD"] = data["SOURCE_PAYLOAD"].fillna("{}")
+    success, _, nrows, _ = write_pandas(
+        connection, data, stage, database=DATABASE, schema=SCHEMA,
+        auto_create_table=True, overwrite=True,
+    )
+    if not success:
+        raise RuntimeError("write_pandas failed for status-history stage")
+    cursor = connection.cursor()
+    try:
+        cursor.execute(f"""
+        MERGE INTO {FQN} target
+        USING {DATABASE}.{SCHEMA}.{stage} source
+          ON target.SOURCE = source.SOURCE
+         AND target.SOURCE_EVENT_ID = source.SOURCE_EVENT_ID
+        WHEN MATCHED THEN UPDATE SET
+          PROJECT_ID=source.PROJECT_ID, PROJECT_NAME=source.PROJECT_NAME,
+          OLD_STATUS_ID=source.OLD_STATUS_ID, OLD_STATUS_NAME=source.OLD_STATUS_NAME,
+          STATUS_ID=source.STATUS_ID, STATUS_NAME=source.STATUS_NAME,
+          STATUS_CHANGED_AT=source.STATUS_CHANGED_AT,
+          STATUS_CHANGED_DATE=source.STATUS_CHANGED_DATE,
+          STATUS_CHANGED_YEAR=source.STATUS_CHANGED_YEAR,
+          EVENT_SEQUENCE=source.EVENT_SEQUENCE,
+          EVENT_AUTHOR_ID=source.EVENT_AUTHOR_ID,
+          SOURCE_PAYLOAD=PARSE_JSON(source.SOURCE_PAYLOAD),
+          INGESTED_AT=source.INGESTED_AT
+        WHEN NOT MATCHED THEN INSERT (
+          PROJECT_ID, PROJECT_NAME, OLD_STATUS_ID, OLD_STATUS_NAME,
+          STATUS_ID, STATUS_NAME, STATUS_CHANGED_AT, STATUS_CHANGED_DATE,
+          STATUS_CHANGED_YEAR, EVENT_SEQUENCE, EVENT_AUTHOR_ID, SOURCE,
+          SOURCE_EVENT_ID, SOURCE_PAYLOAD, INGESTED_AT
+        ) VALUES (
+          source.PROJECT_ID, source.PROJECT_NAME, source.OLD_STATUS_ID,
+          source.OLD_STATUS_NAME, source.STATUS_ID, source.STATUS_NAME,
+          source.STATUS_CHANGED_AT, source.STATUS_CHANGED_DATE,
+          source.STATUS_CHANGED_YEAR, source.EVENT_SEQUENCE,
+          source.EVENT_AUTHOR_ID, source.SOURCE, source.SOURCE_EVENT_ID,
+          PARSE_JSON(source.SOURCE_PAYLOAD), source.INGESTED_AT
+        )
+        """)
+    finally:
+        # drop the stage even if MERGE blew up, otherwise these pile up in the sandbox
+        cursor.execute(f"DROP TABLE IF EXISTS {DATABASE}.{SCHEMA}.{stage}")
+        cursor.close()
+    return int(nrows)
+
+
+def read_history(connection) -> pd.DataFrame:
+    ensure_table(connection)
+    return pd.read_sql(f"SELECT * FROM {FQN}", connection).rename(columns=str.lower)
