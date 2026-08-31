@@ -251,153 +251,237 @@ SELECT
 FROM scored
 ORDER BY query_name;
 ===============================================================
-    elif args.command == "inspect-webhooks":
-        from wrike_status_api import WrikeClient
+"""Permission-aware Wrike API client for status-history backfill."""
 
-        client = WrikeClient(token())
-        raw_response = client.get("webhooks")
-        hooks = raw_response.get("data", [])
-        output = dated_output_dir(args.output)
-        (output / "webhooks_raw_response.json").write_text(
-            json.dumps(raw_response, indent=2, default=str)
-        )
+from __future__ import annotations
 
-        # Unambiguous event-shaped fields only. Deliberately excludes "status"
-        # (a webhook subscription's own active/suspended flag, not a project
-        # status) and "customStatusId" (ambiguous without an old/new prefix).
-        historical_event_fields = {
-            "projectId",
-            "oldStatus",
-            "newStatus",
-            "oldCustomStatusId",
-            "newCustomStatusId",
-            "changedAt",
-            "eventDate",
-        }
-        fields_seen = sorted({key for hook in hooks for key in hook.keys()})
-        historical_fields_found = sorted(set(fields_seen) & historical_event_fields)
+import time
+import json
+from datetime import datetime, timezone
+from collections.abc import Mapping
+from typing import Any
 
-        report = {
-            "endpoint": "GET /webhooks",
-            "subscriptions_returned": len(hooks),
-            "fields_seen": fields_seen,
-            "historical_event_fields_found": historical_fields_found,
-            "conclusion": (
-                "Unambiguous historical-event fields were present; re-examine the response."
-                if historical_fields_found
-                else (
-                    "No unambiguous historical-event fields (projectId/oldStatus/"
-                    "newStatus/changedAt/etc.) are present in this response. That "
-                    "alone is supporting, not conclusive, evidence. The decisive "
-                    "point is structural: this endpoint accepts no date-range, "
-                    "replay, or historical-event-retrieval parameters at all "
-                    "(contrast with audit_log(), which takes eventDate:{start,end}). "
-                    "A subscription-management resource has no mechanism to return "
-                    "events that occurred before the subscription existed, "
-                    "regardless of which fields a given response happens to contain."
-                )
-            ),
-        }
-        (output / "conclusion.json").write_text(json.dumps(report, indent=2))
-        print(f"Fetched {len(hooks)} webhook subscription(s).")
-        print(f"Fields present in response: {fields_seen}")
-        print(report["conclusion"])
-        print(f"Wrote raw response + conclusion to {output}/")
-    elif args.command == "map-statuses":
-        from wrike_status_api import CATALOG_COLUMNS, WrikeClient, flatten_workflows
+import requests
 
-        client = WrikeClient(token())
-        payload = client.workflows_payload()
-        catalog = flatten_workflows(payload)
-        output = dated_output_dir(args.output)
-        (output / "workflows_raw_response.json").write_text(
-            json.dumps(payload, indent=2, default=str)
-        )
-        frame = pd.DataFrame(catalog, columns=CATALOG_COLUMNS)
-        frame.to_csv(output / "custom_status_catalog.csv", index=False)
-        (output / "custom_status_map.json").write_text(
-            json.dumps({row["custom_status_id"]: row["status_name"] for row in catalog}, indent=2)
-        )
-        print(f"Mapped {len(catalog)} custom statuses across "
-              f"{frame['workflow_id'].nunique() if not frame.empty else 0} workflow(s).")
-        if not frame.empty:
-            print(frame[["custom_status_id", "status_name", "status_group", "workflow_name"]].to_string(index=False))
-        print(f"Wrote catalog + raw response to {output}/")
-    elif args.command == "diagnose-access":
-        from wrike_status_api import WrikeClient
 
-        client = WrikeClient(token())
-        window = json.dumps(
-            {"start": "2024-01-01T00:00:00Z", "end": "2026-01-01T00:00:00Z"},
-            separators=(",", ":"),
-        )
-        checks = [
-            ("version", None, "Baseline: token authenticates at all"),
-            (f"folders/{args.project_id}", None, "Control project metadata (current state only)"),
-            ("workflows", {"includeSpaceWorkflow": "true"}, "customStatusId -> name mapping"),
-            ("webhooks", None, "Webhook subscriptions (future events only, no replay)"),
-            (
-                "audit_log",
-                {"eventDate": window, "operations": json.dumps(["TaskStatusChanged"], separators=(",", ":"))},
-                "HISTORICAL PATH A - needs amReadOnlyAuditLog",
-            ),
-            ("data_export", None, "HISTORICAL PATH B - needs dataExportFull"),
-        ]
-        results = []
-        for path, params, purpose in checks:
-            record = client.probe(path, params)
-            record["purpose"] = purpose
-            results.append(record)
-            state = "OK" if record.get("accessible") else f"HTTP {record.get('status_code')}"
-            print(f"  [{state:>8}] {record['endpoint']:<40} {purpose}")
+class WrikePermissionError(RuntimeError):
+    pass
 
-        historical = [r for r in results if r["purpose"].startswith("HISTORICAL")]
-        blocked = [r for r in historical if not r.get("accessible")]
-        report = {
-            "generated_at": pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "control_project_id": args.project_id,
-            "checks": results,
-            "historical_paths_blocked": len(blocked),
-            "historical_paths_total": len(historical),
-            "conclusion": (
-                "Both historical paths return non-200. Every endpoint that can return "
-                "past status transitions is unavailable to this token, so no backfill "
-                "is possible until one scope is granted. Endpoints that do respond "
-                "return current-state or subscription data only."
-                if len(blocked) == len(historical)
-                else "At least one historical path is now reachable — rerun the backfill."
-            ),
-        }
-        output = dated_output_dir(args.output)
-        (output / "access_diagnostics.json").write_text(json.dumps(report, indent=2, default=str))
-        pd.DataFrame(results).to_csv(output / "access_diagnostics.csv", index=False)
-        print(f"\n{report['conclusion']}")
-        print(f"Wrote dated evidence to {output}/access_diagnostics.json")
-    elif args.command == "inspect-project":
-        from wrike_status_api import WrikeClient, describe_project_fields
 
-        client = WrikeClient(token())
-        project = client.project(args.project_id)
-        fields = describe_project_fields(project)
-        output = dated_output_dir(args.output)
-        (output / "project_raw_response.json").write_text(json.dumps(project, indent=2, default=str))
-        (output / "field_inventory.json").write_text(json.dumps(fields, indent=2, default=str))
+CATALOG_COLUMNS = [
+    "custom_status_id",
+    "status_name",
+    "status_group",
+    "status_color",
+    "workflow_id",
+    "workflow_name",
+    "status_hidden",
+    "workflow_hidden",
+]
 
-        print(f"Project: {project.get('title')} ({args.project_id})\n")
-        for row in fields:
-            kind = (
-                "ACTUAL EVENT"
-                if row["is_actual_event"]
-                else "PLANNED/SCHEDULED (not an event)"
-                if row["is_planned_schedule_value"]
-                else "current-state field"
+
+def flatten_workflows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """One row per custom status, flattened out of a GET /workflows response.
+
+    Kept as a plain function (not a method) so it's testable with a canned
+    payload and no token.
+    """
+    rows: list[dict[str, Any]] = []
+    for workflow in payload.get("data", []) or []:
+        for status in workflow.get("customStatuses", []) or []:
+            status_id = status.get("id")
+            if not status_id:
+                continue
+            rows.append(
+                {
+                    "custom_status_id": str(status_id),
+                    "status_name": str(status.get("name") or status_id),
+                    "status_group": status.get("group"),
+                    "status_color": status.get("color"),
+                    "workflow_id": str(workflow.get("id") or ""),
+                    "workflow_name": workflow.get("name"),
+                    "status_hidden": bool(status.get("hidden", False)),
+                    "workflow_hidden": bool(workflow.get("hidden", False)),
+                }
             )
-            print(f"  {row['field_path']:<28} = {row['value']!r}")
-            print(f"    [{kind}] {row['meaning']}")
-        print(
-            "\nNone of these fields is a status-change history record — only "
-            "completedDate is tied to a specific transition. There is still no "
-            "field here that says when the status became 'In Progress'. That "
-            "requires Audit Log or BI Export."
+    rows.sort(key=lambda row: (str(row["workflow_name"] or ""), str(row["status_name"])))
+    return rows
+
+
+# dates.start/due are schedule fields a PM sets by hand, not events -- easy
+# to mix up with an actual status change (createdDate/completedDate) so
+# spelling it out here once instead of relying on people remembering.
+FIELD_MEANINGS: dict[str, str] = {
+    "createdDate": "when the object was created, set once, never changes",
+    "updatedDate": "last edit of any kind (status, dates, fields...), not just status",
+    "completedDate": "the one field actually tied to a real status change",
+    "customStatusId": "current status id only, no history - map to a name via /workflows",
+    "dates.start": "planned start date, set by a PM - not derived from an actual status change",
+    "dates.due": "planned due date, same deal, not an actual completion event",
+    "dates.type": "metadata about the dates block itself (Planned, Backlog, etc), not a date",
+    "project.authorId": "who created it",
+    "project.ownerIds": "current owner(s)",
+    "project.createdDate": "same as createdDate, nested copy",
+    "project.completedDate": "same as completedDate, nested copy",
+    "project.customStatusId": "same as customStatusId, nested copy",
+}
+
+_DATE_OR_STATUS_HINT = ("date", "status", "changed", "when")
+
+
+def describe_project_fields(project: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Walk a GET /folders/{id} response and label every date/status field.
+
+    Mainly so "is this an actual event or just a planned date someone typed
+    in" has one answer instead of everyone guessing per field.
+    """
+    rows: list[dict[str, Any]] = []
+
+    def visit(node: Any, path: str) -> None:
+        if isinstance(node, Mapping):
+            for key, value in node.items():
+                visit(value, f"{path}.{key}" if path else str(key))
+            return
+        lowered = path.lower()
+        if not any(hint in lowered for hint in _DATE_OR_STATUS_HINT):
+            return
+        meaning = FIELD_MEANINGS.get(path)
+        rows.append(
+            {
+                "field_path": path,
+                "value": node,
+                "meaning": meaning or "not documented here yet, check the Wrike API docs before relying on it",
+                "is_actual_event": path in {"completedDate", "project.completedDate"},
+                "is_planned_schedule_value": path in {"dates.start", "dates.due"},
+            }
         )
-        print(f"Wrote raw response + labeled inventory to {output}/")
+
+    visit(project, "")
+    rows.sort(key=lambda row: row["field_path"])
+    return rows
+
+
+class WrikeClient:
+    def __init__(self, token: str, base_url: str = "https://www.wrike.com/api/v4", timeout: int = 60):
+        if not token:
+            raise ValueError("Wrike token is required")
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({"Authorization": f"bearer {token}", "Accept": "application/json"})
+
+    def get(self, path: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        for attempt in range(4):
+            response = self.session.get(url, params=params, timeout=self.timeout)
+            if response.status_code in {401, 403}:
+                raise WrikePermissionError(
+                    f"GET /{path.lstrip('/')} returned HTTP {response.status_code}; required permission/scope is unavailable."
+                )
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < 3:
+                    time.sleep(min(2 ** attempt, 8))
+                    continue
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError(f"Wrike returned a non-object response for {path}")
+            return payload
+        raise RuntimeError(f"Wrike request failed after retries: {path}")
+
+    def project(self, project_id: str) -> dict[str, Any]:
+        rows = self.get(f"folders/{project_id}").get("data", [])
+        if not rows:
+            raise LookupError(f"Project not found or not shared: {project_id}")
+        return rows[0]
+
+    def status_names(self) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        for workflow in self.get("workflows", params={"includeSpaceWorkflow": "true"}).get("data", []):
+            for status in workflow.get("customStatuses", []):
+                if status.get("id"):
+                    mapping[str(status["id"])] = str(status.get("name") or status["id"])
+        return mapping
+
+    def workflows_payload(self) -> dict[str, Any]:
+        """Raw GET /workflows response, unmodified."""
+        return self.get("workflows", params={"includeSpaceWorkflow": "true"})
+
+    def status_catalog(self) -> list[dict[str, Any]]:
+        return flatten_workflows(self.workflows_payload())
+
+    def probe(self, path: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """Like get(), but returns a status report instead of raising on non-200.
+
+        Only use this for diagnostics/access checks, not for actually fetching
+        data - keeps Wrike's own error message so we're not just guessing why
+        something is a 403.
+        """
+        url = f"{self.base_url}/{path.lstrip('/')}"
+        record: dict[str, Any] = {
+            "endpoint": f"GET /{path.lstrip('/')}",
+            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        try:
+            response = self.session.get(url, params=params, timeout=self.timeout)
+        except requests.RequestException as exc:
+            record.update({"status_code": None, "accessible": False, "error": str(exc)})
+            return record
+        record["status_code"] = response.status_code
+        record["accessible"] = response.status_code == 200
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if response.status_code != 200 and isinstance(body, Mapping):
+            record["wrike_error"] = body.get("error")
+            record["wrike_error_description"] = body.get("errorDescription")
+        elif response.status_code == 200 and isinstance(body, Mapping):
+            record["response_kind"] = body.get("kind")
+            data = body.get("data")
+            record["rows_returned"] = len(data) if isinstance(data, list) else None
+        return record
+
+    def audit_log(
+        self,
+        *,
+        object_ids: list[str] | None = None,
+        start: str = "2024-01-01T00:00:00Z",
+        end: str | None = None,
+        page_size: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Fetch Audit Log pages. Requires amReadOnlyAuditLog and account permission."""
+        end = end or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        compact = lambda value: json.dumps(value, separators=(",", ":"))
+        params: dict[str, Any] = {
+            "eventDate": compact({"start": start, "end": end}),
+            "operations": compact(["TaskStatusChanged"]),
+            "pageSize": page_size,
+        }
+        if object_ids:
+            params["objectIds"] = compact(object_ids[:10])
+            params["objectType"] = "Project"
+        output: list[dict[str, Any]] = []
+        next_page: str | None = None
+        while True:
+            if next_page:
+                params["nextPageToken"] = next_page
+            payload = self.get("audit_log", params=params)
+            output.extend(payload.get("data", []))
+            next_page = payload.get("nextPageToken")
+            if not next_page:
+                break
+        return output
+
+    def bi_export_manifest(self) -> dict[str, Any]:
+        """Fetch BI Export manifest. Requires dataExportFull and account permission."""
+        return self.get("data_export")
+
+    def list_webhooks(self) -> list[dict[str, Any]]:
+        """Registered webhook subscriptions (id, hookUrl, status, events).
+
+        Just subscription management, no date-range params - the `status`
+        field here is the subscription's own active/suspended flag, not a
+        project status, don't confuse the two when reading the response.
+        """
+        return self.get("webhooks").get("data", [])
