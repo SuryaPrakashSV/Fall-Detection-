@@ -1,163 +1,30 @@
-import hashlib
-import hmac
-import json
-import sys
-import tempfile
-import types
-import unittest
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+Now verify the merge didn't break anything, then run the diagnostics. In order:
 
-import pandas as pd
+1. Run the test suite first
+cd ~/Documents/wrike_project_status_history/full_implementation
+python3 -m unittest -v test_full_implementation.py
 
-from status_history_core import (
-    attach_to_project_rows,
-    lifecycle_metrics,
-    normalize_bi_export,
-    normalize_events,
-)
-from webhook_receiver import challenge_response, process_request, signature
-from wrike_status_api import describe_project_fields, flatten_workflows
+Expect 7 tests passing (not 4). If anything errors — especially an ImportError or AttributeError mentioning register_webhook or similar — that's the merge point where your register-webhook addition collided with something I changed. Paste me the exact error, don't try to guess-fix it.
 
+2. If tests pass, run the four diagnostics in this order
+python3 status_history_cli.py diagnose-access --project-id MQAAAAEGPpOb --output access_diagnostics
 
-class FullImplementationTests(unittest.TestCase):
-    def setUp(self):
-        self.events = json.loads(Path("sample_project_status_events.json").read_text())
-        self.history = normalize_events(self.events, source="WEBHOOK")
+Confirms current access state — should show 200s on version/folders/workflows/webhooks and 403s on audit_log/data_export, same as before.
 
-    def test_normalize_dedupe_sequence_and_lifecycle(self):
-        history = normalize_events(self.events + [self.events[0]], source="WEBHOOK")
-        self.assertEqual(len(history), 2)
-        self.assertEqual(history["event_sequence"].tolist(), [1, 2])
-        lifecycle = lifecycle_metrics(history)
-        self.assertEqual(len(lifecycle), 1)
-        self.assertAlmostEqual(lifecycle.iloc[0]["duration_days"], 12.0625)
+python3 status_history_cli.py map-statuses --output status_catalog
 
-    def test_project_only_enrichment_preserves_rows(self):
-        stg = pd.DataFrame([
-            {"key": "MQAAAAEGPpOb", "is_project": "Y"},
-            {"key": "TASK1", "is_project": "N"},
-            {"key": "SUB1", "is_project": "N"},
-        ])
-        result = attach_to_project_rows(stg, self.history)
-        self.assertEqual(len(result), len(stg))
-        self.assertEqual(result.iloc[0]["PROJECT_STATUS_EVENT_COUNT"], 2)
-        self.assertTrue(result.iloc[1:]["PROJECT_STATUS_HISTORY_JSON"].isna().all())
+Answers Akash's "how do you map status ID to a name" question directly.
 
-    def test_signature_and_secure_processing(self):
-        body = json.dumps(self.events).encode()
-        secret = "not-a-real-secret"
-        supplied = signature(secret, body)
-        normalized = process_request(body, {"X-Hook-Signature": supplied}, secret=secret)
-        self.assertEqual(len(normalized), 2)
-        expected = hmac.new(secret.encode(), b"challenge", hashlib.sha256).hexdigest()
-        self.assertEqual(challenge_response(secret, "challenge"), expected)
-        with self.assertRaises(PermissionError):
-            process_request(body, {"X-Hook-Signature": "bad"}, secret=secret)
+python3 status_history_cli.py inspect-project --project-id MQAAAAEGPpOb --output project_inspection
 
-    def test_flatten_workflows_builds_status_catalog(self):
-        payload = {
-            "kind": "workflows",
-            "data": [
-                {
-                    "id": "IEAWF1",
-                    "name": "Project Workflow",
-                    "hidden": False,
-                    "customStatuses": [
-                        {"id": "STATUS_PLANNING", "name": "Planning and Resourcing",
-                         "group": "Active", "color": "Blue", "hidden": False},
-                        {"id": "STATUS_DONE", "name": "Completed",
-                         "group": "Completed", "color": "Green", "hidden": False},
-                        {"name": "Malformed status with no id", "group": "Active"},
-                    ],
-                },
-                {"id": "IEAWF2", "name": "Empty Workflow", "customStatuses": []},
-            ],
-        }
-        catalog = flatten_workflows(payload)
-        self.assertEqual(len(catalog), 2)
-        mapping = {row["custom_status_id"]: row["status_name"] for row in catalog}
-        self.assertEqual(mapping["STATUS_PLANNING"], "Planning and Resourcing")
-        self.assertEqual(mapping["STATUS_DONE"], "Completed")
-        by_id = {row["custom_status_id"]: row for row in catalog}
-        self.assertEqual(by_id["STATUS_DONE"]["status_group"], "Completed")
-        self.assertEqual(by_id["STATUS_PLANNING"]["workflow_name"], "Project Workflow")
-        self.assertEqual(flatten_workflows({"data": []}), [])
+The one that resolves the "start date doesn't match go-live" confusion — read this output before tomorrow's call, it's your answer if he brings it up again.
 
-    def test_describe_project_fields_labels_planned_vs_actual(self):
-        # dates.start (05-10) is a planned date, not tied to the real status
-        # change, and completedDate/updatedDate are a second apart on purpose
-        project = {
-            "id": "MQAAAAEGPpOb",
-            "title": "[FR] Mac APR Update",
-            "createdDate": "2026-03-11T09:00:00Z",
-            "updatedDate": "2026-06-10T13:24:34Z",
-            "completedDate": "2026-06-10T13:24:33Z",
-            "customStatusId": "STATUS_DONE",
-            "dates": {"type": "Planned", "start": "2026-05-10", "due": "2026-06-15"},
-            "project": {"authorId": "KUAMPLE", "ownerIds": ["KUAMPLE"]},
-        }
-        fields = describe_project_fields(project)
-        by_path = {row["field_path"]: row for row in fields}
+python3 status_history_cli.py inspect-webhooks --output webhook_inspection
 
-        self.assertIn("dates.start", by_path)
-        self.assertFalse(by_path["dates.start"]["is_actual_event"])
-        self.assertTrue(by_path["dates.start"]["is_planned_schedule_value"])
-        self.assertIn("PLANNED", by_path["dates.start"]["meaning"].upper())
+Formal proof-in-code of the ProjectStatusChanged conclusion, now that it's built as a real code path instead of an ad-hoc one-liner.
 
-        self.assertTrue(by_path["completedDate"]["is_actual_event"])
-        self.assertFalse(by_path["completedDate"]["is_planned_schedule_value"])
+3. Send me the output
 
-        self.assertFalse(by_path["updatedDate"]["is_actual_event"])
-        self.assertFalse(by_path["updatedDate"]["is_planned_schedule_value"])
+Paste the terminal output (or the JSON files) from all four, especially inspect-project — I want to see the actual field values before you take them into tomorrow's call, in case there's a wrinkle in the real data that the fixture-based test didn't cover.
 
-        self.assertNotIn("project.ownerIds", by_path)  # not a date/status field, shouldn't show up
-
-    def test_merge_history_drops_stage_table_even_on_merge_failure(self):
-        # snowflake-connector isn't installed here, merge_history() imports it
-        # lazily inside the function so faking the module is enough
-        fake_pandas_tools = types.ModuleType("snowflake.connector.pandas_tools")
-        fake_pandas_tools.write_pandas = MagicMock(return_value=(True, None, len(self.history), None))
-        fake_connector = types.ModuleType("snowflake.connector")
-        fake_connector.pandas_tools = fake_pandas_tools
-        fake_snowflake = types.ModuleType("snowflake")
-        fake_snowflake.connector = fake_connector
-
-        cursor = MagicMock()
-        cursor.execute.side_effect = lambda sql: (_ for _ in ()).throw(
-            RuntimeError("simulated MERGE failure")
-        ) if "MERGE INTO" in sql else None
-        connection = MagicMock()
-        connection.cursor.return_value = cursor
-
-        with patch.dict(
-            sys.modules,
-            {
-                "snowflake": fake_snowflake,
-                "snowflake.connector": fake_connector,
-                "snowflake.connector.pandas_tools": fake_pandas_tools,
-            },
-        ):
-            from snowflake_repository import merge_history
-
-            with self.assertRaises(RuntimeError):
-                merge_history(connection, self.history)
-
-        executed_sql = [call.args[0] for call in cursor.execute.call_args_list]
-        drop_statements = [sql for sql in executed_sql if sql.strip().startswith("DROP TABLE")]
-        self.assertEqual(len(drop_statements), 1, "stage table must be dropped even when MERGE raises")
-        self.assertEqual(cursor.close.call_count, 2)  # once in ensure_table, once in merge_history
-
-    def test_bi_export_reports_no_project_history(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            pd.DataFrame([{"work_id": 1, "work_type": "Task", "api_id": "T1", "work_name": "Task"}]).to_csv(root / "work_item.csv", index=False)
-            pd.DataFrame([{"id": 1, "work_id": 1, "new_workflow_stage_id": 10, "changed_at": "2026-01-01T00:00:00Z"}]).to_csv(root / "work_workflow_stage_history.csv", index=False)
-            pd.DataFrame([{"workflow_stage_id": 10, "workflow_stage_name": "Completed"}]).to_csv(root / "workflow_stage.csv", index=False)
-            history, diagnostics = normalize_bi_export(root)
-            self.assertTrue(history.empty)
-            self.assertEqual(diagnostics["status"], "unsupported_or_empty")
-
-
-if __name__ == "__main__":
-    unittest.main()
+Once that's confirmed working, the only things left on the list are: the SQL Q6 fix (yours), the redone UAT/Tableau comparison (yours), and then deployment — at that point the code side of this project is genuinely done.
