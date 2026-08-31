@@ -1,102 +1,163 @@
-"""Snowflake persistence helpers. All targets are non-production ``_NEW`` objects."""
-
-from __future__ import annotations
-
-import uuid
+import hashlib
+import hmac
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
-
-DATABASE = "GBI_RETAIL_BAP_DB"
-SCHEMA = "ASO_OPS_WSA_SNDBX_BIZ_APP"
-TABLE = "WRIKE_PROJECT_STATUS_HISTORY_NEW"
-FQN = f'{DATABASE}.{SCHEMA}.{TABLE}'
-
-
-def ensure_table(connection) -> None:
-    ddl = f"""
-    CREATE TABLE IF NOT EXISTS {FQN} (
-      PROJECT_ID VARCHAR NOT NULL,
-      PROJECT_NAME VARCHAR,
-      OLD_STATUS_ID VARCHAR,
-      OLD_STATUS_NAME VARCHAR,
-      STATUS_ID VARCHAR,
-      STATUS_NAME VARCHAR,
-      STATUS_CHANGED_AT TIMESTAMP_TZ,
-      STATUS_CHANGED_DATE DATE,
-      STATUS_CHANGED_YEAR NUMBER(4,0),
-      EVENT_SEQUENCE NUMBER,
-      EVENT_AUTHOR_ID VARCHAR,
-      SOURCE VARCHAR NOT NULL,
-      SOURCE_EVENT_ID VARCHAR NOT NULL,
-      SOURCE_PAYLOAD VARIANT,
-      INGESTED_AT TIMESTAMP_TZ,
-      PRIMARY KEY (SOURCE, SOURCE_EVENT_ID)
-    )
-    """
-    cursor = connection.cursor()
-    try:
-        cursor.execute(ddl)
-    finally:
-        cursor.close()
+from status_history_core import (
+    attach_to_project_rows,
+    lifecycle_metrics,
+    normalize_bi_export,
+    normalize_events,
+)
+from webhook_receiver import challenge_response, process_request, signature
+from wrike_status_api import describe_project_fields, flatten_workflows
 
 
-def merge_history(connection, history: pd.DataFrame) -> int:
-    """Idempotently MERGE canonical rows using Snowflake's write_pandas."""
-    if history.empty:
-        return 0
-    from snowflake.connector.pandas_tools import write_pandas
+class FullImplementationTests(unittest.TestCase):
+    def setUp(self):
+        self.events = json.loads(Path("sample_project_status_events.json").read_text())
+        self.history = normalize_events(self.events, source="WEBHOOK")
 
-    ensure_table(connection)
-    stage = f"WRIKE_PROJECT_STATUS_HISTORY_STAGE_{uuid.uuid4().hex[:10].upper()}"
-    data = history.copy()
-    data.columns = [str(c).upper() for c in data.columns]
-    data["SOURCE_PAYLOAD"] = data["SOURCE_PAYLOAD"].fillna("{}")
-    success, _, nrows, _ = write_pandas(
-        connection, data, stage, database=DATABASE, schema=SCHEMA,
-        auto_create_table=True, overwrite=True,
-    )
-    if not success:
-        raise RuntimeError("write_pandas failed for status-history stage")
-    cursor = connection.cursor()
-    try:
-        cursor.execute(f"""
-        MERGE INTO {FQN} target
-        USING {DATABASE}.{SCHEMA}.{stage} source
-          ON target.SOURCE = source.SOURCE
-         AND target.SOURCE_EVENT_ID = source.SOURCE_EVENT_ID
-        WHEN MATCHED THEN UPDATE SET
-          PROJECT_ID=source.PROJECT_ID, PROJECT_NAME=source.PROJECT_NAME,
-          OLD_STATUS_ID=source.OLD_STATUS_ID, OLD_STATUS_NAME=source.OLD_STATUS_NAME,
-          STATUS_ID=source.STATUS_ID, STATUS_NAME=source.STATUS_NAME,
-          STATUS_CHANGED_AT=source.STATUS_CHANGED_AT,
-          STATUS_CHANGED_DATE=source.STATUS_CHANGED_DATE,
-          STATUS_CHANGED_YEAR=source.STATUS_CHANGED_YEAR,
-          EVENT_SEQUENCE=source.EVENT_SEQUENCE,
-          EVENT_AUTHOR_ID=source.EVENT_AUTHOR_ID,
-          SOURCE_PAYLOAD=PARSE_JSON(source.SOURCE_PAYLOAD),
-          INGESTED_AT=source.INGESTED_AT
-        WHEN NOT MATCHED THEN INSERT (
-          PROJECT_ID, PROJECT_NAME, OLD_STATUS_ID, OLD_STATUS_NAME,
-          STATUS_ID, STATUS_NAME, STATUS_CHANGED_AT, STATUS_CHANGED_DATE,
-          STATUS_CHANGED_YEAR, EVENT_SEQUENCE, EVENT_AUTHOR_ID, SOURCE,
-          SOURCE_EVENT_ID, SOURCE_PAYLOAD, INGESTED_AT
-        ) VALUES (
-          source.PROJECT_ID, source.PROJECT_NAME, source.OLD_STATUS_ID,
-          source.OLD_STATUS_NAME, source.STATUS_ID, source.STATUS_NAME,
-          source.STATUS_CHANGED_AT, source.STATUS_CHANGED_DATE,
-          source.STATUS_CHANGED_YEAR, source.EVENT_SEQUENCE,
-          source.EVENT_AUTHOR_ID, source.SOURCE, source.SOURCE_EVENT_ID,
-          PARSE_JSON(source.SOURCE_PAYLOAD), source.INGESTED_AT
-        )
-        """)
-    finally:
-        # drop the stage even if MERGE blew up, otherwise these pile up in the sandbox
-        cursor.execute(f"DROP TABLE IF EXISTS {DATABASE}.{SCHEMA}.{stage}")
-        cursor.close()
-    return int(nrows)
+    def test_normalize_dedupe_sequence_and_lifecycle(self):
+        history = normalize_events(self.events + [self.events[0]], source="WEBHOOK")
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history["event_sequence"].tolist(), [1, 2])
+        lifecycle = lifecycle_metrics(history)
+        self.assertEqual(len(lifecycle), 1)
+        self.assertAlmostEqual(lifecycle.iloc[0]["duration_days"], 12.0625)
+
+    def test_project_only_enrichment_preserves_rows(self):
+        stg = pd.DataFrame([
+            {"key": "MQAAAAEGPpOb", "is_project": "Y"},
+            {"key": "TASK1", "is_project": "N"},
+            {"key": "SUB1", "is_project": "N"},
+        ])
+        result = attach_to_project_rows(stg, self.history)
+        self.assertEqual(len(result), len(stg))
+        self.assertEqual(result.iloc[0]["PROJECT_STATUS_EVENT_COUNT"], 2)
+        self.assertTrue(result.iloc[1:]["PROJECT_STATUS_HISTORY_JSON"].isna().all())
+
+    def test_signature_and_secure_processing(self):
+        body = json.dumps(self.events).encode()
+        secret = "not-a-real-secret"
+        supplied = signature(secret, body)
+        normalized = process_request(body, {"X-Hook-Signature": supplied}, secret=secret)
+        self.assertEqual(len(normalized), 2)
+        expected = hmac.new(secret.encode(), b"challenge", hashlib.sha256).hexdigest()
+        self.assertEqual(challenge_response(secret, "challenge"), expected)
+        with self.assertRaises(PermissionError):
+            process_request(body, {"X-Hook-Signature": "bad"}, secret=secret)
+
+    def test_flatten_workflows_builds_status_catalog(self):
+        payload = {
+            "kind": "workflows",
+            "data": [
+                {
+                    "id": "IEAWF1",
+                    "name": "Project Workflow",
+                    "hidden": False,
+                    "customStatuses": [
+                        {"id": "STATUS_PLANNING", "name": "Planning and Resourcing",
+                         "group": "Active", "color": "Blue", "hidden": False},
+                        {"id": "STATUS_DONE", "name": "Completed",
+                         "group": "Completed", "color": "Green", "hidden": False},
+                        {"name": "Malformed status with no id", "group": "Active"},
+                    ],
+                },
+                {"id": "IEAWF2", "name": "Empty Workflow", "customStatuses": []},
+            ],
+        }
+        catalog = flatten_workflows(payload)
+        self.assertEqual(len(catalog), 2)
+        mapping = {row["custom_status_id"]: row["status_name"] for row in catalog}
+        self.assertEqual(mapping["STATUS_PLANNING"], "Planning and Resourcing")
+        self.assertEqual(mapping["STATUS_DONE"], "Completed")
+        by_id = {row["custom_status_id"]: row for row in catalog}
+        self.assertEqual(by_id["STATUS_DONE"]["status_group"], "Completed")
+        self.assertEqual(by_id["STATUS_PLANNING"]["workflow_name"], "Project Workflow")
+        self.assertEqual(flatten_workflows({"data": []}), [])
+
+    def test_describe_project_fields_labels_planned_vs_actual(self):
+        # dates.start (05-10) is a planned date, not tied to the real status
+        # change, and completedDate/updatedDate are a second apart on purpose
+        project = {
+            "id": "MQAAAAEGPpOb",
+            "title": "[FR] Mac APR Update",
+            "createdDate": "2026-03-11T09:00:00Z",
+            "updatedDate": "2026-06-10T13:24:34Z",
+            "completedDate": "2026-06-10T13:24:33Z",
+            "customStatusId": "STATUS_DONE",
+            "dates": {"type": "Planned", "start": "2026-05-10", "due": "2026-06-15"},
+            "project": {"authorId": "KUAMPLE", "ownerIds": ["KUAMPLE"]},
+        }
+        fields = describe_project_fields(project)
+        by_path = {row["field_path"]: row for row in fields}
+
+        self.assertIn("dates.start", by_path)
+        self.assertFalse(by_path["dates.start"]["is_actual_event"])
+        self.assertTrue(by_path["dates.start"]["is_planned_schedule_value"])
+        self.assertIn("PLANNED", by_path["dates.start"]["meaning"].upper())
+
+        self.assertTrue(by_path["completedDate"]["is_actual_event"])
+        self.assertFalse(by_path["completedDate"]["is_planned_schedule_value"])
+
+        self.assertFalse(by_path["updatedDate"]["is_actual_event"])
+        self.assertFalse(by_path["updatedDate"]["is_planned_schedule_value"])
+
+        self.assertNotIn("project.ownerIds", by_path)  # not a date/status field, shouldn't show up
+
+    def test_merge_history_drops_stage_table_even_on_merge_failure(self):
+        # snowflake-connector isn't installed here, merge_history() imports it
+        # lazily inside the function so faking the module is enough
+        fake_pandas_tools = types.ModuleType("snowflake.connector.pandas_tools")
+        fake_pandas_tools.write_pandas = MagicMock(return_value=(True, None, len(self.history), None))
+        fake_connector = types.ModuleType("snowflake.connector")
+        fake_connector.pandas_tools = fake_pandas_tools
+        fake_snowflake = types.ModuleType("snowflake")
+        fake_snowflake.connector = fake_connector
+
+        cursor = MagicMock()
+        cursor.execute.side_effect = lambda sql: (_ for _ in ()).throw(
+            RuntimeError("simulated MERGE failure")
+        ) if "MERGE INTO" in sql else None
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+
+        with patch.dict(
+            sys.modules,
+            {
+                "snowflake": fake_snowflake,
+                "snowflake.connector": fake_connector,
+                "snowflake.connector.pandas_tools": fake_pandas_tools,
+            },
+        ):
+            from snowflake_repository import merge_history
+
+            with self.assertRaises(RuntimeError):
+                merge_history(connection, self.history)
+
+        executed_sql = [call.args[0] for call in cursor.execute.call_args_list]
+        drop_statements = [sql for sql in executed_sql if sql.strip().startswith("DROP TABLE")]
+        self.assertEqual(len(drop_statements), 1, "stage table must be dropped even when MERGE raises")
+        self.assertEqual(cursor.close.call_count, 2)  # once in ensure_table, once in merge_history
+
+    def test_bi_export_reports_no_project_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pd.DataFrame([{"work_id": 1, "work_type": "Task", "api_id": "T1", "work_name": "Task"}]).to_csv(root / "work_item.csv", index=False)
+            pd.DataFrame([{"id": 1, "work_id": 1, "new_workflow_stage_id": 10, "changed_at": "2026-01-01T00:00:00Z"}]).to_csv(root / "work_workflow_stage_history.csv", index=False)
+            pd.DataFrame([{"workflow_stage_id": 10, "workflow_stage_name": "Completed"}]).to_csv(root / "workflow_stage.csv", index=False)
+            history, diagnostics = normalize_bi_export(root)
+            self.assertTrue(history.empty)
+            self.assertEqual(diagnostics["status"], "unsupported_or_empty")
 
 
-def read_history(connection) -> pd.DataFrame:
-    ensure_table(connection)
-    return pd.read_sql(f"SELECT * FROM {FQN}", connection).rename(columns=str.lower)
+if __name__ == "__main__":
+    unittest.main()
