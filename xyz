@@ -251,25 +251,29 @@ SELECT
 FROM scored
 ORDER BY query_name;
 ===============================================================
-    inspect_webhooks = sub.add_parser(
-        "inspect-webhooks",
-        help="Fetch GET /webhooks and prove it returns subscription metadata, not historical status events",
-    )
-    inspect_webhooks.add_argument("--output", default="webhook_inspection")
-    map_statuses = sub.add_parser(
-        "map-statuses",
-        help="Build the customStatusId -> readable status name catalog from GET /workflows",
-    )
-    map_statuses.add_argument("--output", default="status_catalog")
-    diagnose = sub.add_parser(
-        "diagnose-access",
-        help="Probe each endpoint and record which are accessible with the current token",
-    )
-    diagnose.add_argument("--project-id", default="MQAAAAEGPpOb")
-    diagnose.add_argument("--output", default="access_diagnostics")
-    inspect_project = sub.add_parser(
-        "inspect-project",
-        help="Fetch a project and label every date/status field with what it actually means (actual event vs planned schedule value)",
-    )
-    inspect_project.add_argument("--project-id", default="MQAAAAEGPpOb")
-    inspect_project.add_argument("--output", default="project_inspection")
+    elif args.command == "webhook-normalize":
+        payload = json.loads(Path(args.input).read_text())
+        events = payload if isinstance(payload, list) else [payload]
+        history = normalize_events(events, source=args.source)
+        synthetic = args.source.upper() != "WEBHOOK"
+        write_outputs(
+            history,
+            Path(args.output),
+            {
+                "source": args.source.upper(),
+                "synthetic": synthetic,
+                "warning": (
+                    "These rows were generated from fabricated sample events. The "
+                    "project_id is real but the dates and statuses are invented and "
+                    "do NOT reflect this project's actual Wrike history. Never present "
+                    "as retrieved data."
+                )
+                if synthetic
+                else None,
+            },
+        )
+        if synthetic:
+            print(
+                f"WARNING: source={args.source.upper()} — output contains FABRICATED "
+                "dates/statuses against a real project_id. Do not present as Wrike history."
+            )
