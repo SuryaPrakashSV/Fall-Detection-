@@ -251,12 +251,25 @@ SELECT
 FROM scored
 ORDER BY query_name;
 ===============================================================
-SELECT
-    TABLE_NAME,
-    TABLE_TYPE,
-    RETENTION_TIME,
-    CREATED,
-    LAST_ALTERED
-FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.TABLES
-WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-  AND UPPER(TABLE_NAME) = 'WRIKE_STG';
+    inspect_webhooks = sub.add_parser(
+        "inspect-webhooks",
+        help="Fetch GET /webhooks and prove it returns subscription metadata, not historical status events",
+    )
+    inspect_webhooks.add_argument("--output", default="webhook_inspection")
+    map_statuses = sub.add_parser(
+        "map-statuses",
+        help="Build the customStatusId -> readable status name catalog from GET /workflows",
+    )
+    map_statuses.add_argument("--output", default="status_catalog")
+    diagnose = sub.add_parser(
+        "diagnose-access",
+        help="Probe each endpoint and record which are accessible with the current token",
+    )
+    diagnose.add_argument("--project-id", default="MQAAAAEGPpOb")
+    diagnose.add_argument("--output", default="access_diagnostics")
+    inspect_project = sub.add_parser(
+        "inspect-project",
+        help="Fetch a project and label every date/status field with what it actually means (actual event vs planned schedule value)",
+    )
+    inspect_project.add_argument("--project-id", default="MQAAAAEGPpOb")
+    inspect_project.add_argument("--output", default="project_inspection")
