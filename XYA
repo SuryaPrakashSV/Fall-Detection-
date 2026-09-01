@@ -1,7 +1,6 @@
 SELECT
     PROJECT_ID,
     PROJECT_NAME,
-
     COUNT(DISTINCT TRIM(CUSTOM_STATUS)) AS DISTINCT_PROJECT_STATUSES,
 
     LISTAGG(
@@ -18,22 +17,6 @@ FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_APL_BAU_PROJECT_LEVEL
 WHERE PROJECT_ID IS NOT NULL
   AND CUSTOM_STATUS IS NOT NULL
   AND TRIM(CUSTOM_STATUS) <> ''
-
-  AND TRIM(CUSTOM_STATUS) IN (
-      'Not Started',
-      'PM pending',
-      'Planning/Resourcing',
-      'In Progress',
-      'PM Task/Milestone',
-      'New',
-      'Completed',
-      'Completed - Delayed',
-      'PM - Completed',
-      'Backlog',
-      'On Hold',
-      'Absorbed Scope',
-      'Cancelled'
-  )
 
 GROUP BY
     PROJECT_ID,
