@@ -29,9 +29,10 @@ Paste the terminal output (or the JSON files) from all four, especially inspect-
 
 Once that's confirmed working, the only things left on the list are: the SQL Q6 fix (yours), the redone UAT/Tableau comparison (yours), and then deployment — at that point the code side of this project is genuinely done.
 =====================================================================================================x=
-find project_inspection/20260901 \
-  -maxdepth 1 \
-  -type f \
-  -iname '*hierarchy*.json' \
-  -print \
-  -exec python3 -m json.tool {} \;
+cd wrike_status_track1_updated
+
+python3 -m unittest -v test_full_implementation.py
+
+python3 status_history_cli.py verify-control \
+  --project-id MQAAAAEGPpOb \
+  --output control_project_verification
