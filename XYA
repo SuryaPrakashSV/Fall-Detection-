@@ -35,16 +35,24 @@ from pathlib import Path
 from status_history_cli import token
 from wrike_status_api import WrikeClient
 
-project_id = "MQAAAAEGPpOb"
 client = WrikeClient(token())
 
-result = client.get(f"folders/{project_id}/folders_history")
+params = {
+    "updatedDate": json.dumps({
+        "start": "2026-05-01T00:00:00Z",
+        "end": "2026-06-30T23:59:59Z"
+    })
+}
 
-Path("folder_history_live.json").write_text(
+result = client.get(
+    "folders/MQAAAAEGPpOb/folders_history",
+    params=params
+)
+
+Path("folder_history_may_june.json").write_text(
     json.dumps(result, indent=2),
     encoding="utf-8"
 )
 
 print(json.dumps(result, indent=2))
-print("\nSaved to folder_history_live.json")
 PY
