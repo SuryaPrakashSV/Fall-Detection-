@@ -1,12 +1,6 @@
 SELECT
     table_schema,
-    table_name,
-    column_name,
-    data_type,
-    ordinal_position
-FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
+    table_name
+FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.TABLES
 WHERE table_schema = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-  AND table_name ILIKE '%APL%BAU%PROJECT%LEVEL%'
-ORDER BY
-    table_name,
-    ordinal_position;
+  AND table_name ILIKE '%APL%';
