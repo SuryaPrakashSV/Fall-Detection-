@@ -1,13 +1,13 @@
 SELECT
     table_name,
+    ordinal_position,
     column_name,
     data_type
 FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
 WHERE UPPER(table_schema) = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-  AND (
-       UPPER(column_name) LIKE '%PROJECT%STATUS%'
-       OR UPPER(column_name) LIKE '%PROJECT%CUSTOM%STATUS%'
-       OR UPPER(column_name) = 'PROJECT_STATUS'
+  AND UPPER(table_name) IN (
+      'WRIKE_PROJECT_ASSIGNEE_DETAIL',
+      'WRIKE_PROJECT_ASSIGNEE_DETAIL_NEW'
   )
 ORDER BY
     table_name,
