@@ -1,19 +1,8 @@
 SELECT
-    table_schema,
-    table_name,
-    table_type,
-    created,
-    last_altered,
-    retention_time
-FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.TABLES
-WHERE (
-       UPPER(table_name) LIKE '%WRIKE%'
-    OR UPPER(table_name) LIKE '%HISTORY%'
-    OR UPPER(table_name) LIKE '%SNAPSHOT%'
-    OR UPPER(table_name) LIKE '%ARCHIVE%'
-    OR UPPER(table_name) LIKE '%BACKUP%'
-)
-ORDER BY
-    created,
-    table_schema,
-    table_name;
+    ordinal_position,
+    column_name,
+    data_type
+FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
+WHERE table_schema = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+  AND table_name = 'WRIKE_APL_BAU_PROJECT_LEVEL'
+ORDER BY ordinal_position;
