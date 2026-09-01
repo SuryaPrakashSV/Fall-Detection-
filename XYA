@@ -29,10 +29,13 @@ Paste the terminal output (or the JSON files) from all four, especially inspect-
 
 Once that's confirmed working, the only things left on the list are: the SQL Q6 fix (yours), the redone UAT/Tableau comparison (yours), and then deployment — at that point the code side of this project is genuinely done.
 =====================================================================================================x=
-cd wrike_status_track1_updated
+cd ~/Downloads
+
+ls -l wrike_status_history_control_verification_20260901.zip
+
+unzip wrike_status_history_control_verification_20260901.zip \
+  -d wrike_status_20260901_run
+
+cd wrike_status_20260901_run/wrike_status_track1_updated
 
 python3 -m unittest -v test_full_implementation.py
-
-python3 status_history_cli.py verify-control \
-  --project-id MQAAAAEGPpOb \
-  --output control_project_verification
