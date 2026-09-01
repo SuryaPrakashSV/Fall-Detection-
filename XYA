@@ -1,10 +1,19 @@
-SELECT DISTINCT
-    PROJECT_ID,
-    PROJECT_NAME,
-    PROJECT_CUSTOM_STATUS,
-    PROJECT_DATA_REFRESH
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_PROJECT_ASSIGNEE_DETAIL
-AT (
-    TIMESTAMP => '2026-06-09 12:00:00'::TIMESTAMP
+SELECT
+    table_schema,
+    table_name,
+    table_type,
+    created,
+    last_altered,
+    retention_time
+FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.TABLES
+WHERE (
+       UPPER(table_name) LIKE '%WRIKE%'
+    OR UPPER(table_name) LIKE '%HISTORY%'
+    OR UPPER(table_name) LIKE '%SNAPSHOT%'
+    OR UPPER(table_name) LIKE '%ARCHIVE%'
+    OR UPPER(table_name) LIKE '%BACKUP%'
 )
-WHERE PROJECT_ID = 'MQAAAAEGPpOb';
+ORDER BY
+    created,
+    table_schema,
+    table_name;
