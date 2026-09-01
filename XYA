@@ -29,30 +29,9 @@ Paste the terminal output (or the JSON files) from all four, especially inspect-
 
 Once that's confirmed working, the only things left on the list are: the SQL Q6 fix (yours), the redone UAT/Tableau comparison (yours), and then deployment — at that point the code side of this project is genuinely done.
 =====================================================================================================x=
-python3 - <<'PY'
-import json
-from pathlib import Path
-from status_history_cli import token
-from wrike_status_api import WrikeClient
-
-client = WrikeClient(token())
-
-params = {
-    "updatedDate": json.dumps({
-        "start": "2026-05-01T00:00:00Z",
-        "end": "2026-06-30T23:59:59Z"
-    })
-}
-
-result = client.get(
-    "folders/MQAAAAEGPpOb/folders_history",
-    params=params
-)
-
-Path("folder_history_may_june.json").write_text(
-    json.dumps(result, indent=2),
-    encoding="utf-8"
-)
-
-print(json.dumps(result, indent=2))
-PY
+find project_inspection/20260901 \
+  -maxdepth 1 \
+  -type f \
+  -iname '*hierarchy*.json' \
+  -print \
+  -exec python3 -m json.tool {} \;
