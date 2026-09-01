@@ -1,3 +1,18 @@
-python3 status_history_cli.py verify-control \
-  --project-id MQAAAAEGPpOb \
-  --output control_project_verification
+SELECT
+    table_schema,
+    table_name,
+    column_name,
+    data_type
+FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
+WHERE UPPER(table_schema) = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+  AND (
+       UPPER(column_name) LIKE '%STATUS%'
+    OR UPPER(column_name) LIKE '%HISTORY%'
+    OR UPPER(column_name) LIKE '%UPDATED%'
+    OR UPPER(column_name) LIKE '%MODIFIED%'
+    OR UPPER(column_name) LIKE '%CREATED%'
+    OR UPPER(column_name) LIKE '%TIMESTAMP%'
+    OR UPPER(column_name) LIKE '%EVENT%'
+    OR UPPER(column_name) LIKE '%ACTIVITY%'
+  )
+ORDER BY table_name, ordinal_position;
