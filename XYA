@@ -1,3 +1,386 @@
-cd "/Users/venkatasuryaprakash/Documents/wrike_project_status_history/full_implementation"
+import hashlib
+import hmac
+import json
+import os
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
-grep -c '^[[:space:]]*def test_' test_full_implementation.py
+import pandas as pd
+
+from status_history_core import (
+    attach_to_project_rows,
+    lifecycle_metrics,
+    normalize_bi_export,
+    normalize_events,
+)
+from webhook_receiver import challenge_response, process_request, signature
+from webhook_server import validated_challenge_response
+from wrike_status_api import (
+    WrikeClient,
+    describe_project_fields,
+    flatten_workflows,
+    folder_hierarchy,
+    label_custom_fields,
+    label_folder_hierarchy,
+)
+
+
+class FullImplementationTests(unittest.TestCase):
+    def setUp(self):
+        self.events = json.loads(Path("sample_project_status_events.json").read_text())
+        self.history = normalize_events(self.events, source="WEBHOOK")
+
+    def test_normalize_dedupe_sequence_and_lifecycle(self):
+        history = normalize_events(self.events + [self.events[0]], source="WEBHOOK")
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history["event_sequence"].tolist(), [1, 2])
+        lifecycle = lifecycle_metrics(history)
+        self.assertEqual(len(lifecycle), 1)
+        self.assertAlmostEqual(lifecycle.iloc[0]["duration_days"], 12.0625)
+
+    def test_project_only_enrichment_preserves_rows(self):
+        stg = pd.DataFrame([
+            {"key": "MQAAAAEGPpOb", "is_project": "Y"},
+            {"key": "TASK1", "is_project": "N"},
+            {"key": "SUB1", "is_project": "N"},
+        ])
+        result = attach_to_project_rows(stg, self.history)
+        self.assertEqual(len(result), len(stg))
+        self.assertEqual(result.iloc[0]["PROJECT_STATUS_EVENT_COUNT"], 2)
+        self.assertTrue(result.iloc[1:]["PROJECT_STATUS_HISTORY_JSON"].isna().all())
+
+    def test_signature_and_secure_processing(self):
+        body = json.dumps(self.events).encode()
+        secret = "not-a-real-secret"
+        supplied = signature(secret, body)
+        normalized = process_request(body, {"X-Hook-Signature": supplied}, secret=secret)
+        self.assertEqual(len(normalized), 2)
+        expected = hmac.new(secret.encode(), b"challenge", hashlib.sha256).hexdigest()
+        self.assertEqual(challenge_response(secret, "challenge"), expected)
+        with self.assertRaises(PermissionError):
+            process_request(body, {"X-Hook-Signature": "bad"}, secret=secret)
+
+    def test_secure_webhook_handshake_requires_and_verifies_signature(self):
+        secret = "not-a-real-secret"
+        challenge = "Challenge123"
+        body = b'{"requestType":"WebHook secret verification"}'
+        supplied = signature(secret, body)
+
+        self.assertEqual(
+            validated_challenge_response(secret, body, challenge, supplied),
+            challenge_response(secret, challenge),
+        )
+        with self.assertRaises(PermissionError):
+            validated_challenge_response(secret, body, challenge, "bad-signature")
+        with self.assertRaises(ValueError):
+            validated_challenge_response(secret, body, "not valid{}", supplied)
+
+    def test_flatten_workflows_builds_status_catalog(self):
+        payload = {
+            "kind": "workflows",
+            "data": [
+                {
+                    "id": "IEAWF1",
+                    "name": "Project Workflow",
+                    "hidden": False,
+                    "customStatuses": [
+                        {"id": "STATUS_PLANNING", "name": "Planning and Resourcing",
+                         "group": "Active", "color": "Blue", "hidden": False},
+                        {"id": "STATUS_DONE", "name": "Completed",
+                         "group": "Completed", "color": "Green", "hidden": False},
+                        {"name": "Malformed status with no id", "group": "Active"},
+                    ],
+                },
+                {"id": "IEAWF2", "name": "Empty Workflow", "customStatuses": []},
+            ],
+        }
+        catalog = flatten_workflows(payload)
+        self.assertEqual(len(catalog), 2)
+        mapping = {row["custom_status_id"]: row["status_name"] for row in catalog}
+        self.assertEqual(mapping["STATUS_PLANNING"], "Planning and Resourcing")
+        self.assertEqual(mapping["STATUS_DONE"], "Completed")
+        by_id = {row["custom_status_id"]: row for row in catalog}
+        self.assertEqual(by_id["STATUS_DONE"]["status_group"], "Completed")
+        self.assertEqual(by_id["STATUS_PLANNING"]["workflow_name"], "Project Workflow")
+        self.assertEqual(flatten_workflows({"data": []}), [])
+
+    def test_describe_project_fields_labels_planned_vs_actual(self):
+        # dates.start (05-10) is a planned date, not tied to the real status
+        # change, and completedDate/updatedDate are a second apart on purpose
+        project = {
+            "id": "MQAAAAEGPpOb",
+            "title": "[FR] Mac APR Update",
+            "createdDate": "2026-03-11T09:00:00Z",
+            "updatedDate": "2026-06-10T13:24:34Z",
+            "completedDate": "2026-06-10T13:24:33Z",
+            "customStatusId": "STATUS_DONE",
+            "dates": {"type": "Planned", "start": "2026-05-10", "due": "2026-06-15"},
+            "project": {
+                "authorId": "KUAMPLE",
+                "ownerIds": ["KUAMPLE"],
+                "startDate": "2026-05-18",
+                "endDate": "2026-06-09",
+            },
+        }
+        fields = describe_project_fields(project)
+        by_path = {row["field_path"]: row for row in fields}
+
+        self.assertIn("dates.start", by_path)
+        self.assertFalse(by_path["dates.start"]["is_actual_event"])
+        self.assertTrue(by_path["dates.start"]["is_planned_schedule_value"])
+        self.assertIn("PLANNED", by_path["dates.start"]["meaning"].upper())
+
+        for real_field in ("project.startDate", "project.endDate"):
+            self.assertIn(real_field, by_path)
+            self.assertFalse(by_path[real_field]["is_actual_event"])
+            self.assertTrue(by_path[real_field]["is_planned_schedule_value"])
+            self.assertIn("PLANNED", by_path[real_field]["meaning"].upper())
+
+        self.assertTrue(by_path["completedDate"]["is_actual_event"])
+        self.assertFalse(by_path["completedDate"]["is_planned_schedule_value"])
+
+        self.assertFalse(by_path["updatedDate"]["is_actual_event"])
+        self.assertFalse(by_path["updatedDate"]["is_planned_schedule_value"])
+
+        self.assertNotIn("project.ownerIds", by_path)  # not a date/status field, shouldn't show up
+
+    def test_label_custom_fields_resolves_ids_to_names(self):
+        project = {
+            "id": "MQAAAAEGPpOb",
+            "customFields": [
+                {"id": "IEACF1", "value": "2026-05-26"},
+                {"id": "IEACF2", "value": "Some note"},
+                {"id": "IEACFMISSING", "value": "orphaned - not in account defs"},
+            ],
+        }
+        definitions = {
+            "data": [
+                {"id": "IEACF1", "title": "Actual In Progress Date", "type": "Date"},
+                {"id": "IEACF2", "title": "PM Notes", "type": "Text"},
+            ]
+        }
+        rows = label_custom_fields(project, definitions)
+        self.assertEqual(len(rows), 3)
+        by_title = {row["title"]: row for row in rows}
+        self.assertEqual(by_title["Actual In Progress Date"]["value"], "2026-05-26")
+        self.assertEqual(by_title["Actual In Progress Date"]["type"], "Date")
+        self.assertEqual(by_title["PM Notes"]["value"], "Some note")
+        unlabeled = [row for row in rows if row["field_id"] == "IEACFMISSING"]
+        self.assertEqual(len(unlabeled), 1)
+        self.assertIn("unknown", unlabeled[0]["title"])
+        self.assertEqual(label_custom_fields({}, definitions), [])
+
+    def test_folder_hierarchy_extracts_ids_and_resolves_titles(self):
+        project = {
+            "id": "MQAAAAEGPpOb",
+            "title": "[FR] Mac APR Update",
+            "parentIds": ["IEAPARENT1"],
+            "childIds": ["IEACHILD1", "IEACHILD2"],
+            "superParentIds": ["IEASUPER1"],
+        }
+        hierarchy = folder_hierarchy(project)
+        self.assertEqual(hierarchy["project_id"], "MQAAAAEGPpOb")
+        self.assertEqual(hierarchy["parent_ids"], ["IEAPARENT1"])
+        self.assertEqual(hierarchy["child_ids"], ["IEACHILD1", "IEACHILD2"])
+        self.assertEqual(hierarchy["super_parent_ids"], ["IEASUPER1"])
+
+        folders_payload = {"data": [{"id": "IEACHILD2", "title": "Subtask Alpha"}]}
+        labeled = label_folder_hierarchy(hierarchy, folders_payload)
+        self.assertEqual(labeled["parents"], [{"id": "IEAPARENT1", "title": "(not resolvable with current access)"}])
+        self.assertEqual(
+            labeled["children"],
+            [
+                {"id": "IEACHILD1", "title": "(not resolvable with current access)"},
+                {"id": "IEACHILD2", "title": "Subtask Alpha"},
+            ],
+        )
+        self.assertEqual(labeled["super_parents"], [{"id": "IEASUPER1", "title": "(not resolvable with current access)"}])
+
+        empty = folder_hierarchy({"id": "X"})
+        self.assertEqual(empty["parent_ids"], [])
+        self.assertEqual(label_folder_hierarchy(empty, {"data": []}), {
+            "project_id": "X", "project_name": None, "parents": [], "children": [], "super_parents": [],
+        })
+
+    def test_register_webhook_builds_contextual_project_event_form(self):
+        client = WrikeClient("test-token")
+        client.post = MagicMock(
+            return_value={"kind": "webhooks", "data": [{"id": "HOOK1", "status": "Active"}]}
+        )
+
+        result = client.register_webhook(
+            folder_id="MQAAAAEGPpOb",
+            hook_url="https://receiver.example.test/wrike",
+            events=["ProjectStatusChanged"],
+            fields=["title", "customFields", "project"],
+            recursive=False,
+            secret="test-secret",
+        )
+
+        self.assertEqual(result["data"][0]["status"], "Active")
+        endpoint, form = client.post.call_args.args
+        self.assertEqual(endpoint, "folders/MQAAAAEGPpOb/webhooks")
+        self.assertNotIn("events", form)  # Wrike forbids the same event in both forms.
+        self.assertEqual(form["recursive"], "false")
+        self.assertEqual(form["secret"], "test-secret")
+        self.assertEqual(
+            json.loads(form["parameterisedEvents"]),
+            [{
+                "event": "ProjectStatusChanged",
+                "fields": ["title", "customFields", "project"],
+            }],
+        )
+
+    def test_cli_register_webhook_creates_redacted_evidence(self):
+        import status_history_cli
+
+        fake_client = MagicMock()
+        fake_client.list_webhooks.return_value = []
+        fake_client.register_webhook.return_value = {
+            "kind": "webhooks",
+            "data": [{
+                "id": "HOOK1",
+                "status": "Active",
+                "folderId": "MQAAAAEGPpOb",
+                "accountId": "ACCOUNT1",
+                "hookUrl": "https://receiver.example.test/wrike",
+            }],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            argv = [
+                "status_history_cli.py",
+                "register-webhook",
+                "--folder-id",
+                "MQAAAAEGPpOb",
+                "--secure",
+                "--output",
+                str(output),
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.dict(
+                    os.environ,
+                    {
+                        "WRIKE_TOKEN": "test-token",
+                        "WRIKE_WEBHOOK_URL": "https://receiver.example.test/wrike",
+                        "WRIKE_WEBHOOK_SECRET": "test-secret",
+                    },
+                    clear=False,
+                ),
+                patch("wrike_status_api.WrikeClient", return_value=fake_client),
+                patch("status_history_cli.dated_output_dir", return_value=output),
+                patch("builtins.print"),
+            ):
+                status_history_cli.main()
+
+            fake_client.register_webhook.assert_called_once_with(
+                folder_id="MQAAAAEGPpOb",
+                hook_url="https://receiver.example.test/wrike",
+                events=["ProjectStatusChanged"],
+                fields=["title", "customFields", "project"],
+                recursive=False,
+                secret="test-secret",
+            )
+            evidence = (output / "webhook_registration_response.json").read_text()
+            report = json.loads(evidence)
+            self.assertEqual(report["action"], "created")
+            self.assertEqual(report["response"]["data"][0]["hookUrl"], "[REDACTED]")
+            self.assertNotIn("receiver.example.test", evidence)
+            self.assertNotIn("test-secret", evidence)
+
+    def test_cli_register_webhook_reuses_matching_subscription(self):
+        import status_history_cli
+
+        existing = {
+            "id": "HOOK1",
+            "status": "Active",
+            "folderId": "MQAAAAEGPpOb",
+            "accountId": "ACCOUNT1",
+            "hookUrl": "https://receiver.example.test/wrike",
+        }
+        fake_client = MagicMock()
+        fake_client.list_webhooks.return_value = [existing]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            argv = [
+                "status_history_cli.py",
+                "register-webhook",
+                "--folder-id",
+                "MQAAAAEGPpOb",
+                "--output",
+                str(output),
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.dict(
+                    os.environ,
+                    {
+                        "WRIKE_TOKEN": "test-token",
+                        "WRIKE_WEBHOOK_URL": "https://receiver.example.test/wrike",
+                    },
+                    clear=False,
+                ),
+                patch("wrike_status_api.WrikeClient", return_value=fake_client),
+                patch("status_history_cli.dated_output_dir", return_value=output),
+                patch("builtins.print"),
+            ):
+                status_history_cli.main()
+
+            fake_client.register_webhook.assert_not_called()
+            report = json.loads((output / "webhook_registration_response.json").read_text())
+            self.assertEqual(report["action"], "reused_existing")
+            self.assertEqual(report["response"]["data"][0]["hookUrl"], "[REDACTED]")
+
+    def test_merge_history_drops_stage_table_even_on_merge_failure(self):
+        # snowflake-connector isn't installed here, merge_history() imports it
+        # lazily inside the function so faking the module is enough
+        fake_pandas_tools = types.ModuleType("snowflake.connector.pandas_tools")
+        fake_pandas_tools.write_pandas = MagicMock(return_value=(True, None, len(self.history), None))
+        fake_connector = types.ModuleType("snowflake.connector")
+        fake_connector.pandas_tools = fake_pandas_tools
+        fake_snowflake = types.ModuleType("snowflake")
+        fake_snowflake.connector = fake_connector
+
+        cursor = MagicMock()
+        cursor.execute.side_effect = lambda sql: (_ for _ in ()).throw(
+            RuntimeError("simulated MERGE failure")
+        ) if "MERGE INTO" in sql else None
+        connection = MagicMock()
+        connection.cursor.return_value = cursor
+
+        with patch.dict(
+            sys.modules,
+            {
+                "snowflake": fake_snowflake,
+                "snowflake.connector": fake_connector,
+                "snowflake.connector.pandas_tools": fake_pandas_tools,
+            },
+        ):
+            from snowflake_repository import merge_history
+
+            with self.assertRaises(RuntimeError):
+                merge_history(connection, self.history)
+
+        executed_sql = [call.args[0] for call in cursor.execute.call_args_list]
+        drop_statements = [sql for sql in executed_sql if sql.strip().startswith("DROP TABLE")]
+        self.assertEqual(len(drop_statements), 1, "stage table must be dropped even when MERGE raises")
+        self.assertEqual(cursor.close.call_count, 2)  # once in ensure_table, once in merge_history
+
+    def test_bi_export_reports_no_project_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pd.DataFrame([{"work_id": 1, "work_type": "Task", "api_id": "T1", "work_name": "Task"}]).to_csv(root / "work_item.csv", index=False)
+            pd.DataFrame([{"id": 1, "work_id": 1, "new_workflow_stage_id": 10, "changed_at": "2026-01-01T00:00:00Z"}]).to_csv(root / "work_workflow_stage_history.csv", index=False)
+            pd.DataFrame([{"workflow_stage_id": 10, "workflow_stage_name": "Completed"}]).to_csv(root / "workflow_stage.csv", index=False)
+            history, diagnostics = normalize_bi_export(root)
+            self.assertTrue(history.empty)
+            self.assertEqual(diagnostics["status"], "unsupported_or_empty")
+
+
+if __name__ == "__main__":
+    unittest.main()
