@@ -1,574 +1,589 @@
-"""Canonical Wrike project-status history transformations.
-
-This module is deliberately side-effect free. It normalizes events from Wrike
-webhooks, Audit Log, or BI Export, calculates lifecycle durations, and enriches
-only project-level Wrike_STG rows while preserving the input row count.
-"""
+"""Command-line POC for real API testing and offline integration demos."""
 
 from __future__ import annotations
 
-import hashlib
+import argparse
+import getpass
 import json
-from collections.abc import Iterable, Mapping
+import os
 from pathlib import Path
-from typing import Any
 
 import pandas as pd
 
-
-HISTORY_COLUMNS = [
-    "project_id",
-    "project_name",
-    "old_status_id",
-    "old_status_name",
-    "status_id",
-    "status_name",
-    "status_changed_at",
-    "status_changed_date",
-    "status_changed_year",
-    "event_sequence",
-    "event_author_id",
-    "source",
-    "source_event_id",
-    "source_payload",
-    "ingested_at",
-]
-
-
-CONTROL_PROJECT_ID = "MQAAAAEGPpOb"
-CONTROL_PROJECT_NAME = "[FR] Mac APR Update"
-CONTROL_EXPECTATIONS = (
-    {"status_name": "In Progress", "status_changed_date": "2026-05-26"},
-    {"status_name": "Completed", "status_changed_date": "2026-06-10"},
+from status_history_core import (
+    CONTROL_EXPECTATIONS,
+    CONTROL_PROJECT_ID,
+    attach_to_project_rows,
+    lifecycle_metrics,
+    normalize_bi_export,
+    normalize_events,
+    verify_control_project,
 )
-HISTORICAL_BACKFILL_SOURCES = {"AUDIT_LOG", "BI_EXPORT"}
 
 
-def _utc(value: Any) -> pd.Timestamp:
-    return pd.to_datetime(value, utc=True, errors="coerce")
+def parse_expected(pairs: list[str] | None) -> list[dict[str, str]]:
+    """Parse repeated --expected "Status Name:YYYY-MM-DD" values.
 
-
-def _first(mapping: Mapping[str, Any], *keys: str) -> Any:
-    for key in keys:
-        value = mapping.get(key)
-        if value not in (None, ""):
-            return value
-    return None
-
-
-def _stable_event_id(row: Mapping[str, Any]) -> str:
-    parts = [
-        str(row.get("source") or ""),
-        str(row.get("project_id") or ""),
-        str(row.get("status_changed_at") or ""),
-        str(row.get("old_status_id") or row.get("old_status_name") or ""),
-        str(row.get("status_id") or row.get("status_name") or ""),
-        str(row.get("event_author_id") or ""),
-    ]
-    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
-
-
-def normalize_events(
-    events: Iterable[Mapping[str, Any]],
-    *,
-    source: str,
-    project_names: Mapping[str, str] | None = None,
-    status_names: Mapping[str, str] | None = None,
-) -> pd.DataFrame:
-    """Normalize webhook-like or Audit Log-like rows into one stable schema."""
-    project_names = project_names or {}
-    status_names = status_names or {}
-    rows: list[dict[str, Any]] = []
-    ingested_at = pd.Timestamp.now(tz="UTC")
-
-    for raw in events:
-        event_type = _first(raw, "eventType", "event_type", "operation", "action")
-        if event_type and "status" not in str(event_type).lower():
-            continue
-
-        details = raw.get("details") if isinstance(raw.get("details"), Mapping) else {}
-        project_id = str(
-            _first(raw, "projectId", "project_id", "taskId", "objectId", "object_id")
-            or _first(details, "projectId", "taskId", "objectId")
-            or ""
-        ).strip()
-        if not project_id:
-            continue
-
-        old_status_id = _first(raw, "oldCustomStatusId", "old_status_id") or _first(
-            details, "oldCustomStatusId", "oldStatusId", "oldValue"
-        )
-        status_id = _first(raw, "customStatusId", "status_id") or _first(
-            details, "customStatusId", "statusId", "newValue"
-        )
-        old_status_name = _first(raw, "oldStatus", "old_status_name") or _first(
-            details, "oldStatus", "oldStatusName"
-        )
-        status_name = _first(raw, "status", "status_name") or _first(
-            details, "status", "statusName", "newStatus"
-        )
-        if old_status_name is None and old_status_id is not None:
-            old_status_name = status_names.get(str(old_status_id))
-        if status_name is None and status_id is not None:
-            status_name = status_names.get(str(status_id))
-
-        changed_at = _utc(
-            _first(raw, "lastUpdatedDate", "eventDate", "status_changed_at", "timestamp", "createdDate")
-            or _first(details, "eventDate", "timestamp", "createdDate")
-        )
-        row = {
-            "project_id": project_id,
-            "project_name": _first(raw, "projectName", "project_name") or project_names.get(project_id),
-            "old_status_id": old_status_id,
-            "old_status_name": old_status_name,
-            "status_id": status_id,
-            "status_name": status_name,
-            "status_changed_at": changed_at,
-            "event_author_id": _first(raw, "eventAuthorId", "event_author_id", "userId", "authorId"),
-            "source": source.upper(),
-            "source_event_id": _first(raw, "sourceEventId", "source_event_id", "idempotencyKey", "id"),
-            "source_payload": json.dumps(raw, separators=(",", ":"), default=str),
-            "ingested_at": ingested_at,
-        }
-        row["source_event_id"] = str(row["source_event_id"] or _stable_event_id(row))
-        rows.append(row)
-
-    return finalize_history(pd.DataFrame(rows))
-
-
-def finalize_history(frame: pd.DataFrame) -> pd.DataFrame:
-    """Validate, deduplicate, order, and sequence canonical history rows."""
-    if frame.empty:
-        return pd.DataFrame(columns=HISTORY_COLUMNS)
-    required = {"project_id", "status_changed_at", "source_event_id", "source"}
-    missing = required.difference(frame.columns)
-    if missing:
-        raise ValueError(f"History rows are missing columns: {sorted(missing)}")
-    output = frame.copy()
-    for column in HISTORY_COLUMNS:
-        if column not in output.columns:
-            output[column] = pd.NA
-    output["project_id"] = output["project_id"].astype(str)
-    output["status_changed_at"] = pd.to_datetime(output["status_changed_at"], utc=True, errors="coerce")
-    output["ingested_at"] = pd.to_datetime(output["ingested_at"], utc=True, errors="coerce")
-    output = output.drop_duplicates(subset=["source", "source_event_id"], keep="last")
-    output = output.sort_values(
-        ["project_id", "status_changed_at", "source_event_id"], na_position="last"
-    ).reset_index(drop=True)
-    output["status_changed_date"] = output["status_changed_at"].dt.date
-    output["status_changed_year"] = output["status_changed_at"].dt.year.astype("Int64")
-    output["event_sequence"] = output.groupby("project_id").cumcount() + 1
-    return output[HISTORY_COLUMNS]
-
-
-def verify_control_project(
-    project: Mapping[str, Any],
-    *,
-    status_names: Mapping[str, str] | None = None,
-    history: pd.DataFrame | None = None,
-    expectations: Iterable[Mapping[str, str]] = CONTROL_EXPECTATIONS,
-    access_checks: Iterable[Mapping[str, Any]] | None = None,
-) -> tuple[dict[str, Any], pd.DataFrame]:
-    """Compare Akash's control-project expectations with real evidence.
-
-    The ordinary project response is current-state metadata, not a status
-    timeline. It can independently confirm the Completed transition through
-    ``completedDate`` but it cannot prove when the project became In Progress.
-    Only Audit Log or BI Export rows count as historical-backfill evidence.
-
-    Synthetic sample rows are deliberately rejected even if their status/date
-    values happen to match an expectation.
-
-    ``expectations`` defaults to CONTROL_EXPECTATIONS, but that default only
-    means anything for CONTROL_PROJECT_ID - the caller is responsible for
-    passing an empty list or real per-project expectations for any other
-    project. Passing no expectations produces an honest "nothing was
-    verified" report rather than a fabricated pass/fail.
+    Kept separate from argparse wiring so it's testable on its own - a typo
+    here (missing colon, bad date) should fail loudly, not silently produce
+    an expectation nobody meant to check.
     """
-    status_names = status_names or {}
-    expected = [dict(item) for item in expectations]
-    project_id = str(project.get("id") or "")
-    project_name = project.get("title")
-    nested_project = (
-        project.get("project")
-        if isinstance(project.get("project"), Mapping)
-        else {}
-    )
-    current_status_id = project.get("customStatusId") or nested_project.get(
-        "customStatusId"
-    )
-    current_status_name = (
-        project.get("status")
-        or nested_project.get("status")
-        or status_names.get(str(current_status_id or ""))
-    )
-    completed_at = _utc(project.get("completedDate") or nested_project.get("completedDate"))
-
-    candidate_history = (
-        finalize_history(history.copy())
-        if history is not None
-        else finalize_history(pd.DataFrame())
-    )
-    if not candidate_history.empty:
-        candidate_history = candidate_history[
-            candidate_history["project_id"].astype(str).eq(project_id)
-        ].copy()
-
-    rows: list[dict[str, Any]] = []
-    for expectation in expected:
-        wanted_status = str(expectation["status_name"])
-        wanted_date = pd.Timestamp(expectation["status_changed_date"]).date()
-        matches = candidate_history.iloc[0:0].copy()
-        if not candidate_history.empty:
-            normalized_names = (
-                candidate_history["status_name"]
-                .fillna("")
-                .astype(str)
-                .str.strip()
-                .str.casefold()
+    parsed: list[dict[str, str]] = []
+    for pair in pairs or []:
+        if ":" not in pair:
+            raise SystemExit(
+                f"--expected value {pair!r} must be 'Status Name:YYYY-MM-DD' (missing ':')"
             )
-            changed_dates = pd.to_datetime(
-                candidate_history["status_changed_at"], utc=True, errors="coerce"
-            ).dt.date
-            matches = candidate_history[
-                normalized_names.eq(wanted_status.strip().casefold())
-                & changed_dates.eq(wanted_date)
-            ].copy()
+        status_name, _, date_part = pair.partition(":")
+        status_name = status_name.strip()
+        date_part = date_part.strip()
+        if not status_name or not date_part:
+            raise SystemExit(f"--expected value {pair!r} must be 'Status Name:YYYY-MM-DD'")
+        try:
+            pd.Timestamp(date_part)
+        except (ValueError, TypeError) as exc:
+            raise SystemExit(f"--expected value {pair!r} has an invalid date: {exc}")
+        parsed.append({"status_name": status_name, "status_changed_date": date_part})
+    return parsed
 
-        rejected_synthetic = False
-        live_match: Mapping[str, Any] | None = None
-        if not matches.empty:
-            sources = matches["source"].fillna("").astype(str).str.upper()
-            event_ids = matches["source_event_id"].fillna("").astype(str).str.lower()
-            synthetic_mask = sources.str.contains(
-                "SYNTHETIC", regex=False
-            ) | event_ids.str.startswith("demo-event-")
-            rejected_synthetic = bool(synthetic_mask.any())
-            live_matches = matches[
-                sources.isin(HISTORICAL_BACKFILL_SOURCES) & ~synthetic_mask
-            ]
-            if not live_matches.empty:
-                live_match = live_matches.sort_values("status_changed_at").iloc[0].to_dict()
 
-        if live_match is not None:
-            result = "CONFIRMED_LIVE_HISTORY"
-            source = str(live_match.get("source") or "")
-            observed_at = pd.to_datetime(
-                live_match.get("status_changed_at"), utc=True, errors="coerce"
-            )
-            explanation = "Matched a historical event returned by Audit Log or BI Export."
-        elif (
-            wanted_status.strip().casefold() == "completed"
-            and str(current_status_name or "").strip().casefold() == "completed"
-            and not pd.isna(completed_at)
-            and completed_at.date() == wanted_date
-        ):
-            result = "CONFIRMED_CURRENT_METADATA_ONLY"
-            source = "CURRENT_PROJECT_METADATA"
-            observed_at = completed_at
-            explanation = (
-                "completedDate confirms this transition, but the project response "
-                "still is not a complete status timeline."
-            )
-        elif rejected_synthetic:
-            result = "REJECTED_SYNTHETIC_MATCH"
-            source = "SYNTHETIC_DEMO"
-            observed_at = pd.NaT
-            explanation = "A matching demo row exists, but fabricated events are not evidence."
-        else:
-            result = "MISSING_FROM_ACCESSIBLE_SOURCES"
-            source = None
-            observed_at = pd.NaT
-            explanation = (
-                "The transition is absent from current project metadata and no "
-                "permitted historical-backfill row was supplied."
-            )
+def token() -> str:
+    value = os.getenv("WRIKE_TOKEN", "").strip()
+    return value or getpass.getpass("Wrike token (hidden; not saved): ").strip()
 
-        rows.append(
+
+def callback_url() -> str:
+    value = os.getenv("WRIKE_WEBHOOK_URL", "").strip()
+    return value or getpass.getpass("Approved callback URL (hidden; not saved): ").strip()
+
+
+def webhook_secret() -> str:
+    value = os.getenv("WRIKE_WEBHOOK_SECRET", "").strip()
+    return value or getpass.getpass("Webhook signing secret (hidden; not saved): ").strip()
+
+
+def redact_webhook_response(value):
+    """Remove callback URLs and secrets before writing registration evidence."""
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if key.lower() in {"hookurl", "secret"}
+            else redact_webhook_response(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_webhook_response(item) for item in value]
+    return value
+
+
+def dated_output_dir(base: str) -> Path:
+    """Namespace a diagnostic output directory by UTC date (base/YYYYMMDD/).
+
+    A rerun on a later day writes to a new folder instead of silently
+    overwriting the previous day's evidence. These are point-in-time
+    snapshots and cannot be recreated once lost — see the deleted UAT
+    tracker copies incident (2026-08-27), which is exactly this failure
+    mode and is why this exists.
+    """
+    stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%d")
+    path = Path(base) / stamp
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def write_outputs(history: pd.DataFrame, output: Path, diagnostics: dict | None = None) -> None:
+    output.mkdir(parents=True, exist_ok=True)
+    history.to_csv(output / "project_status_history.csv", index=False)
+    lifecycle_metrics(history).to_csv(output / "project_status_lifecycle.csv", index=False)
+    if diagnostics is not None:
+        (output / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2, default=str))
+    print(f"Wrote {len(history)} history rows to {output}")
+
+
+def control_history_probe_specs(project_id: str):
+    """Historical probes scoped to Akash's May/June 2026 control window."""
+    window = json.dumps(
+        {"start": "2026-05-01T00:00:00Z", "end": "2026-07-01T00:00:00Z"},
+        separators=(",", ":"),
+    )
+    return [
+        (
+            "audit_log",
             {
-                "project_id": project_id,
-                "project_name": project_name,
-                "expected_status": wanted_status,
-                "expected_date": wanted_date.isoformat(),
-                "result": result,
-                "evidence_source": source,
-                "observed_at": None if pd.isna(observed_at) else observed_at.isoformat(),
-                "explanation": explanation,
-            }
-        )
-
-    checks = [dict(check) for check in (access_checks or [])]
-    blocked_historical_paths = [
-        check
-        for check in checks
-        if str(check.get("purpose") or "").startswith("HISTORICAL")
-        and not bool(check.get("accessible"))
-    ]
-
-    if not expected:
-        # No expectations were supplied for this project. Silently reusing
-        # CONTROL_EXPECTATIONS (Akash's May 26 / June 10 facts, which apply
-        # ONLY to the control project) would produce a result that looks
-        # like a real check but isn't - it tests dates nobody claimed for
-        # this project. Report that plainly instead of pretending to verify.
-        acceptance_status = "NO_EXPECTATIONS_PROVIDED"
-        all_live = False
-        missing: list[dict[str, Any]] = []
-        conclusion = (
-            "No expected status/date pairs were supplied for this project, so "
-            "nothing was verified. Only current-state facts are available: "
-            f"current status is {current_status_name!r}"
-            + (f", completed at {completed_at.isoformat()}" if not pd.isna(completed_at) else "")
-            + ". Pass --expected to check specific transitions for this project."
-        )
-    else:
-        all_live = bool(rows) and all(row["result"] == "CONFIRMED_LIVE_HISTORY" for row in rows)
-        missing = [row for row in rows if row["result"] != "CONFIRMED_LIVE_HISTORY"]
-        acceptance_status = "PASS_LIVE_HISTORY" if all_live else "BLOCKED_OR_INCOMPLETE"
-        if all_live:
-            conclusion = "All expected project transitions were confirmed from a historical source."
-        else:
-            missing_desc = "; ".join(
-                f"{row['expected_status']} ({row['expected_date']})" for row in missing
-            )
-            conclusion = (
-                f"{len(missing)} of {len(rows)} expected transition(s) could not be confirmed "
-                f"from a historical source: {missing_desc}. Do not present synthetic rows or "
-                "the workflow catalog as project history."
-            )
-
-    report = {
-        "control_project_id": project_id,
-        "control_project_name": project_name,
-        "current_status_id": current_status_id,
-        "current_status_name": current_status_name,
-        "completed_at": None if pd.isna(completed_at) else completed_at.isoformat(),
-        "acceptance_status": acceptance_status,
-        "can_answer_akash_from_live_history": all_live,
-        "expected_event_count": len(rows),
-        "live_history_event_count": sum(
-            row["result"] == "CONFIRMED_LIVE_HISTORY" for row in rows
+                "eventDate": window,
+                "operations": json.dumps(["TaskStatusChanged"], separators=(",", ":")),
+                "objectType": "Project",
+                "objectIds": json.dumps([project_id], separators=(",", ":")),
+            },
+            "HISTORICAL PATH A - Audit Log (needs amReadOnlyAuditLog)",
         ),
-        "events_not_confirmed_from_live_history": len(missing),
-        "blocked_historical_paths": len(blocked_historical_paths),
-        "event_checks": rows,
-        "access_checks": checks,
-        "conclusion": conclusion,
-    }
-    return report, pd.DataFrame(rows)
-
-
-def _find_file(directory: Path, stem: str) -> Path | None:
-    stem = stem.lower()
-    for path in directory.rglob("*"):
-        if path.is_file() and path.suffix.lower() in {".csv", ".tsv"} and path.stem.lower() == stem:
-            return path
-    return None
-
-
-def _read_delimited(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path, sep="\t" if path.suffix.lower() == ".tsv" else ",", low_memory=False)
-
-
-def _col(frame: pd.DataFrame, *candidates: str, required: bool = True) -> str | None:
-    lookup = {str(c).lower(): str(c) for c in frame.columns}
-    for candidate in candidates:
-        if candidate.lower() in lookup:
-            return lookup[candidate.lower()]
-    if required:
-        raise ValueError(f"Expected one of {candidates}; available columns: {list(frame.columns)}")
-    return None
-
-
-def normalize_bi_export(directory: str | Path) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Normalize BI Export status history if project rows are present.
-
-    Wrike documents ``work_workflow_stage_history`` as task-status history. The
-    function therefore filters empirically for Project work items and reports a
-    clear diagnostic instead of claiming project history is available.
-    """
-    root = Path(directory)
-    diagnostics: dict[str, Any] = {"source": "BI_EXPORT", "directory": str(root)}
-    item_path = _find_file(root, "work_item")
-    history_path = _find_file(root, "work_workflow_stage_history")
-    stage_path = _find_file(root, "workflow_stage")
-    revision_path = _find_file(root, "work_change_revision")
-    missing_files = [
-        name
-        for name, path in {
-            "work_item": item_path,
-            "work_workflow_stage_history": history_path,
-            "workflow_stage": stage_path,
-        }.items()
-        if path is None
+        ("data_export", None, "HISTORICAL PATH B - BI Export (needs dataExportFull)"),
     ]
-    if missing_files:
-        diagnostics.update(status="blocked", reason=f"Missing BI files: {missing_files}")
-        return pd.DataFrame(columns=HISTORY_COLUMNS), diagnostics
 
-    items = _read_delimited(item_path)  # type: ignore[arg-type]
-    history = _read_delimited(history_path)  # type: ignore[arg-type]
-    stages = _read_delimited(stage_path)  # type: ignore[arg-type]
-    item_id = _col(items, "work_id", "id")
-    item_type = _col(items, "work_type", "type")
-    item_api_id = _col(items, "api_id", "work_api_id", "work_item_api_id", required=False)
-    item_name = _col(items, "work_name", "name", "title", required=False)
-    hist_work_id = _col(history, "work_id")
-    new_stage = _col(history, "new_workflow_stage_id", "workflow_stage_id", "new_status_id")
-    old_stage = _col(history, "old_workflow_stage_id", "old_status_id", required=False)
-    author = _col(history, "user_id", "author_id", required=False)
-    event_id = _col(history, "work_workflow_stage_history_id", "id", required=False)
-    changed_at = _col(history, "when_work_changed", "changed_at", "created_date", required=False)
 
-    merged = history.merge(
-        items[[c for c in [item_id, item_type, item_api_id, item_name] if c]],
-        left_on=hist_work_id,
-        right_on=item_id,
-        how="left",
-        suffixes=("", "_item"),
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command", required=True)
+    audit = sub.add_parser("audit-backfill")
+    audit.add_argument("--project-id", action="append", required=True)
+    audit.add_argument("--start", default="2024-01-01T00:00:00Z")
+    audit.add_argument("--end")
+    audit.add_argument("--output", default="wrike_status_output")
+    bi = sub.add_parser("bi-normalize")
+    bi.add_argument("--bi-dir", required=True)
+    bi.add_argument("--output", default="wrike_status_output")
+    webhook = sub.add_parser("webhook-normalize")
+    webhook.add_argument("--input", required=True)
+    webhook.add_argument("--output", default="wrike_status_output")
+    webhook.add_argument(
+        "--source",
+        required=True,
+        help=(
+            "Value written to the `source` column. No default on purpose — "
+            "forces an explicit choice instead of letting fabricated demo "
+            "events silently default to WEBHOOK. Use WEBHOOK for a real "
+            "captured event, SYNTHETIC_DEMO for fabricated sample events "
+            "(source is part of the primary key, so they can never collide "
+            "with or be mistaken for real Wrike history)."
+        ),
     )
-    merged = merged[merged[item_type].astype(str).str.lower().eq("project")].copy()
-    diagnostics["project_status_rows_found"] = int(len(merged))
-    if merged.empty:
-        diagnostics.update(
-            status="unsupported_or_empty",
-            reason="No Project rows exist in work_workflow_stage_history; Wrike documents this table as task status history.",
-        )
-        return pd.DataFrame(columns=HISTORY_COLUMNS), diagnostics
+    enrich = sub.add_parser("enrich-csv")
+    enrich.add_argument("--wrike-stg", required=True)
+    enrich.add_argument("--history", required=True)
+    enrich.add_argument("--output", default="Wrike_STG_STATUS_HISTORY_POC.csv")
+    inspect_webhooks = sub.add_parser(
+        "inspect-webhooks",
+        help="Fetch GET /webhooks and prove it returns subscription metadata, not historical status events",
+    )
+    inspect_webhooks.add_argument("--output", default="webhook_inspection")
+    register_webhook = sub.add_parser(
+        "register-webhook",
+        help=(
+            "Register a project-scoped webhook for future events. Existing "
+            "history is never replayed."
+        ),
+    )
+    register_webhook.add_argument("--folder-id", required=True)
+    register_webhook.add_argument(
+        "--event",
+        action="append",
+        dest="events",
+        help="Webhook event; repeat for multiple events (default: ProjectStatusChanged)",
+    )
+    register_webhook.add_argument(
+        "--field",
+        action="append",
+        dest="fields",
+        help=(
+            "Additional payload field; repeat as needed "
+            "(default: title, customFields, project)"
+        ),
+    )
+    register_webhook.add_argument("--recursive", action="store_true")
+    register_webhook.add_argument(
+        "--secure",
+        action="store_true",
+        help="Use WRIKE_WEBHOOK_SECRET or prompt for a signing secret",
+    )
+    register_webhook.add_argument(
+        "--force",
+        action="store_true",
+        help="Create another registration even if the same URL/folder already exists",
+    )
+    register_webhook.add_argument("--output", default="webhook_registration")
+    map_statuses = sub.add_parser(
+        "map-statuses",
+        help="Build the customStatusId -> readable status name catalog from GET /workflows",
+    )
+    map_statuses.add_argument("--output", default="status_catalog")
+    diagnose = sub.add_parser(
+        "diagnose-access",
+        help="Probe each endpoint and record which are accessible with the current token",
+    )
+    diagnose.add_argument("--project-id", default="MQAAAAEGPpOb")
+    diagnose.add_argument("--output", default="access_diagnostics")
+    inspect_project = sub.add_parser(
+        "inspect-project",
+        help="Fetch a project and label every date/status field with what it actually means (actual event vs planned schedule value)",
+    )
+    inspect_project.add_argument("--project-id", default="MQAAAAEGPpOb")
+    inspect_project.add_argument("--output", default="project_inspection")
+    verify_control = sub.add_parser(
+        "verify-control",
+        help=(
+            "Compare a project against expected status transitions. Defaults to "
+            "Akash's In Progress (May 26) / Completed (June 10) facts ONLY for "
+            "the [FR] Mac APR Update control project - any other --project-id "
+            "requires --expected, since those dates don't apply elsewhere."
+        ),
+    )
+    verify_control.add_argument("--project-id", default="MQAAAAEGPpOb")
+    verify_control.add_argument(
+        "--expected",
+        action="append",
+        dest="expected",
+        metavar="STATUS:YYYY-MM-DD",
+        help=(
+            "Expected status/date pair to check, e.g. 'In Progress:2026-05-26'. "
+            "Repeat for multiple. Required for any project other than the "
+            "control project - CONTROL_EXPECTATIONS never applies elsewhere."
+        ),
+    )
+    verify_control.add_argument(
+        "--history",
+        help=(
+            "Optional canonical project_status_history.csv from Audit Log or BI Export. "
+            "Synthetic rows are rejected."
+        ),
+    )
+    verify_control.add_argument("--output", default="control_project_verification")
+    args = parser.parse_args()
 
-    if changed_at is None and revision_path is not None:
-        revisions = _read_delimited(revision_path)
-        revision_id_hist = _col(history, "work_change_revision_id", "revision_id", required=False)
-        revision_id = _col(revisions, "work_change_revision_id", "id", "revision_id", required=False)
-        revision_time = _col(revisions, "when_work_changed", "changed_at", required=False)
-        if revision_id_hist and revision_id and revision_time:
-            merged = merged.merge(
-                revisions[[revision_id, revision_time]],
-                left_on=revision_id_hist,
-                right_on=revision_id,
-                how="left",
+    if args.command == "audit-backfill":
+        from wrike_status_api import WrikeClient, WrikePermissionError
+
+        client = WrikeClient(token())
+        names = {}
+        for project_id in args.project_id:
+            project = client.project(project_id)
+            names[project_id] = project.get("title")
+        statuses = client.status_names()
+        try:
+            events = client.audit_log(object_ids=args.project_id, start=args.start, end=args.end)
+        except WrikePermissionError as exc:
+            raise SystemExit(
+                f"Historical Audit Log access is blocked: {exc}\n"
+                "Required: Enterprise admin, Create user activity reports, and amReadOnlyAuditLog scope."
             )
-            changed_at = revision_time
-    if changed_at is None:
-        diagnostics.update(status="blocked", reason="Project history rows have no resolvable change timestamp.")
-        return pd.DataFrame(columns=HISTORY_COLUMNS), diagnostics
-
-    stage_id = _col(stages, "workflow_stage_id", "id", "status_id")
-    stage_name = _col(stages, "workflow_stage_name", "name", "status_name")
-    status_map = stages.set_index(stage_id)[stage_name].astype(str).to_dict()
-    rows: list[dict[str, Any]] = []
-    for _, raw in merged.iterrows():
-        pid = raw.get(item_api_id) if item_api_id else raw.get(item_id)
-        new_id = raw.get(new_stage)
-        old_id = raw.get(old_stage) if old_stage else None
-        row = {
-            "project_id": str(pid),
-            "project_name": raw.get(item_name) if item_name else None,
-            "old_status_id": old_id,
-            "old_status_name": status_map.get(old_id),
-            "status_id": new_id,
-            "status_name": status_map.get(new_id),
-            "status_changed_at": _utc(raw.get(changed_at)),
-            "event_author_id": raw.get(author) if author else None,
-            "source": "BI_EXPORT",
-            "source_event_id": str(raw.get(event_id)) if event_id and pd.notna(raw.get(event_id)) else None,
-            "source_payload": json.dumps(raw.dropna().to_dict(), separators=(",", ":"), default=str),
-            "ingested_at": pd.Timestamp.now(tz="UTC"),
-        }
-        row["source_event_id"] = row["source_event_id"] or _stable_event_id(row)
-        rows.append(row)
-    output = finalize_history(pd.DataFrame(rows))
-    diagnostics.update(status="ok", normalized_rows=int(len(output)))
-    return output, diagnostics
-
-
-def lifecycle_metrics(history: pd.DataFrame) -> pd.DataFrame:
-    """Return time spent between consecutive project statuses in hours/days."""
-    columns = [
-        "project_id", "project_name", "from_status", "to_status",
-        "from_at", "to_at", "duration_hours", "duration_days", "transition_sequence",
-    ]
-    if history.empty:
-        return pd.DataFrame(columns=columns)
-    rows: list[dict[str, Any]] = []
-    for project_id, events in history.groupby("project_id", sort=False):
-        ordered = events.dropna(subset=["status_changed_at"]).sort_values("status_changed_at")
-        for index in range(1, len(ordered)):
-            previous = ordered.iloc[index - 1]
-            current = ordered.iloc[index]
-            delta = current["status_changed_at"] - previous["status_changed_at"]
-            rows.append({
-                "project_id": project_id,
-                "project_name": current.get("project_name") or previous.get("project_name"),
-                "from_status": previous.get("status_name"),
-                "to_status": current.get("status_name"),
-                "from_at": previous["status_changed_at"],
-                "to_at": current["status_changed_at"],
-                "duration_hours": delta.total_seconds() / 3600,
-                "duration_days": delta.total_seconds() / 86400,
-                "transition_sequence": index,
-            })
-    return pd.DataFrame(rows, columns=columns)
-
-
-def history_json_map(history: pd.DataFrame) -> dict[str, str]:
-    output: dict[str, str] = {}
-    for project_id, events in history.groupby("project_id", sort=False):
-        records = []
-        for row in events.sort_values("event_sequence").to_dict("records"):
-            changed_at = row.get("status_changed_at")
-            records.append({
-                "sequence": int(row["event_sequence"]),
-                "old_status_id": row.get("old_status_id"),
-                "old_status_name": row.get("old_status_name"),
-                "status_id": row.get("status_id"),
-                "status_name": row.get("status_name"),
-                "changed_at": None if pd.isna(changed_at) else pd.Timestamp(changed_at).isoformat().replace("+00:00", "Z"),
-                "event_author_id": row.get("event_author_id"),
-                "source": row.get("source"),
-            })
-        output[str(project_id)] = json.dumps(records, separators=(",", ":"), default=str)
-    return output
-
-
-def attach_to_project_rows(
-    wrike_stg: pd.DataFrame,
-    history: pd.DataFrame,
-    *,
-    project_key_col: str = "key",
-    is_project_col: str = "is_project",
-) -> pd.DataFrame:
-    """Add history fields only to ``is_project=Y`` rows, preserving row count."""
-    missing = {project_key_col, is_project_col}.difference(wrike_stg.columns)
-    if missing:
-        raise KeyError(f"Missing Wrike_STG columns: {sorted(missing)}")
-    before = len(wrike_stg)
-    result = wrike_stg.copy()
-    added = [
-        "PROJECT_STATUS_HISTORY_JSON", "PROJECT_LATEST_STATUS_ID",
-        "PROJECT_LATEST_STATUS", "PROJECT_LATEST_STATUS_CHANGED_AT",
-        "PROJECT_STATUS_EVENT_COUNT",
-    ]
-    result["PROJECT_STATUS_HISTORY_JSON"] = pd.NA
-    result["PROJECT_LATEST_STATUS_ID"] = pd.NA
-    result["PROJECT_LATEST_STATUS"] = pd.NA
-    result["PROJECT_LATEST_STATUS_CHANGED_AT"] = pd.Series(
-        pd.NaT, index=result.index, dtype="datetime64[ns, UTC]"
-    )
-    result["PROJECT_STATUS_EVENT_COUNT"] = pd.NA
-    project_mask = result[is_project_col].astype(str).str.upper().eq("Y")
-    if not history.empty:
-        latest = history.sort_values(["project_id", "event_sequence"]).groupby("project_id").tail(1).set_index("project_id")
-        keys = result.loc[project_mask, project_key_col].astype(str)
-        result.loc[project_mask, "PROJECT_STATUS_HISTORY_JSON"] = keys.map(history_json_map(history)).values
-        result.loc[project_mask, "PROJECT_LATEST_STATUS_ID"] = keys.map(latest["status_id"].to_dict()).values
-        result.loc[project_mask, "PROJECT_LATEST_STATUS"] = keys.map(latest["status_name"].to_dict()).values
-        result.loc[project_mask, "PROJECT_LATEST_STATUS_CHANGED_AT"] = keys.map(
-            latest["status_changed_at"].to_dict()
+        history = normalize_events(events, source="AUDIT_LOG", project_names=names, status_names=statuses)
+        write_outputs(history, Path(args.output), {"source": "AUDIT_LOG", "projects": args.project_id})
+    elif args.command == "bi-normalize":
+        history, diagnostics = normalize_bi_export(args.bi_dir)
+        write_outputs(history, Path(args.output), diagnostics)
+    elif args.command == "webhook-normalize":
+        payload = json.loads(Path(args.input).read_text())
+        events = payload if isinstance(payload, list) else [payload]
+        history = normalize_events(events, source=args.source)
+        synthetic = args.source.upper() != "WEBHOOK"
+        write_outputs(
+            history,
+            Path(args.output),
+            {
+                "source": args.source.upper(),
+                "synthetic": synthetic,
+                "warning": (
+                    "These rows were generated from fabricated sample events. The "
+                    "project_id is real but the dates and statuses are invented and "
+                    "do NOT reflect this project's actual Wrike history. Never present "
+                    "as retrieved data."
+                )
+                if synthetic
+                else None,
+            },
         )
-        result.loc[project_mask, "PROJECT_STATUS_EVENT_COUNT"] = keys.map(history.groupby("project_id").size().to_dict()).values
-    if len(result) != before:
-        raise AssertionError("Wrike_STG row count changed")
-    if result.loc[~project_mask, added].notna().any().any():
-        raise AssertionError("Project history leaked onto task/subtask rows")
-    return result
+        if synthetic:
+            print(
+                f"WARNING: source={args.source.upper()} — output contains FABRICATED "
+                "dates/statuses against a real project_id. Do not present as Wrike history."
+            )
+    elif args.command == "enrich-csv":
+        wrike_stg = pd.read_csv(args.wrike_stg, low_memory=False)
+        history = pd.read_csv(args.history, low_memory=False)
+        enriched = attach_to_project_rows(wrike_stg, history)
+        enriched.to_csv(args.output, index=False)
+        print(f"Input rows={len(wrike_stg)}; output rows={len(enriched)}; wrote {args.output}")
+    elif args.command == "register-webhook":
+        from wrike_status_api import WrikeClient
+
+        client = WrikeClient(token())
+        hook_url = callback_url()
+        if not hook_url:
+            raise SystemExit("An approved callback URL is required")
+
+        events = args.events or ["ProjectStatusChanged"]
+        fields = args.fields or ["title", "customFields", "project"]
+        existing = [
+            hook
+            for hook in client.list_webhooks()
+            if hook.get("hookUrl") == hook_url
+            and str(hook.get("folderId") or "") == args.folder_id
+        ]
+
+        if existing and not args.force:
+            if args.secure:
+                raise SystemExit(
+                    "A matching webhook already exists, but Wrike does not reveal "
+                    "whether it uses a signing secret. Rerun without --secure to "
+                    "reuse it, or use --force only if a second registration is intended."
+                )
+            action = "reused_existing"
+            response = {"kind": "webhooks", "data": existing}
+        else:
+            secret = webhook_secret() if args.secure else None
+            if args.secure and not secret:
+                raise SystemExit("--secure requires a non-empty webhook signing secret")
+            action = "created"
+            response = client.register_webhook(
+                folder_id=args.folder_id,
+                hook_url=hook_url,
+                events=events,
+                fields=fields,
+                recursive=args.recursive,
+                secret=secret,
+            )
+
+        report = {
+            "action": action,
+            "folder_id": args.folder_id,
+            "events": events,
+            "fields": fields,
+            "recursive": args.recursive,
+            "secure_requested": args.secure,
+            "response": redact_webhook_response(response),
+        }
+        output = dated_output_dir(args.output)
+        (output / "webhook_registration_response.json").write_text(
+            json.dumps(report, indent=2, default=str), encoding="utf-8"
+        )
+        summary = [
+            {
+                "id": hook.get("id"),
+                "status": hook.get("status"),
+                "folderId": hook.get("folderId"),
+                "accountId": hook.get("accountId"),
+            }
+            for hook in response.get("data", [])
+        ]
+        print(f"Webhook registration action: {action}")
+        print(summary)
+        print(f"Wrote redacted evidence to {output}/webhook_registration_response.json")
+    elif args.command == "inspect-webhooks":
+        from wrike_status_api import WrikeClient
+
+        client = WrikeClient(token())
+        raw_response = client.get("webhooks")
+        hooks = raw_response.get("data", [])
+        output = dated_output_dir(args.output)
+        (output / "webhooks_raw_response.json").write_text(
+            json.dumps(raw_response, indent=2, default=str)
+        )
+
+        # Unambiguous event-shaped fields only. Deliberately excludes "status"
+        # (a webhook subscription's own active/suspended flag, not a project
+        # status) and "customStatusId" (ambiguous without an old/new prefix).
+        historical_event_fields = {
+            "projectId",
+            "oldStatus",
+            "newStatus",
+            "oldCustomStatusId",
+            "newCustomStatusId",
+            "changedAt",
+            "eventDate",
+        }
+        fields_seen = sorted({key for hook in hooks for key in hook.keys()})
+        historical_fields_found = sorted(set(fields_seen) & historical_event_fields)
+
+        report = {
+            "endpoint": "GET /webhooks",
+            "subscriptions_returned": len(hooks),
+            "fields_seen": fields_seen,
+            "historical_event_fields_found": historical_fields_found,
+            "conclusion": (
+                "Unambiguous historical-event fields were present; re-examine the response."
+                if historical_fields_found
+                else (
+                    "No unambiguous historical-event fields (projectId/oldStatus/"
+                    "newStatus/changedAt/etc.) are present in this response. That "
+                    "alone is supporting, not conclusive, evidence. The decisive "
+                    "point is structural: this endpoint accepts no date-range, "
+                    "replay, or historical-event-retrieval parameters at all "
+                    "(contrast with audit_log(), which takes eventDate:{start,end}). "
+                    "A subscription-management resource has no mechanism to return "
+                    "events that occurred before the subscription existed, "
+                    "regardless of which fields a given response happens to contain."
+                )
+            ),
+        }
+        (output / "conclusion.json").write_text(json.dumps(report, indent=2))
+        print(f"Fetched {len(hooks)} webhook subscription(s).")
+        print(f"Fields present in response: {fields_seen}")
+        print(report["conclusion"])
+        print(f"Wrote raw response + conclusion to {output}/")
+    elif args.command == "map-statuses":
+        from wrike_status_api import CATALOG_COLUMNS, WrikeClient, flatten_workflows
+
+        client = WrikeClient(token())
+        payload = client.workflows_payload()
+        catalog = flatten_workflows(payload)
+        output = dated_output_dir(args.output)
+        (output / "workflows_raw_response.json").write_text(
+            json.dumps(payload, indent=2, default=str)
+        )
+        frame = pd.DataFrame(catalog, columns=CATALOG_COLUMNS)
+        frame.to_csv(output / "custom_status_catalog.csv", index=False)
+        (output / "custom_status_map.json").write_text(
+            json.dumps({row["custom_status_id"]: row["status_name"] for row in catalog}, indent=2)
+        )
+        print(f"Mapped {len(catalog)} custom statuses across "
+              f"{frame['workflow_id'].nunique() if not frame.empty else 0} workflow(s).")
+        if not frame.empty:
+            print(frame[["custom_status_id", "status_name", "status_group", "workflow_name"]].to_string(index=False))
+        print(f"Wrote catalog + raw response to {output}/")
+    elif args.command == "diagnose-access":
+        from wrike_status_api import WrikeClient
+
+        client = WrikeClient(token())
+        checks = [
+            ("version", None, "Baseline: token authenticates at all"),
+            (f"folders/{args.project_id}", None, "Control project metadata (current state only)"),
+            ("workflows", {"includeSpaceWorkflow": "true"}, "customStatusId -> name mapping"),
+            ("webhooks", None, "Webhook subscriptions (future events only, no replay)"),
+        ] + control_history_probe_specs(args.project_id)
+        results = []
+        for path, params, purpose in checks:
+            record = client.probe(path, params)
+            record["purpose"] = purpose
+            results.append(record)
+            state = "OK" if record.get("accessible") else f"HTTP {record.get('status_code')}"
+            print(f"  [{state:>8}] {record['endpoint']:<40} {purpose}")
+
+        historical = [r for r in results if r["purpose"].startswith("HISTORICAL")]
+        blocked = [r for r in historical if not r.get("accessible")]
+        report = {
+            "generated_at": pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "control_project_id": args.project_id,
+            "checks": results,
+            "historical_paths_blocked": len(blocked),
+            "historical_paths_total": len(historical),
+            "conclusion": (
+                "Both historical paths return non-200. Every endpoint that can return "
+                "past status transitions is unavailable to this token, so no backfill "
+                "is possible until one scope is granted. Endpoints that do respond "
+                "return current-state or subscription data only."
+                if len(blocked) == len(historical)
+                else "At least one historical path is now reachable — rerun the backfill."
+            ),
+        }
+        output = dated_output_dir(args.output)
+        (output / "access_diagnostics.json").write_text(json.dumps(report, indent=2, default=str))
+        pd.DataFrame(results).to_csv(output / "access_diagnostics.csv", index=False)
+        print(f"\n{report['conclusion']}")
+        print(f"Wrote dated evidence to {output}/access_diagnostics.json")
+    elif args.command == "verify-control":
+        from wrike_status_api import WrikeClient
+
+        client = WrikeClient(token())
+        project = client.project(args.project_id)
+        status_names = client.status_names()
+        history = pd.read_csv(args.history, low_memory=False) if args.history else None
+
+        access_checks = []
+        for path, params, purpose in control_history_probe_specs(args.project_id):
+            record = client.probe(path, params)
+            record["purpose"] = purpose
+            access_checks.append(record)
+
+        if args.expected:
+            expectations = parse_expected(args.expected)
+        elif args.project_id == CONTROL_PROJECT_ID:
+            expectations = list(CONTROL_EXPECTATIONS)
+        else:
+            expectations = []
+            print(
+                f"WARNING: --project-id {args.project_id} is not the control project "
+                f"({CONTROL_PROJECT_ID}) and no --expected was given. "
+                "CONTROL_EXPECTATIONS (May 26 / June 10) does NOT apply to this project - "
+                "reporting current-state facts only. Pass --expected 'Status:YYYY-MM-DD' "
+                "to check specific transitions for this project."
+            )
+
+        report, event_checks = verify_control_project(
+            project,
+            status_names=status_names,
+            history=history,
+            expectations=expectations,
+            access_checks=access_checks,
+        )
+        output = dated_output_dir(args.output)
+        (output / "control_verification.json").write_text(
+            json.dumps(report, indent=2, default=str), encoding="utf-8"
+        )
+        event_checks.to_csv(output / "control_event_checks.csv", index=False)
+        pd.DataFrame(access_checks).to_csv(output / "control_access_checks.csv", index=False)
+
+        print(f"Project: {report['control_project_name']} ({report['control_project_id']})")
+        print(f"Current status: {report['current_status_name']}")
+        for row in report["event_checks"]:
+            observed = row["observed_at"] or "not returned"
+            print(
+                f"  {row['expected_status']:<12} {row['expected_date']}  "
+                f"{row['result']:<32} observed={observed}"
+            )
+        for check in access_checks:
+            state = "OK" if check.get("accessible") else f"HTTP {check.get('status_code')}"
+            print(f"  {state:<8} {check['purpose']}")
+        print(f"Result: {report['acceptance_status']}")
+        print(report["conclusion"])
+        print(f"Wrote verification evidence to {output}/")
+    elif args.command == "inspect-project":
+        from wrike_status_api import (
+            WrikeClient,
+            describe_project_fields,
+            folder_hierarchy,
+            label_custom_fields,
+            label_folder_hierarchy,
+        )
+
+        client = WrikeClient(token())
+        project = client.project(args.project_id)
+        fields = describe_project_fields(project)
+        definitions = client.custom_field_definitions()
+        custom_fields = label_custom_fields(project, definitions)
+        hierarchy = folder_hierarchy(project)
+        related_ids = hierarchy["parent_ids"] + hierarchy["child_ids"] + hierarchy["super_parent_ids"]
+        folders_payload = client.folders_batch(related_ids)
+        labeled_hierarchy = label_folder_hierarchy(hierarchy, folders_payload)
+        output = dated_output_dir(args.output)
+        (output / "project_raw_response.json").write_text(json.dumps(project, indent=2, default=str))
+        (output / "field_inventory.json").write_text(json.dumps(fields, indent=2, default=str))
+        (output / "custom_field_definitions_raw.json").write_text(json.dumps(definitions, indent=2, default=str))
+        (output / "custom_fields_labeled.json").write_text(json.dumps(custom_fields, indent=2, default=str))
+        (output / "folder_hierarchy.json").write_text(json.dumps(labeled_hierarchy, indent=2, default=str))
+
+        print(f"Project: {project.get('title')} ({args.project_id})\n")
+        for row in fields:
+            kind = (
+                "ACTUAL EVENT"
+                if row["is_actual_event"]
+                else "PLANNED/SCHEDULED (not an event)"
+                if row["is_planned_schedule_value"]
+                else "current-state field"
+            )
+            print(f"  {row['field_path']:<28} = {row['value']!r}")
+            print(f"    [{kind}] {row['meaning']}")
+        print(
+            "\nNone of these fields is a status-change history record — only "
+            "completedDate is tied to a specific transition. There is still no "
+            "field here that says when the status became 'In Progress'. That "
+            "requires Audit Log or BI Export."
+        )
+
+        print(f"\nCustom fields on this project ({len(custom_fields)}):")
+        if not custom_fields:
+            print("  (none set on this project)")
+        for row in custom_fields:
+            print(f"  {row['title']:<32} = {row['value']!r}  [{row['type']}, id={row['field_id']}]")
+
+        print(f"\nFolder hierarchy for {labeled_hierarchy['project_name']} ({labeled_hierarchy['project_id']}):")
+        for label, key in (("Super-parents", "super_parents"), ("Parents", "parents"), ("Children", "children")):
+            entries = labeled_hierarchy[key]
+            print(f"  {label} ({len(entries)}):")
+            if not entries:
+                print("    (none)")
+            for entry in entries:
+                print(f"    {entry['title']}  [id={entry['id']}]")
+
+        print(f"\nWrote raw response + labeled inventory + custom fields + hierarchy to {output}/")
+
+
+if __name__ == "__main__":
+    main()
