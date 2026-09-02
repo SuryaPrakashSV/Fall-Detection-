@@ -1,5 +1,3 @@
-The second code was a CTE fragment, so it cannot run alone. To test it separately, use the complete query:
-
 WITH project_actuals AS (
     SELECT
         PROJECT_TYPE,
@@ -12,20 +10,3 @@ WITH project_actuals AS (
 )
 SELECT *
 FROM project_actuals;
-
-This should return project types and their historical actual hours.
-
-Then, in 06_SUPPLY_FORECAST_NEW.SQL, replace only the existing lines 86–95 project_actuals section with:
-
-project_actuals AS (
-    SELECT
-        PROJECT_TYPE,
-        SUM(ACTUAL_HOURS) AS total_historical_actual_hours
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW
-    WHERE ACTUAL_OR_FORECAST = 'ACTUAL'
-      AND BREAKDOWN_LEVEL = 'BY_PROJECT_TYPE'
-      AND PROJECT_TYPE != 'ALL'
-    GROUP BY PROJECT_TYPE
-),
-
-Do not run that fragment alone. After replacing it inside the complete Query 6 file, run the entire 06_SUPPLY_FORECAST_NEW.SQL.
