@@ -1,39 +1,18 @@
-    else:
-        all_live = bool(rows) and all(row["result"] == "CONFIRMED_LIVE_HISTORY" for row in rows)
-        missing = [row for row in rows if row["result"] != "CONFIRMED_LIVE_HISTORY"]
-        acceptance_status = "PASS_LIVE_HISTORY" if all_live else "BLOCKED_OR_INCOMPLETE"
-        if all_live:
-            conclusion = "All expected project transitions were confirmed from a historical source."
-        else:
-            # A row can be CONFIRMED_LIVE_HISTORY, CONFIRMED_CURRENT_METADATA_ONLY
-            # (partial - real but not a historical record), REJECTED_SYNTHETIC_MATCH,
-            # or MISSING_FROM_ACCESSIBLE_SOURCES (nothing at all). Collapsing all
-            # non-live results into one "could not be confirmed" bucket erased that
-            # distinction - restoring it so "we have SOME evidence" doesn't read the
-            # same as "we have NONE".
-            def describe(group: list[dict[str, Any]]) -> str:
-                return "; ".join(f"{r['expected_status']} ({r['expected_date']})" for r in group)
+python3 - <<'PY'
+import pandas as pd
 
-            metadata_only = [r for r in missing if r["result"] == "CONFIRMED_CURRENT_METADATA_ONLY"]
-            truly_missing = [r for r in missing if r["result"] == "MISSING_FROM_ACCESSIBLE_SOURCES"]
-            rejected = [r for r in missing if r["result"] == "REJECTED_SYNTHETIC_MATCH"]
+p = "webhook_verification_output/project_status_history.csv"
+df = pd.read_csv(p)
 
-            parts = []
-            if metadata_only:
-                parts.append(
-                    "confirmed only from current project metadata, not a historical record: "
-                    + describe(metadata_only)
-                )
-            if truly_missing:
-                parts.append("absent from every accessible source: " + describe(truly_missing))
-            if rejected:
-                parts.append(
-                    "only matched by a rejected synthetic/demo row: " + describe(rejected)
-                )
-
-            live_count = len(rows) - len(missing)
-            conclusion = (
-                f"{live_count} of {len(rows)} expected transition(s) confirmed from live "
-                f"historical evidence. {' | '.join(parts)}. Do not present synthetic rows or "
-                "the workflow catalog as project history."
-            )
+print(
+    df[
+        [
+            "event_sequence",
+            "old_status_name",
+            "status_name",
+            "status_changed_at",
+            "source"
+        ]
+    ].to_string(index=False)
+)
+PY
