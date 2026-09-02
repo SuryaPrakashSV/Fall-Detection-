@@ -1,22 +1,31 @@
-First, confirm the values:
+The second code was a CTE fragment, so it cannot run alone. To test it separately, use the complete query:
 
-SELECT
-    ACTUAL_OR_FORECAST,
-    BREAKDOWN_LEVEL,
-    COUNT(*) AS ROW_COUNT
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW
-GROUP BY 1, 2
-ORDER BY 1, 2;
+WITH project_actuals AS (
+    SELECT
+        PROJECT_TYPE,
+        SUM(ACTUAL_HOURS) AS total_historical_actual_hours
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW
+    WHERE ACTUAL_OR_FORECAST = 'ACTUAL'
+      AND BREAKDOWN_LEVEL = 'BY_PROJECT_TYPE'
+      AND PROJECT_TYPE != 'ALL'
+    GROUP BY PROJECT_TYPE
+)
+SELECT *
+FROM project_actuals;
 
-If the results contain ACTUAL and BY_PROJECT_TYPE, replace the existing project_actuals CTE in 06_SUPPLY_FORECAST_NEW.SQL with:
+This should return project types and their historical actual hours.
+
+Then, in 06_SUPPLY_FORECAST_NEW.SQL, replace only the existing lines 86–95 project_actuals section with:
 
 project_actuals AS (
     SELECT
         PROJECT_TYPE,
         SUM(ACTUAL_HOURS) AS total_historical_actual_hours
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW
-    WHERE UPPER(ACTUAL_OR_FORECAST) = 'ACTUAL'
-      AND UPPER(BREAKDOWN_LEVEL) = 'BY_PROJECT_TYPE'
+    WHERE ACTUAL_OR_FORECAST = 'ACTUAL'
+      AND BREAKDOWN_LEVEL = 'BY_PROJECT_TYPE'
       AND PROJECT_TYPE != 'ALL'
     GROUP BY PROJECT_TYPE
 ),
+
+Do not run that fragment alone. After replacing it inside the complete Query 6 file, run the entire 06_SUPPLY_FORECAST_NEW.SQL.
