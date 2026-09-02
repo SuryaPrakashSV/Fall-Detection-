@@ -1,1 +1,8 @@
-We are trying to extract the complete project-level status history from Wrike. For each project, we need the project ID and name, every status the project actually entered, the previous and new status names/IDs, and the exact date and timestamp of each transition. We do not need the full workflow catalog of possible statuses—only the statuses that occurred for that specific project. For example, `[FR] Mac APR Update` moved to In Progress on May 26 and Completed on June 10. The goal is to calculate how long each project remained in every status and the time taken between status transitions.
+SELECT
+    TABLE_NAME,
+    COLUMN_NAME,
+    DATA_TYPE
+FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+  AND TABLE_NAME IN ('DEMAND_FORECAST', 'DEMAND_FORECAST_NEW')
+ORDER BY TABLE_NAME, ORDINAL_POSITION;
