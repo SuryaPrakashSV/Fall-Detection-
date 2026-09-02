@@ -1,8 +1,1 @@
-SELECT DISTINCT
-    PROJECT_ID,
-    PROJECT_NAME,
-    PROJECT_START_DATE,
-    PROJECT_END_DATE,
-    CUSTOM_STATUS
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_API_BAU_PROJECT_LEVEL
-WHERE UPPER(PROJECT_NAME) = UPPER('[UK DE FR] Edu Watch Offer Update');
+We are trying to extract the complete project-level status history from Wrike. For each project, we need the project ID and name, every status the project actually entered, the previous and new status names/IDs, and the exact date and timestamp of each transition. We do not need the full workflow catalog of possible statuses—only the statuses that occurred for that specific project. For example, `[FR] Mac APR Update` moved to In Progress on May 26 and Completed on June 10. The goal is to calculate how long each project remained in every status and the time taken between status transitions.
