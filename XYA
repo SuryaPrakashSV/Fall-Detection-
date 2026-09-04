@@ -1,69 +1,7 @@
-def trace_project_status_history(
-    project: Mapping[str, Any],
-    *,
-    status_names: Mapping[str, str],
-    raw_audit_events: list[Mapping[str, Any]] | None,
-    blocked_reason: str | None = None,
-) -> dict[str, Any]:
-    """Trace one project's full status trail: current state (live) back to its first stage.
-
-    Every status name and date here is either read directly off `project` /
-    `status_names` (both fetched from Wrike moments before calling this) or
-    normalized from `raw_audit_events` (Wrike's own Audit Log) - nothing is
-    authored locally, unlike the old control_result() helper this replaces.
-    When `raw_audit_events` is None, `blocked_reason` must explain what
-    blocked retrieval (WrikeClient.get() already appends the relevant
-    developers.wrike.com doc link to that message) and this returns a
-    blocked report instead of inventing any stage to fill the gap.
-    """
-    project_id = str(project.get("id") or "")
-    project_name = project.get("title")
-    nested_project = (
-        project.get("project") if isinstance(project.get("project"), Mapping) else {}
-    )
-    current_status_id = project.get("customStatusId") or nested_project.get("customStatusId")
-    current_status_name = (
-        project.get("status")
-        or nested_project.get("status")
-        or status_names.get(str(current_status_id or ""))
-        or current_status_id
-    )
-
-    if raw_audit_events is None:
-        return {
-            "project_id": project_id,
-            "project_name": project_name,
-            "current_status_name": current_status_name,
-            "stages": pd.DataFrame(columns=HISTORY_COLUMNS),
-            "blocked": True,
-            "blocked_reason": blocked_reason,
-            "traces_back_to_current": False,
-        }
-
-    stages = normalize_events(
-        raw_audit_events,
-        source="AUDIT_LOG",
-        project_names={project_id: project_name},
-        status_names=status_names,
-    )
-    project_stages = (
-        stages[stages["project_id"].astype(str).eq(project_id)].reset_index(drop=True)
-        if not stages.empty
-        else stages
-    )
-
-    reaches_current = (
-        not project_stages.empty
-        and str(project_stages.iloc[-1]["status_name"]).strip().casefold()
-        == str(current_status_name or "").strip().casefold()
-    )
-
-    return {
-        "project_id": project_id,
-        "project_name": project_name,
-        "current_status_name": current_status_name,
-        "stages": project_stages,
-        "blocked": False,
-        "blocked_reason": None,
-        "traces_back_to_current": reaches_current,
-    }
+python3 -c "
+import pandas as pd
+df = pd.read_csv('status_catalog/20260831/custom_status_catalog.csv')
+row = df[df['custom_status_id'] == 'IEADQP2VJMDZGQR5']
+workflow_id = row['workflow_id'].iloc[0]
+print(df[df['workflow_id'] == workflow_id][['status_name', 'status_group', 'status_hidden']].to_string(index=False))
+"
