@@ -1,79 +1,20 @@
-"""Standalone class to see a  Wrike project's raw metadata.
+SELECT
+    COUNT_IF(TRIM(parent_folder_title) ILIKE '[FR] Mac APR Update')
+        AS parent_folder_matches,
 
-Everything else in this project uses plain functions (see wrike_status_api.py,
-status_history_core.py) - this is a deliberate one-off exception, built as a
-class because that's specifically what was asked for here.
-"""
+    COUNT_IF(TRIM(child_folder_title) ILIKE '[FR] Mac APR Update')
+        AS child_folder_matches,
 
-from __future__ import annotations
+    COUNT_IF(TRIM(grandchild_folder_title) ILIKE '[FR] Mac APR Update')
+        AS grandchild_folder_matches,
 
-from collections.abc import Mapping
-from typing import Any
+    COUNT_IF(TRIM(baby_folder_title) ILIKE '[FR] Mac APR Update')
+        AS baby_folder_matches,
 
-from wrike_status_api import WrikeClient, describe_project_fields, label_custom_fields
+    COUNT_IF(TRIM(grandbaby_folder_title) ILIKE '[FR] Mac APR Update')
+        AS grandbaby_folder_matches,
 
+    COUNT_IF(TRIM(title) ILIKE '[FR] Mac APR Update')
+        AS title_matches
 
-class ProjectMetadataInspector:
-    """Fetches a project's raw metadata and exposes it for inspection.
-
-    Wraps WrikeClient.project() plus the existing field-labeling helpers so
-    the raw response, field inventory, and custom fields can each be pulled
-    out separately after one fetch() call, instead of one big printed dump.
-    """
-
-    def __init__(self, client: WrikeClient, project_id: str):
-        self.client = client
-        self.project_id = project_id
-        self.raw: dict[str, Any] | None = None
-
-    def fetch(self) -> dict[str, Any]:
-        """Fetch the raw project metadata from Wrike (GET /folders/{id})."""
-        self.raw = self.client.project(self.project_id)
-        return self.raw
-
-    def _require_fetch(self) -> dict[str, Any]:
-        if self.raw is None:
-            raise RuntimeError("Call fetch() before inspecting the metadata")
-        return self.raw
-
-    def keys(self) -> list[str]:
-        """Top-level keys present on the raw response."""
-        return sorted(self._require_fetch().keys())
-
-    def field_inventory(self) -> list[dict[str, Any]]:
-        """Every date/status field, labeled as an actual event, a planned value, or current-state."""
-        return describe_project_fields(self._require_fetch())
-
-    def custom_fields(self, definitions: Mapping[str, Any]) -> list[dict[str, Any]]:
-        """This project's custom field values, resolved to readable titles via definitions."""
-        return label_custom_fields(self._require_fetch(), definitions)
-
-    def print_summary(self) -> None:
-        """Print a compact overview: top-level keys, then every labeled date/status field."""
-        raw = self._require_fetch()
-        print(f"Top-level keys ({len(raw)}): {', '.join(self.keys())}")
-        print()
-        for row in self.field_inventory():
-            kind = (
-                "ACTUAL EVENT"
-                if row["is_actual_event"]
-                else "PLANNED/SCHEDULED"
-                if row["is_planned_schedule_value"]
-                else "current-state"
-            )
-            print(f"  [{kind:<18}] {row['field_path']:<28} = {row['value']!r}")
-
-
-if __name__ == "__main__":
-    import getpass
-    import os
-
-    token = os.getenv("WRIKE_TOKEN", "").strip() or getpass.getpass("Wrike token (hidden; not saved): ").strip()
-    project_id = input("Project ID: ").strip() or "MQAAAAEGPpOb"
-
-    client = WrikeClient(token)
-    inspector = ProjectMetadataInspector(client, project_id)
-    inspector.fetch()
-    inspector.print_summary()
-
-python3 metadata_inspector.py
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG;
