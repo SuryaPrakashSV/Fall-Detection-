@@ -1,20 +1,25 @@
-SELECT
-    COUNT_IF(TRIM(parent_folder_title) ILIKE '[FR] Mac APR Update')
-        AS parent_folder_matches,
-
-    COUNT_IF(TRIM(child_folder_title) ILIKE '[FR] Mac APR Update')
-        AS child_folder_matches,
-
-    COUNT_IF(TRIM(grandchild_folder_title) ILIKE '[FR] Mac APR Update')
-        AS grandchild_folder_matches,
-
-    COUNT_IF(TRIM(baby_folder_title) ILIKE '[FR] Mac APR Update')
-        AS baby_folder_matches,
-
-    COUNT_IF(TRIM(grandbaby_folder_title) ILIKE '[FR] Mac APR Update')
-        AS grandbaby_folder_matches,
-
-    COUNT_IF(TRIM(title) ILIKE '[FR] Mac APR Update')
-        AS title_matches
-
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG;
+SELECT DISTINCT
+    parent_folder_title,
+    child_folder_title,
+    grandchild_folder_title,
+    baby_folder_title,
+    grandbaby_folder_title,
+    title,
+    parent_task_title,
+    child_task_title,
+    grandchild_task_title,
+    baby_task_title,
+    grandbaby_task_title
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG
+WHERE COALESCE(parent_folder_title, '') ILIKE '%FR%Mac%APR%Update%'
+   OR COALESCE(child_folder_title, '') ILIKE '%FR%Mac%APR%Update%'
+   OR COALESCE(grandchild_folder_title, '') ILIKE '%FR%Mac%APR%Update%'
+   OR COALESCE(baby_folder_title, '') ILIKE '%FR%Mac%APR%Update%'
+   OR COALESCE(grandbaby_folder_title, '') ILIKE '%FR%Mac%APR%Update%'
+   OR COALESCE(title, '') ILIKE '%FR%Mac%APR%Update%'
+   OR COALESCE(parent_task_title, '') ILIKE '%FR%Mac%APR%Update%'
+   OR COALESCE(child_task_title, '') ILIKE '%FR%Mac%APR%Update%'
+   OR COALESCE(grandchild_task_title, '') ILIKE '%FR%Mac%APR%Update%'
+   OR COALESCE(baby_task_title, '') ILIKE '%FR%Mac%APR%Update%'
+   OR COALESCE(grandbaby_task_title, '') ILIKE '%FR%Mac%APR%Update%'
+LIMIT 200;
