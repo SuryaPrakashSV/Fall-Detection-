@@ -1,27 +1,14 @@
-WITH src AS (
-    SELECT *
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG
-    WHERE TRIM(CHILD_FOLDER_TITLE) ILIKE '[FR] Mac APR Update'
-),
-task_rows AS (
-    SELECT
-        COALESCE(
-            NULLIF(TRIM("great_grandbaby_task_id"), ''),
-            NULLIF(TRIM("grandbaby_task_id"), ''),
-            NULLIF(TRIM("baby_task_id"), ''),
-            NULLIF(TRIM("grandchild_task_id"), ''),
-            NULLIF(TRIM("child_task_id"), ''),
-            NULLIF(TRIM("parent_task_id"), '')
-        ) AS record_task_id,
-        "status",
-        "customStatusId"
-    FROM src
-)
 SELECT
-    COALESCE(NULLIF(TRIM("status"), ''), '<BLANK>') AS general_status,
-    COALESCE(NULLIF(TRIM("customStatusId"), ''), '<BLANK>') AS custom_status_id,
-    COUNT(*) AS task_count
-FROM task_rows
-WHERE record_task_id IS NOT NULL
-GROUP BY 1, 2
-ORDER BY task_count DESC;
+    ORDINAL_POSITION,
+    COLUMN_NAME,
+    DATA_TYPE
+FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+  AND TABLE_NAME = 'WRIKE_STG'
+  AND (
+      UPPER(COLUMN_NAME) LIKE '%STATUS%'
+      OR UPPER(COLUMN_NAME) LIKE '%HISTORY%'
+      OR UPPER(COLUMN_NAME) LIKE '%TRANSITION%'
+      OR UPPER(COLUMN_NAME) LIKE '%CHANGED%'
+  )
+ORDER BY ORDINAL_POSITION;
