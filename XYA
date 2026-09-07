@@ -6,12 +6,12 @@ WITH src AS (
 records AS (
     SELECT
         COALESCE(
-            "great_grandbaby_task_id",
-            "grandbaby_task_id",
-            "baby_task_id",
-            "grandchild_task_id",
-            "child_task_id",
-            "parent_task_id"
+            NULLIF(TRIM("great_grandbaby_task_id"), ''),
+            NULLIF(TRIM("grandbaby_task_id"), ''),
+            NULLIF(TRIM("baby_task_id"), ''),
+            NULLIF(TRIM("grandchild_task_id"), ''),
+            NULLIF(TRIM("child_task_id"), ''),
+            NULLIF(TRIM("parent_task_id"), '')
         ) AS record_task_id
     FROM src
 )
