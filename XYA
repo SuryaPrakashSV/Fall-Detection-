@@ -1,8 +1,7 @@
-python3 - <<'PY'
+python3 <(cat <<'PY'
 import getpass
 import json
 from collections import Counter
-
 import requests
 
 raw_ids = input("Paste the comma-separated 42 task IDs: ").strip()
@@ -36,14 +35,12 @@ try:
 except ValueError:
     payload = {"raw_response": response.text}
 
-evidence = {
-    "requested_task_count": len(task_ids),
-    "http_status": response.status_code,
-    "response": payload
-}
-
 with open("fr_mac_task_history_raw.json", "w", encoding="utf-8") as file:
-    json.dump(evidence, file, indent=2)
+    json.dump({
+        "requested_task_count": len(task_ids),
+        "http_status": response.status_code,
+        "response": payload
+    }, file, indent=2)
 
 status_keys = Counter()
 
@@ -72,3 +69,4 @@ if response.status_code != 200 and isinstance(payload, dict):
         payload.get("errorDescription")
     )
 PY
+)
