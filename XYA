@@ -1,11 +1,14 @@
-    def find_projects_by_title(self, title: str) -> list[dict[str, Any]]:
-        """GET /folders?title=...&project=true - find a project by name.
-
-        Verified against https://developers.wrike.com/reference/getfoldersempty:
-        `title` is a CONTAINS-match filter, not an exact-name lookup, and can
-        return multiple folders. Callers must filter the result to an exact
-        (case-insensitive) title match themselves if they need a specific
-        project rather than every folder whose title happens to contain this
-        substring.
-        """
-        return self.get("folders", params={"title": title, "project": "true"}).get("data", [])
+from status_history_core import (
+    CONTROL_EXPECTATIONS,
+    CONTROL_PROJECT_ID,
+    HIERARCHY_LEVEL_NAMES,
+    attach_to_project_rows,
+    build_task_hierarchy_table,
+    build_task_inventory,
+    lifecycle_metrics,
+    normalize_bi_export,
+    normalize_events,
+    reconcile_task_inventory,
+    trace_project_status_history,
+    verify_control_project,
+)
