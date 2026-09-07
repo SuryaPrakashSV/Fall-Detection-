@@ -1,25 +1,74 @@
-WITH src AS (
-    SELECT *
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG
-    WHERE TRIM(CHILD_FOLDER_TITLE) ILIKE '[FR] Mac APR Update'
-),
-records AS (
-    SELECT
-        COALESCE(
-            NULLIF(TRIM("great_grandbaby_task_id"), ''),
-            NULLIF(TRIM("grandbaby_task_id"), ''),
-            NULLIF(TRIM("baby_task_id"), ''),
-            NULLIF(TRIM("grandchild_task_id"), ''),
-            NULLIF(TRIM("child_task_id"), ''),
-            NULLIF(TRIM("parent_task_id"), '')
-        ) AS record_task_id
-    FROM src
+python3 - <<'PY'
+import getpass
+import json
+from collections import Counter
+
+import requests
+
+raw_ids = input("Paste the comma-separated 42 task IDs: ").strip()
+task_ids = list(dict.fromkeys(
+    value.strip() for value in raw_ids.split(",") if value.strip()
+))
+
+if len(task_ids) != 42:
+    raise SystemExit(
+        f"Stopped: expected 42 unique IDs but received {len(task_ids)}."
+    )
+
+token = getpass.getpass("Paste Wrike token (hidden): ").strip()
+
+url = (
+    "https://www.wrike.com/api/v4/tasks/"
+    + ",".join(task_ids)
+    + "/tasks_history"
 )
-SELECT
-    LISTAGG(record_task_id, ',')
-        WITHIN GROUP (ORDER BY record_task_id) AS task_ids
-FROM (
-    SELECT DISTINCT record_task_id
-    FROM records
-    WHERE record_task_id IS NOT NULL
-);
+
+response = requests.get(
+    url,
+    headers={"Authorization": f"Bearer {token}"},
+    timeout=120
+)
+
+print("HTTP status:", response.status_code)
+
+try:
+    payload = response.json()
+except ValueError:
+    payload = {"raw_response": response.text}
+
+evidence = {
+    "requested_task_count": len(task_ids),
+    "http_status": response.status_code,
+    "response": payload
+}
+
+with open("fr_mac_task_history_raw.json", "w", encoding="utf-8") as file:
+    json.dump(evidence, file, indent=2)
+
+status_keys = Counter()
+
+def scan(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if "status" in key.lower():
+                status_keys[key] += 1
+            scan(child)
+    elif isinstance(value, list):
+        for child in value:
+            scan(child)
+
+scan(payload)
+
+data = payload.get("data", []) if isinstance(payload, dict) else []
+
+print("Response objects:", len(data) if isinstance(data, list) else "unknown")
+print("Status-related keys:", dict(status_keys))
+print("Saved: fr_mac_task_history_raw.json")
+
+if response.status_code != 200 and isinstance(payload, dict):
+    print(
+        "Wrike error:",
+        payload.get("error"),
+        payload.get("errorDescription")
+    )
+PY
