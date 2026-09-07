@@ -3,155 +3,91 @@ WITH src AS (
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG
     WHERE TRIM(CHILD_FOLDER_TITLE) ILIKE '[FR] Mac APR Update'
 ),
-normalized AS (
+task_rows AS (
     SELECT
-        src.*,
-
-        NULLIF(TRIM("parent_task_id"), '') AS parent_id_n,
-        NULLIF(TRIM("child_task_id"), '') AS child_id_n,
-        NULLIF(TRIM("grandchild_task_id"), '') AS grandchild_id_n,
-        NULLIF(TRIM("baby_task_id"), '') AS baby_id_n,
-        NULLIF(TRIM("grandbaby_task_id"), '') AS grandbaby_id_n,
-        NULLIF(TRIM("great_grandbaby_task_id"), '') AS great_grandbaby_id_n
-
-    FROM src
-),
-inventory AS (
-    SELECT
-        "Space_Id" AS space_id,
-        "Space_Name" AS space_name,
-
-        "child_folder_id" AS project_id,
-        "child_folder_title" AS project_name,
-
         COALESCE(
-            great_grandbaby_id_n,
-            grandbaby_id_n,
-            baby_id_n,
-            grandchild_id_n,
-            child_id_n,
-            parent_id_n
+            NULLIF(TRIM("great_grandbaby_task_id"), ''),
+            NULLIF(TRIM("grandbaby_task_id"), ''),
+            NULLIF(TRIM("baby_task_id"), ''),
+            NULLIF(TRIM("grandchild_task_id"), ''),
+            NULLIF(TRIM("child_task_id"), ''),
+            NULLIF(TRIM("parent_task_id"), '')
         ) AS task_id,
 
         CASE
-            WHEN great_grandbaby_id_n IS NOT NULL
-                THEN '<TITLE NOT STORED AT THIS LEVEL>'
-            WHEN grandbaby_id_n IS NOT NULL
-                THEN NULLIF(TRIM("grandbaby_task_title"), '')
-            WHEN baby_id_n IS NOT NULL
-                THEN NULLIF(TRIM("baby_task_title"), '')
-            WHEN grandchild_id_n IS NOT NULL
-                THEN NULLIF(TRIM("grandchild_task_title"), '')
-            WHEN child_id_n IS NOT NULL
-                THEN NULLIF(TRIM("child_task_title"), '')
-            WHEN parent_id_n IS NOT NULL
-                THEN NULLIF(TRIM("parent_task_title"), '')
-        END AS task_name,
-
-        CASE
-            WHEN great_grandbaby_id_n IS NOT NULL
+            WHEN NULLIF(TRIM("great_grandbaby_task_id"), '') IS NOT NULL
                 THEN 'GREAT_GRANDBABY_TASK'
-            WHEN grandbaby_id_n IS NOT NULL
+            WHEN NULLIF(TRIM("grandbaby_task_id"), '') IS NOT NULL
                 THEN 'GRANDBABY_TASK'
-            WHEN baby_id_n IS NOT NULL
+            WHEN NULLIF(TRIM("baby_task_id"), '') IS NOT NULL
                 THEN 'BABY_TASK'
-            WHEN grandchild_id_n IS NOT NULL
+            WHEN NULLIF(TRIM("grandchild_task_id"), '') IS NOT NULL
                 THEN 'GRANDCHILD_SUBTASK'
-            WHEN child_id_n IS NOT NULL
+            WHEN NULLIF(TRIM("child_task_id"), '') IS NOT NULL
                 THEN 'CHILD_TASK'
-            WHEN parent_id_n IS NOT NULL
+            WHEN NULLIF(TRIM("parent_task_id"), '') IS NOT NULL
                 THEN 'TOP_LEVEL_SECTION'
         END AS task_level,
 
-        CASE
-            WHEN great_grandbaby_id_n IS NOT NULL
-                THEN grandbaby_id_n
-            WHEN grandbaby_id_n IS NOT NULL
-                THEN baby_id_n
-            WHEN baby_id_n IS NOT NULL
-                THEN grandchild_id_n
-            WHEN grandchild_id_n IS NOT NULL
-                THEN child_id_n
-            WHEN child_id_n IS NOT NULL
-                THEN parent_id_n
-            WHEN parent_id_n IS NOT NULL
-                THEN "child_folder_id"
-        END AS direct_parent_id,
+        NULLIF(TRIM("status"), '') AS general_status,
+        NULLIF(TRIM("customStatusId"), '') AS custom_status,
+        NULLIF(TRIM("createdDate"), '') AS created_at,
+        NULLIF(TRIM("updatedDate"), '') AS updated_at,
+        NULLIF(TRIM("completedDate"), '') AS completed_at,
+        NULLIF(TRIM("OwnerName"), '') AS assignee_name
 
-        CASE
-            WHEN great_grandbaby_id_n IS NOT NULL
-                THEN NULLIF(TRIM("grandbaby_task_title"), '')
-            WHEN grandbaby_id_n IS NOT NULL
-                THEN NULLIF(TRIM("baby_task_title"), '')
-            WHEN baby_id_n IS NOT NULL
-                THEN NULLIF(TRIM("grandchild_task_title"), '')
-            WHEN grandchild_id_n IS NOT NULL
-                THEN NULLIF(TRIM("child_task_title"), '')
-            WHEN child_id_n IS NOT NULL
-                THEN NULLIF(TRIM("parent_task_title"), '')
-            WHEN parent_id_n IS NOT NULL
-                THEN "child_folder_title"
-        END AS direct_parent_name,
-
-        parent_id_n AS top_level_section_id,
-        NULLIF(TRIM("parent_task_title"), '') AS top_level_section_name,
-
-        child_id_n AS child_task_id,
-        NULLIF(TRIM("child_task_title"), '') AS child_task_name,
-
-        grandchild_id_n AS grandchild_task_id,
-        NULLIF(TRIM("grandchild_task_title"), '') AS grandchild_task_name,
-
-        baby_id_n AS baby_task_id,
-        NULLIF(TRIM("baby_task_title"), '') AS baby_task_name,
-
-        grandbaby_id_n AS grandbaby_task_id,
-        NULLIF(TRIM("grandbaby_task_title"), '') AS grandbaby_task_name,
-
-        great_grandbaby_id_n AS great_grandbaby_task_id,
-
-        "status" AS current_general_status,
-        "customStatusId" AS current_custom_status,
-
-        "createdDate" AS created_at,
-        "updatedDate" AS updated_at,
-        "completedDate" AS completed_at,
-
-        "dates_type" AS schedule_type,
-        "dates_start" AS planned_start_at,
-        "dates_due" AS planned_due_at,
-        "dates_duration" AS planned_duration,
-
-        "ownerIds" AS owner_ids,
-        "Owner_userid" AS owner_user_id,
-        "OwnerName" AS current_assignee_name,
-        "Responsible_userId" AS responsible_user_id,
-
-        "permalink" AS permalink,
-
-        'WRIKE_STG' AS inventory_source,
-        'CURRENT_STATUS_ONLY' AS status_history_classification,
-        'HTTP_200_NO_STATUS_FIELDS_OR_VALUES'
-            AS task_history_api_result
-
-    FROM normalized
+    FROM src
     WHERE COALESCE(
-        great_grandbaby_id_n,
-        grandbaby_id_n,
-        baby_id_n,
-        grandchild_id_n,
-        child_id_n,
-        parent_id_n
+        NULLIF(TRIM("great_grandbaby_task_id"), ''),
+        NULLIF(TRIM("grandbaby_task_id"), ''),
+        NULLIF(TRIM("baby_task_id"), ''),
+        NULLIF(TRIM("grandchild_task_id"), ''),
+        NULLIF(TRIM("child_task_id"), ''),
+        NULLIF(TRIM("parent_task_id"), '')
     ) IS NOT NULL
 )
-SELECT
-    ROW_NUMBER() OVER (
-        ORDER BY
-            top_level_section_name,
-            child_task_name,
-            grandchild_task_name,
-            task_id
-    ) AS inventory_row,
-    *
-FROM inventory
-ORDER BY inventory_row;
+SELECT 'TOTAL_TASK_ROWS' AS metric, COUNT(*) AS result FROM task_rows
+UNION ALL
+SELECT 'DISTINCT_TASK_IDS', COUNT(DISTINCT task_id) FROM task_rows
+UNION ALL
+SELECT 'DUPLICATE_TASK_ROWS',
+       COUNT(*) - COUNT(DISTINCT task_id) FROM task_rows
+UNION ALL
+SELECT 'TOP_LEVEL_SECTIONS',
+       COUNT_IF(task_level = 'TOP_LEVEL_SECTION') FROM task_rows
+UNION ALL
+SELECT 'CHILD_TASKS',
+       COUNT_IF(task_level = 'CHILD_TASK') FROM task_rows
+UNION ALL
+SELECT 'GRANDCHILD_SUBTASKS',
+       COUNT_IF(task_level = 'GRANDCHILD_SUBTASK') FROM task_rows
+UNION ALL
+SELECT 'BABY_TASKS',
+       COUNT_IF(task_level = 'BABY_TASK') FROM task_rows
+UNION ALL
+SELECT 'GRANDBABY_TASKS',
+       COUNT_IF(task_level = 'GRANDBABY_TASK') FROM task_rows
+UNION ALL
+SELECT 'GREAT_GRANDBABY_TASKS',
+       COUNT_IF(task_level = 'GREAT_GRANDBABY_TASK') FROM task_rows
+UNION ALL
+SELECT 'CURRENT_STATUS_PRESENT',
+       COUNT_IF(general_status IS NOT NULL) FROM task_rows
+UNION ALL
+SELECT 'CUSTOM_STATUS_PRESENT',
+       COUNT_IF(custom_status IS NOT NULL) FROM task_rows
+UNION ALL
+SELECT 'CREATED_DATE_PRESENT',
+       COUNT_IF(created_at IS NOT NULL) FROM task_rows
+UNION ALL
+SELECT 'UPDATED_DATE_PRESENT',
+       COUNT_IF(updated_at IS NOT NULL) FROM task_rows
+UNION ALL
+SELECT 'COMPLETED_DATE_PRESENT',
+       COUNT_IF(completed_at IS NOT NULL) FROM task_rows
+UNION ALL
+SELECT 'ASSIGNEE_NAME_PRESENT',
+       COUNT_IF(assignee_name IS NOT NULL) FROM task_rows
+UNION ALL
+SELECT 'ASSIGNEE_NAME_MISSING',
+       COUNT_IF(assignee_name IS NULL) FROM task_rows;
