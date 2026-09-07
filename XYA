@@ -1,103 +1,157 @@
-python3 <(cat <<'PY'
-import getpass
-import json
-from collections import Counter
-from datetime import datetime, timezone
+WITH src AS (
+    SELECT *
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG
+    WHERE TRIM(CHILD_FOLDER_TITLE) ILIKE '[FR] Mac APR Update'
+),
+normalized AS (
+    SELECT
+        src.*,
 
-import requests
+        NULLIF(TRIM("parent_task_id"), '') AS parent_id_n,
+        NULLIF(TRIM("child_task_id"), '') AS child_id_n,
+        NULLIF(TRIM("grandchild_task_id"), '') AS grandchild_id_n,
+        NULLIF(TRIM("baby_task_id"), '') AS baby_id_n,
+        NULLIF(TRIM("grandbaby_task_id"), '') AS grandbaby_id_n,
+        NULLIF(TRIM("great_grandbaby_task_id"), '') AS great_grandbaby_id_n
 
-raw_ids = input("Paste the comma-separated 42 task IDs: ").strip()
-task_ids = list(dict.fromkeys(
-    value.strip() for value in raw_ids.split(",") if value.strip()
-))
+    FROM src
+),
+inventory AS (
+    SELECT
+        "Space_Id" AS space_id,
+        "Space_Name" AS space_name,
 
-if len(task_ids) != 42:
-    raise SystemExit(
-        f"Stopped: expected 42 unique IDs but received {len(task_ids)}."
-    )
+        "child_folder_id" AS project_id,
+        "child_folder_title" AS project_name,
 
-token = getpass.getpass("Paste Wrike token (hidden): ").strip()
+        COALESCE(
+            great_grandbaby_id_n,
+            grandbaby_id_n,
+            baby_id_n,
+            grandchild_id_n,
+            child_id_n,
+            parent_id_n
+        ) AS task_id,
 
-url = (
-    "https://www.wrike.com/api/v4/tasks/"
-    + ",".join(task_ids)
-    + "/tasks_history"
+        CASE
+            WHEN great_grandbaby_id_n IS NOT NULL
+                THEN '<TITLE NOT STORED AT THIS LEVEL>'
+            WHEN grandbaby_id_n IS NOT NULL
+                THEN NULLIF(TRIM("grandbaby_task_title"), '')
+            WHEN baby_id_n IS NOT NULL
+                THEN NULLIF(TRIM("baby_task_title"), '')
+            WHEN grandchild_id_n IS NOT NULL
+                THEN NULLIF(TRIM("grandchild_task_title"), '')
+            WHEN child_id_n IS NOT NULL
+                THEN NULLIF(TRIM("child_task_title"), '')
+            WHEN parent_id_n IS NOT NULL
+                THEN NULLIF(TRIM("parent_task_title"), '')
+        END AS task_name,
+
+        CASE
+            WHEN great_grandbaby_id_n IS NOT NULL
+                THEN 'GREAT_GRANDBABY_TASK'
+            WHEN grandbaby_id_n IS NOT NULL
+                THEN 'GRANDBABY_TASK'
+            WHEN baby_id_n IS NOT NULL
+                THEN 'BABY_TASK'
+            WHEN grandchild_id_n IS NOT NULL
+                THEN 'GRANDCHILD_SUBTASK'
+            WHEN child_id_n IS NOT NULL
+                THEN 'CHILD_TASK'
+            WHEN parent_id_n IS NOT NULL
+                THEN 'TOP_LEVEL_SECTION'
+        END AS task_level,
+
+        CASE
+            WHEN great_grandbaby_id_n IS NOT NULL
+                THEN grandbaby_id_n
+            WHEN grandbaby_id_n IS NOT NULL
+                THEN baby_id_n
+            WHEN baby_id_n IS NOT NULL
+                THEN grandchild_id_n
+            WHEN grandchild_id_n IS NOT NULL
+                THEN child_id_n
+            WHEN child_id_n IS NOT NULL
+                THEN parent_id_n
+            WHEN parent_id_n IS NOT NULL
+                THEN "child_folder_id"
+        END AS direct_parent_id,
+
+        CASE
+            WHEN great_grandbaby_id_n IS NOT NULL
+                THEN NULLIF(TRIM("grandbaby_task_title"), '')
+            WHEN grandbaby_id_n IS NOT NULL
+                THEN NULLIF(TRIM("baby_task_title"), '')
+            WHEN baby_id_n IS NOT NULL
+                THEN NULLIF(TRIM("grandchild_task_title"), '')
+            WHEN grandchild_id_n IS NOT NULL
+                THEN NULLIF(TRIM("child_task_title"), '')
+            WHEN child_id_n IS NOT NULL
+                THEN NULLIF(TRIM("parent_task_title"), '')
+            WHEN parent_id_n IS NOT NULL
+                THEN "child_folder_title"
+        END AS direct_parent_name,
+
+        parent_id_n AS top_level_section_id,
+        NULLIF(TRIM("parent_task_title"), '') AS top_level_section_name,
+
+        child_id_n AS child_task_id,
+        NULLIF(TRIM("child_task_title"), '') AS child_task_name,
+
+        grandchild_id_n AS grandchild_task_id,
+        NULLIF(TRIM("grandchild_task_title"), '') AS grandchild_task_name,
+
+        baby_id_n AS baby_task_id,
+        NULLIF(TRIM("baby_task_title"), '') AS baby_task_name,
+
+        grandbaby_id_n AS grandbaby_task_id,
+        NULLIF(TRIM("grandbaby_task_title"), '') AS grandbaby_task_name,
+
+        great_grandbaby_id_n AS great_grandbaby_task_id,
+
+        "status" AS current_general_status,
+        "customStatusId" AS current_custom_status,
+
+        "createdDate" AS created_at,
+        "updatedDate" AS updated_at,
+        "completedDate" AS completed_at,
+
+        "dates_type" AS schedule_type,
+        "dates_start" AS planned_start_at,
+        "dates_due" AS planned_due_at,
+        "dates_duration" AS planned_duration,
+
+        "ownerIds" AS owner_ids,
+        "Owner_userid" AS owner_user_id,
+        "OwnerName" AS current_assignee_name,
+        "Responsible_userId" AS responsible_user_id,
+
+        "permalink" AS permalink,
+
+        'WRIKE_STG' AS inventory_source,
+        'CURRENT_STATUS_ONLY' AS status_history_classification,
+        'HTTP_200_NO_STATUS_FIELDS_OR_VALUES'
+            AS task_history_api_result
+
+    FROM normalized
+    WHERE COALESCE(
+        great_grandbaby_id_n,
+        grandbaby_id_n,
+        baby_id_n,
+        grandchild_id_n,
+        child_id_n,
+        parent_id_n
+    ) IS NOT NULL
 )
-
-response = requests.get(
-    url,
-    headers={"Authorization": f"Bearer {token}"},
-    timeout=120
-)
-
-try:
-    payload = response.json()
-except ValueError:
-    payload = {"raw_response": response.text}
-
-rate_headers = {
-    key: value
-    for key, value in response.headers.items()
-    if key.lower() in {
-        "retry-after",
-        "x-ratelimit-limit",
-        "x-ratelimit-remaining",
-        "x-ratelimit-reset"
-    }
-}
-
-timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-filename = (
-    f"fr_mac_task_history_http"
-    f"{response.status_code}_{timestamp}.json"
-)
-
-with open(filename, "w", encoding="utf-8") as file:
-    json.dump({
-        "requested_task_count": len(task_ids),
-        "http_status": response.status_code,
-        "rate_limit_headers": rate_headers,
-        "response": payload
-    }, file, indent=2)
-
-print("HTTP status:", response.status_code)
-print("Rate-limit headers:", rate_headers)
-print("Saved:", filename)
-
-if response.status_code != 200:
-    if isinstance(payload, dict):
-        print(
-            "Wrike error:",
-            payload.get("error"),
-            payload.get("errorDescription")
-        )
-    raise SystemExit("Stopped without retrying.")
-
-key_matches = Counter()
-value_matches = Counter()
-
-def scan(value):
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if "status" in str(key).lower():
-                key_matches[str(key)] += 1
-            scan(child)
-    elif isinstance(value, list):
-        for child in value:
-            scan(child)
-    elif isinstance(value, str) and "status" in value.lower():
-        value_matches[value] += 1
-
-scan(payload)
-
-data = payload.get("data", []) if isinstance(payload, dict) else []
-
-print("Response objects:", len(data) if isinstance(data, list) else "unknown")
-print("Status-key matches:", dict(key_matches))
-print("Status-value matches:", dict(value_matches))
-print(
-    "Total status mentions:",
-    sum(key_matches.values()) + sum(value_matches.values())
-)
-PY
-)
+SELECT
+    ROW_NUMBER() OVER (
+        ORDER BY
+            top_level_section_name,
+            child_task_name,
+            grandchild_task_name,
+            task_id
+    ) AS inventory_row,
+    *
+FROM inventory
+ORDER BY inventory_row;
