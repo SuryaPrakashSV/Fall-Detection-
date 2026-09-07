@@ -14,27 +14,10 @@ task_rows AS (
             NULLIF(TRIM("parent_task_id"), '')
         ) AS task_id,
 
-        CASE
-            WHEN NULLIF(TRIM("great_grandbaby_task_id"), '') IS NOT NULL
-                THEN 'GREAT_GRANDBABY_TASK'
-            WHEN NULLIF(TRIM("grandbaby_task_id"), '') IS NOT NULL
-                THEN 'GRANDBABY_TASK'
-            WHEN NULLIF(TRIM("baby_task_id"), '') IS NOT NULL
-                THEN 'BABY_TASK'
-            WHEN NULLIF(TRIM("grandchild_task_id"), '') IS NOT NULL
-                THEN 'GRANDCHILD_SUBTASK'
-            WHEN NULLIF(TRIM("child_task_id"), '') IS NOT NULL
-                THEN 'CHILD_TASK'
-            WHEN NULLIF(TRIM("parent_task_id"), '') IS NOT NULL
-                THEN 'TOP_LEVEL_SECTION'
-        END AS task_level,
-
-        NULLIF(TRIM("status"), '') AS general_status,
-        NULLIF(TRIM("customStatusId"), '') AS custom_status,
-        NULLIF(TRIM("createdDate"), '') AS created_at,
-        NULLIF(TRIM("updatedDate"), '') AS updated_at,
-        NULLIF(TRIM("completedDate"), '') AS completed_at,
-        NULLIF(TRIM("OwnerName"), '') AS assignee_name
+        NULLIF(NULLIF(TRIM("ownerIds"), ''), '[]') AS owner_ids,
+        NULLIF(TRIM("Owner_userid"), '') AS owner_user_id,
+        NULLIF(TRIM("OwnerName"), '') AS owner_name,
+        NULLIF(TRIM("Responsible_userId"), '') AS responsible_user_id
 
     FROM src
     WHERE COALESCE(
@@ -46,48 +29,51 @@ task_rows AS (
         NULLIF(TRIM("parent_task_id"), '')
     ) IS NOT NULL
 )
-SELECT 'TOTAL_TASK_ROWS' AS metric, COUNT(*) AS result FROM task_rows
+SELECT 'OWNER_IDS_PRESENT' AS metric,
+       COUNT_IF(owner_ids IS NOT NULL) AS result
+FROM task_rows
 UNION ALL
-SELECT 'DISTINCT_TASK_IDS', COUNT(DISTINCT task_id) FROM task_rows
+SELECT 'OWNER_USER_ID_PRESENT',
+       COUNT_IF(owner_user_id IS NOT NULL)
+FROM task_rows
 UNION ALL
-SELECT 'DUPLICATE_TASK_ROWS',
-       COUNT(*) - COUNT(DISTINCT task_id) FROM task_rows
+SELECT 'OWNER_NAME_PRESENT',
+       COUNT_IF(owner_name IS NOT NULL)
+FROM task_rows
 UNION ALL
-SELECT 'TOP_LEVEL_SECTIONS',
-       COUNT_IF(task_level = 'TOP_LEVEL_SECTION') FROM task_rows
+SELECT 'RESPONSIBLE_USER_ID_PRESENT',
+       COUNT_IF(responsible_user_id IS NOT NULL)
+FROM task_rows
 UNION ALL
-SELECT 'CHILD_TASKS',
-       COUNT_IF(task_level = 'CHILD_TASK') FROM task_rows
+SELECT 'ANY_ASSIGNEE_REFERENCE_PRESENT',
+       COUNT_IF(
+           COALESCE(
+               owner_ids,
+               owner_user_id,
+               owner_name,
+               responsible_user_id
+           ) IS NOT NULL
+       )
+FROM task_rows
 UNION ALL
-SELECT 'GRANDCHILD_SUBTASKS',
-       COUNT_IF(task_level = 'GRANDCHILD_SUBTASK') FROM task_rows
+SELECT 'ASSIGNEE_ID_WITHOUT_NAME',
+       COUNT_IF(
+           owner_name IS NULL
+           AND COALESCE(
+               owner_ids,
+               owner_user_id,
+               responsible_user_id
+           ) IS NOT NULL
+       )
+FROM task_rows
 UNION ALL
-SELECT 'BABY_TASKS',
-       COUNT_IF(task_level = 'BABY_TASK') FROM task_rows
-UNION ALL
-SELECT 'GRANDBABY_TASKS',
-       COUNT_IF(task_level = 'GRANDBABY_TASK') FROM task_rows
-UNION ALL
-SELECT 'GREAT_GRANDBABY_TASKS',
-       COUNT_IF(task_level = 'GREAT_GRANDBABY_TASK') FROM task_rows
-UNION ALL
-SELECT 'CURRENT_STATUS_PRESENT',
-       COUNT_IF(general_status IS NOT NULL) FROM task_rows
-UNION ALL
-SELECT 'CUSTOM_STATUS_PRESENT',
-       COUNT_IF(custom_status IS NOT NULL) FROM task_rows
-UNION ALL
-SELECT 'CREATED_DATE_PRESENT',
-       COUNT_IF(created_at IS NOT NULL) FROM task_rows
-UNION ALL
-SELECT 'UPDATED_DATE_PRESENT',
-       COUNT_IF(updated_at IS NOT NULL) FROM task_rows
-UNION ALL
-SELECT 'COMPLETED_DATE_PRESENT',
-       COUNT_IF(completed_at IS NOT NULL) FROM task_rows
-UNION ALL
-SELECT 'ASSIGNEE_NAME_PRESENT',
-       COUNT_IF(assignee_name IS NOT NULL) FROM task_rows
-UNION ALL
-SELECT 'ASSIGNEE_NAME_MISSING',
-       COUNT_IF(assignee_name IS NULL) FROM task_rows;
+SELECT 'NO_ASSIGNEE_REFERENCE',
+       COUNT_IF(
+           COALESCE(
+               owner_ids,
+               owner_user_id,
+               owner_name,
+               responsible_user_id
+           ) IS NULL
+       )
+FROM task_rows;
