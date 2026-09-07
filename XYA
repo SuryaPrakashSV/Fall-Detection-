@@ -3,7 +3,7 @@ WITH src AS (
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG
     WHERE TRIM(CHILD_FOLDER_TITLE) ILIKE '[FR] Mac APR Update'
 ),
-records AS (
+task_rows AS (
     SELECT
         COALESCE(
             NULLIF(TRIM("great_grandbaby_task_id"), ''),
@@ -12,14 +12,16 @@ records AS (
             NULLIF(TRIM("grandchild_task_id"), ''),
             NULLIF(TRIM("child_task_id"), ''),
             NULLIF(TRIM("parent_task_id"), '')
-        ) AS record_task_id
+        ) AS record_task_id,
+        "status",
+        "customStatusId"
     FROM src
 )
 SELECT
-    COUNT(*) AS raw_rows,
-    COUNT_IF(record_task_id IS NULL) AS project_rows,
-    COUNT_IF(record_task_id IS NOT NULL) AS task_rows,
-    COUNT(DISTINCT record_task_id) AS distinct_task_records,
-    COUNT_IF(record_task_id IS NOT NULL)
-        - COUNT(DISTINCT record_task_id) AS duplicate_task_rows
-FROM records;
+    COALESCE(NULLIF(TRIM("status"), ''), '<BLANK>') AS general_status,
+    COALESCE(NULLIF(TRIM("customStatusId"), ''), '<BLANK>') AS custom_status_id,
+    COUNT(*) AS task_count
+FROM task_rows
+WHERE record_task_id IS NOT NULL
+GROUP BY 1, 2
+ORDER BY task_count DESC;
