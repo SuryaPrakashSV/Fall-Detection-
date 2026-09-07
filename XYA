@@ -1,14 +1,13 @@
-from status_history_core import (
-    CONTROL_EXPECTATIONS,
-    CONTROL_PROJECT_ID,
-    HIERARCHY_LEVEL_NAMES,
-    attach_to_project_rows,
-    build_task_hierarchy_table,
-    build_task_inventory,
-    lifecycle_metrics,
-    normalize_bi_export,
-    normalize_events,
-    reconcile_task_inventory,
-    trace_project_status_history,
-    verify_control_project,
-)
+    hierarchy = sub.add_parser(
+        "extract-project-hierarchy",
+        help=(
+            "Look up a project by NAME (not ID) and pull its full task/subtask "
+            "hierarchy, at whatever depth that project actually uses - the "
+            "output has parent_task/child_task/grandchild_task/... column "
+            "pairs, but ONLY as many pairs as the deepest chain in this "
+            "project needs (a 3-level project gets 3 pairs, not 6). If the "
+            "name matches more than one project, every match is pulled."
+        ),
+    )
+    hierarchy.add_argument("--project-name", required=True)
+    hierarchy.add_argument("--output", default="project_hierarchy")
