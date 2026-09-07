@@ -1,9 +1,11 @@
-        params: dict[str, Any] = {
-            "descendants": "true" if descendants else "false",
-            "subTasks": "true" if include_subtasks else "false",
-            "pageSize": page_size,
-            "fields": json.dumps(
-                ["superTaskIds", "subTaskIds", "parentIds", "responsibleIds", "authorIds"],
-                separators=(",", ":"),
-            ),
-        }
+    def find_projects_by_title(self, title: str) -> list[dict[str, Any]]:
+        """GET /folders?title=...&project=true - find a project by name.
+
+        Verified against https://developers.wrike.com/reference/getfoldersempty:
+        `title` is a CONTAINS-match filter, not an exact-name lookup, and can
+        return multiple folders. Callers must filter the result to an exact
+        (case-insensitive) title match themselves if they need a specific
+        project rather than every folder whose title happens to contain this
+        substring.
+        """
+        return self.get("folders", params={"title": title, "project": "true"}).get("data", [])
