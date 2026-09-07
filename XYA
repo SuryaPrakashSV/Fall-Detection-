@@ -1,11 +1,78 @@
-python3 - <<'PY'
+python3 <(cat <<'PY'
+import getpass
 import json
 from collections import Counter
+from datetime import datetime, timezone
 
-with open("fr_mac_task_history_raw.json", encoding="utf-8") as file:
-    evidence = json.load(file)
+import requests
 
-payload = evidence.get("response", evidence)
+raw_ids = input("Paste the comma-separated 42 task IDs: ").strip()
+task_ids = list(dict.fromkeys(
+    value.strip() for value in raw_ids.split(",") if value.strip()
+))
+
+if len(task_ids) != 42:
+    raise SystemExit(
+        f"Stopped: expected 42 unique IDs but received {len(task_ids)}."
+    )
+
+token = getpass.getpass("Paste Wrike token (hidden): ").strip()
+
+url = (
+    "https://www.wrike.com/api/v4/tasks/"
+    + ",".join(task_ids)
+    + "/tasks_history"
+)
+
+response = requests.get(
+    url,
+    headers={"Authorization": f"Bearer {token}"},
+    timeout=120
+)
+
+try:
+    payload = response.json()
+except ValueError:
+    payload = {"raw_response": response.text}
+
+rate_headers = {
+    key: value
+    for key, value in response.headers.items()
+    if key.lower() in {
+        "retry-after",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-reset"
+    }
+}
+
+timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+filename = (
+    f"fr_mac_task_history_http"
+    f"{response.status_code}_{timestamp}.json"
+)
+
+with open(filename, "w", encoding="utf-8") as file:
+    json.dump({
+        "requested_task_count": len(task_ids),
+        "http_status": response.status_code,
+        "rate_limit_headers": rate_headers,
+        "response": payload
+    }, file, indent=2)
+
+print("HTTP status:", response.status_code)
+print("Rate-limit headers:", rate_headers)
+print("Saved:", filename)
+
+if response.status_code != 200:
+    if isinstance(payload, dict):
+        print(
+            "Wrike error:",
+            payload.get("error"),
+            payload.get("errorDescription")
+        )
+    raise SystemExit("Stopped without retrying.")
+
 key_matches = Counter()
 value_matches = Counter()
 
@@ -23,7 +90,14 @@ def scan(value):
 
 scan(payload)
 
+data = payload.get("data", []) if isinstance(payload, dict) else []
+
+print("Response objects:", len(data) if isinstance(data, list) else "unknown")
 print("Status-key matches:", dict(key_matches))
 print("Status-value matches:", dict(value_matches))
-print("Total status mentions:", sum(key_matches.values()) + sum(value_matches.values()))
+print(
+    "Total status mentions:",
+    sum(key_matches.values()) + sum(value_matches.values())
+)
 PY
+)
