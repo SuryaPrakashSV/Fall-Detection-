@@ -1,72 +1,29 @@
-python3 <(cat <<'PY'
-import getpass
+python3 - <<'PY'
 import json
 from collections import Counter
-import requests
 
-raw_ids = input("Paste the comma-separated 42 task IDs: ").strip()
-task_ids = list(dict.fromkeys(
-    value.strip() for value in raw_ids.split(",") if value.strip()
-))
+with open("fr_mac_task_history_raw.json", encoding="utf-8") as file:
+    evidence = json.load(file)
 
-if len(task_ids) != 42:
-    raise SystemExit(
-        f"Stopped: expected 42 unique IDs but received {len(task_ids)}."
-    )
-
-token = getpass.getpass("Paste Wrike token (hidden): ").strip()
-
-url = (
-    "https://www.wrike.com/api/v4/tasks/"
-    + ",".join(task_ids)
-    + "/tasks_history"
-)
-
-response = requests.get(
-    url,
-    headers={"Authorization": f"Bearer {token}"},
-    timeout=120
-)
-
-print("HTTP status:", response.status_code)
-
-try:
-    payload = response.json()
-except ValueError:
-    payload = {"raw_response": response.text}
-
-with open("fr_mac_task_history_raw.json", "w", encoding="utf-8") as file:
-    json.dump({
-        "requested_task_count": len(task_ids),
-        "http_status": response.status_code,
-        "response": payload
-    }, file, indent=2)
-
-status_keys = Counter()
+payload = evidence.get("response", evidence)
+key_matches = Counter()
+value_matches = Counter()
 
 def scan(value):
     if isinstance(value, dict):
         for key, child in value.items():
-            if "status" in key.lower():
-                status_keys[key] += 1
+            if "status" in str(key).lower():
+                key_matches[str(key)] += 1
             scan(child)
     elif isinstance(value, list):
         for child in value:
             scan(child)
+    elif isinstance(value, str) and "status" in value.lower():
+        value_matches[value] += 1
 
 scan(payload)
 
-data = payload.get("data", []) if isinstance(payload, dict) else []
-
-print("Response objects:", len(data) if isinstance(data, list) else "unknown")
-print("Status-related keys:", dict(status_keys))
-print("Saved: fr_mac_task_history_raw.json")
-
-if response.status_code != 200 and isinstance(payload, dict):
-    print(
-        "Wrike error:",
-        payload.get("error"),
-        payload.get("errorDescription")
-    )
+print("Status-key matches:", dict(key_matches))
+print("Status-value matches:", dict(value_matches))
+print("Total status mentions:", sum(key_matches.values()) + sum(value_matches.values()))
 PY
-)
