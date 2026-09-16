@@ -1,23 +1,29 @@
-Investigated Projects (6):
-
-#	Project	ID
-1	ASA OS Compatibility	MQAAAABnlKFK
-2	Holiday (FY27)	MQAAAAEIsSOV
-3	FY26 Earth Day	MQAAAABooWQv
-4	FY26 Back to School Wave 1	MQAAAABqlXRg
-5	Apple Shopping Event (FY26)	IEADQP2VI5QPRQWK
-6	RESTRICTED Project B 2026 Spring 1	MQAAAABrUCtn
-
-Shared Task Projects (where the "missing" tasks actually live):
-
-Linked to	Shared Task Project (name)	ID
-Holiday (FY27)	Specialist image refresh Q1&Q2 FY27	MQAAAAEO6vxh
-FY26 Earth Day	Spring & Summer FY26 Specialist image refreshes	MQAAAAEEtZm0
-FY26 Earth Day	Trade In Pages update	MQAAAAEGPJGt
-FY26 Earth Day	Earth Day Promo (Recycling Offer)	MQAAAAEDA33T
-FY26 Back to School Wave 1	EDU Store Refresh ahead of BTS	MQAAAAEJN1E2
-FY26 Back to School Wave 1	JPN Education Savings Marketing Campaign	MQAAAAEK9Opf
-Apple Shopping Event (FY26)	(not individually captured — aggregate count only)	—
-RESTRICTED Project B 2026 Spring 1	Additional claims to Apple Watch Magnetic Fast Charging	MQAAAAEEt1EE
-RESTRICTED Project B 2026 Spring 1	India NSO - Borivali	MQAAAAEEaiya
-RESTRICTED Project B 2026 Spring 1	FCE Footer update	MQAAAAEE0QI8
+WITH specialist_tasks AS (
+    SELECT
+        COALESCE(
+            NULLIF(TRIM("great_grandbaby_task_id"), ''), NULLIF(TRIM("grandbaby_task_id"), ''),
+            NULLIF(TRIM("baby_task_id"), ''), NULLIF(TRIM("grandchild_task_id"), ''),
+            NULLIF(TRIM("child_task_id"), ''), NULLIF(TRIM("parent_task_id"), '')
+        ) AS task_id,
+        "id" AS filed_under_project_id,
+        "title" AS filed_under_project_name
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    WHERE "id" = 'MQAAAAEO6vxh'
+),
+holiday_tasks AS (
+    SELECT DISTINCT
+        COALESCE(
+            NULLIF(TRIM("great_grandbaby_task_id"), ''), NULLIF(TRIM("grandbaby_task_id"), ''),
+            NULLIF(TRIM("baby_task_id"), ''), NULLIF(TRIM("grandchild_task_id"), ''),
+            NULLIF(TRIM("child_task_id"), ''), NULLIF(TRIM("parent_task_id"), '')
+        ) AS task_id
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    WHERE "id" = 'MQAAAAEIsSOV'
+)
+SELECT
+    s.task_id,
+    s.filed_under_project_id,
+    s.filed_under_project_name,
+    CASE WHEN s.task_id IN (SELECT task_id FROM holiday_tasks) THEN 'YES' ELSE 'NO' END AS also_appears_under_holiday
+FROM specialist_tasks s
+LIMIT 10;
