@@ -1,30 +1,24 @@
 WITH holiday_tasks AS (
-    SELECT NULLIF(TRIM("parent_task_id"), '') AS task_id FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" WHERE "id" = 'MQAAAAEIsSOV'
-    UNION ALL
-    SELECT NULLIF(TRIM("child_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" WHERE "id" = 'MQAAAAEIsSOV'
-    UNION ALL
-    SELECT NULLIF(TRIM("grandchild_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" WHERE "id" = 'MQAAAAEIsSOV'
-    UNION ALL
-    SELECT NULLIF(TRIM("baby_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" WHERE "id" = 'MQAAAAEIsSOV'
-    UNION ALL
-    SELECT NULLIF(TRIM("grandbaby_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" WHERE "id" = 'MQAAAAEIsSOV'
-    UNION ALL
-    SELECT NULLIF(TRIM("great_grandbaby_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" WHERE "id" = 'MQAAAAEIsSOV'
+    SELECT DISTINCT
+        COALESCE(
+            NULLIF(TRIM("great_grandbaby_task_id"), ''), NULLIF(TRIM("grandbaby_task_id"), ''),
+            NULLIF(TRIM("baby_task_id"), ''), NULLIF(TRIM("grandchild_task_id"), ''),
+            NULLIF(TRIM("child_task_id"), ''), NULLIF(TRIM("parent_task_id"), '')
+        ) AS task_id
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    WHERE "id" = 'MQAAAAEIsSOV'
 ),
 specialist_tasks AS (
-    SELECT NULLIF(TRIM("parent_task_id"), '') AS task_id FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" WHERE "id" = 'MQAAAAE06vxh'
-    UNION ALL
-    SELECT NULLIF(TRIM("child_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" WHERE "id" = 'MQAAAAE06vxh'
-    UNION ALL
-    SELECT NULLIF(TRIM("grandchild_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" WHERE "id" = 'MQAAAAE06vxh'
-    UNION ALL
-    SELECT NULLIF(TRIM("baby_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" WHERE "id" = 'MQAAAAE06vxh'
-    UNION ALL
-    SELECT NULLIF(TRIM("grandbaby_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" WHERE "id" = 'MQAAAAE06vxh'
-    UNION ALL
-    SELECT NULLIF(TRIM("great_grandbaby_task_id"), '') FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" WHERE "id" = 'MQAAAAE06vxh'
+    SELECT DISTINCT
+        COALESCE(
+            NULLIF(TRIM("great_grandbaby_task_id"), ''), NULLIF(TRIM("grandbaby_task_id"), ''),
+            NULLIF(TRIM("baby_task_id"), ''), NULLIF(TRIM("grandchild_task_id"), ''),
+            NULLIF(TRIM("child_task_id"), ''), NULLIF(TRIM("parent_task_id"), '')
+        ) AS task_id
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    WHERE "id" = 'MQAAAAE06vxh'
 )
 SELECT
-    (SELECT COUNT(DISTINCT task_id) FROM holiday_tasks WHERE task_id IS NOT NULL) AS holiday_own_task_count,
-    (SELECT COUNT(DISTINCT task_id) FROM specialist_tasks WHERE task_id IS NOT NULL) AS specialist_own_task_count,
-    (SELECT COUNT(DISTINCT task_id) FROM specialist_tasks WHERE task_id IN (SELECT task_id FROM holiday_tasks)) AS tasks_shared_between_them;
+    (SELECT COUNT(*) FROM holiday_tasks WHERE task_id IS NOT NULL) AS holiday_own_task_count,
+    (SELECT COUNT(*) FROM specialist_tasks WHERE task_id IS NOT NULL) AS specialist_own_task_count,
+    (SELECT COUNT(*) FROM specialist_tasks WHERE task_id IN (SELECT task_id FROM holiday_tasks)) AS tasks_shared_between_them;
