@@ -1,21 +1,27 @@
-SELECT
-    COALESCE(
-        NULLIF(TRIM("great_grandbaby_task_id"), ''), NULLIF(TRIM("grandbaby_task_id"), ''),
-        NULLIF(TRIM("baby_task_id"), ''), NULLIF(TRIM("grandchild_task_id"), ''),
-        NULLIF(TRIM("child_task_id"), ''), NULLIF(TRIM("parent_task_id"), '')
-    ) AS task_id,
-    COALESCE(
-        NULLIF(TRIM("grandbaby_task_title"), ''), NULLIF(TRIM("baby_task_title"), ''),
-        NULLIF(TRIM("grandchild_task_title"), ''), NULLIF(TRIM("child_task_title"), ''),
-        NULLIF(TRIM("parent_task_title"), '')
-    ) AS task_title,
-    "id" AS filed_under_project_id,
-    "title" AS filed_under_project_name
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE "id" = 'MQAAAAEO6vxh'
-  AND COALESCE(
-        NULLIF(TRIM("grandbaby_task_title"), ''), NULLIF(TRIM("baby_task_title"), ''),
-        NULLIF(TRIM("grandchild_task_title"), ''), NULLIF(TRIM("child_task_title"), ''),
-        NULLIF(TRIM("parent_task_title"), '')
-      ) ILIKE '%Specialist image refresh%'
-ORDER BY task_title;
+WITH combined AS (
+    SELECT
+        COALESCE(
+            NULLIF(TRIM("great_grandbaby_task_id"), ''), NULLIF(TRIM("grandbaby_task_id"), ''),
+            NULLIF(TRIM("baby_task_id"), ''), NULLIF(TRIM("grandchild_task_id"), ''),
+            NULLIF(TRIM("child_task_id"), ''), NULLIF(TRIM("parent_task_id"), '')
+        ) AS task_id,
+        COALESCE(
+            NULLIF(TRIM("grandbaby_task_title"), ''), NULLIF(TRIM("baby_task_title"), ''),
+            NULLIF(TRIM("grandchild_task_title"), ''), NULLIF(TRIM("child_task_title"), ''),
+            NULLIF(TRIM("parent_task_title"), '')
+        ) AS task_title,
+        "id" AS filed_under_project_id
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    WHERE "id" IN ('MQAAAAEIsSOV', 'MQAAAAEO6vxh')
+)
+SELECT DISTINCT
+    task_id,
+    task_title,
+    filed_under_project_id,
+    CASE filed_under_project_id
+        WHEN 'MQAAAAEIsSOV' THEN 'Holiday (FY27) - direct'
+        WHEN 'MQAAAAEO6vxh' THEN 'Under Specialist image refresh Q1&Q2 FY27'
+    END AS source_label
+FROM combined
+WHERE task_id IS NOT NULL
+ORDER BY source_label, task_title;
