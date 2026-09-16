@@ -1,24 +1,48 @@
-WITH holiday_tasks AS (
-    SELECT DISTINCT
-        COALESCE(
-            NULLIF(TRIM("great_grandbaby_task_id"), ''), NULLIF(TRIM("grandbaby_task_id"), ''),
-            NULLIF(TRIM("baby_task_id"), ''), NULLIF(TRIM("grandchild_task_id"), ''),
-            NULLIF(TRIM("child_task_id"), ''), NULLIF(TRIM("parent_task_id"), '')
-        ) AS task_id
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE "id" = 'MQAAAAEIsSOV'
-),
-specialist_tasks AS (
-    SELECT DISTINCT
-        COALESCE(
-            NULLIF(TRIM("great_grandbaby_task_id"), ''), NULLIF(TRIM("grandbaby_task_id"), ''),
-            NULLIF(TRIM("baby_task_id"), ''), NULLIF(TRIM("grandchild_task_id"), ''),
-            NULLIF(TRIM("child_task_id"), ''), NULLIF(TRIM("parent_task_id"), '')
-        ) AS task_id
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE "id" = 'MQAAAAE06vxh'
-)
 SELECT
-    (SELECT COUNT(*) FROM holiday_tasks WHERE task_id IS NOT NULL) AS holiday_own_task_count,
-    (SELECT COUNT(*) FROM specialist_tasks WHERE task_id IS NOT NULL) AS specialist_own_task_count,
-    (SELECT COUNT(*) FROM specialist_tasks WHERE task_id IN (SELECT task_id FROM holiday_tasks)) AS tasks_shared_between_them;
+    *,
+    CASE "id"
+        WHEN 'MQAAAABnlKFK' THEN 1
+        WHEN 'MQAAAAEIsSOV' THEN 1
+        WHEN 'MQAAAABooWQv' THEN 1
+        WHEN 'MQAAAABqlXRg' THEN 1
+        WHEN 'IEADQP2VI5QPRQWK' THEN 1
+        WHEN 'MQAAAABrUCtn' THEN 1
+        ELSE 2
+    END AS project_group,
+    CASE "id"
+        WHEN 'MQAAAABnlKFK' THEN 'Investigated: ASA OS Compatibility'
+        WHEN 'MQAAAAEIsSOV' THEN 'Investigated: Holiday (FY27)'
+        WHEN 'MQAAAABooWQv' THEN 'Investigated: FY26 Earth Day'
+        WHEN 'MQAAAABqlXRg' THEN 'Investigated: FY26 Back to School Wave 1'
+        WHEN 'IEADQP2VI5QPRQWK' THEN 'Investigated: Apple Shopping Event (FY26)'
+        WHEN 'MQAAAABrUCtn' THEN 'Investigated: RESTRICTED Project B 2026 Spring 1'
+        WHEN 'MQAAAAEO6vxh' THEN 'Shared: Specialist image refresh Q1&Q2 FY27'
+        WHEN 'MQAAAAEEtZm0' THEN 'Shared: Spring & Summer FY26 Specialist image refreshes'
+        WHEN 'MQAAAAEGPJGt' THEN 'Shared: Trade In Pages update'
+        WHEN 'MQAAAAEDA33T' THEN 'Shared: Earth Day Promo (Recycling Offer)'
+        WHEN 'MQAAAAEJN1E2' THEN 'Shared: EDU Store Refresh ahead of BTS'
+        WHEN 'MQAAAAEK9Opf' THEN 'Shared: JPN Education Savings Marketing Campaign'
+        WHEN 'MQAAAAEEt1EE' THEN 'Shared: Additional claims to Apple Watch Magnetic Fast Charging'
+        WHEN 'MQAAAAEEaiya' THEN 'Shared: India NSO - Borivali'
+        WHEN 'MQAAAAEE0QI8' THEN 'Shared: FCE Footer update'
+    END AS project_label,
+    CASE "id"
+        WHEN 'MQAAAAEO6vxh' THEN 'Belongs to: Holiday (FY27)'
+        WHEN 'MQAAAAEEtZm0' THEN 'Belongs to: FY26 Earth Day'
+        WHEN 'MQAAAAEGPJGt' THEN 'Belongs to: FY26 Earth Day'
+        WHEN 'MQAAAAEDA33T' THEN 'Belongs to: FY26 Earth Day'
+        WHEN 'MQAAAAEJN1E2' THEN 'Belongs to: FY26 Back to School Wave 1'
+        WHEN 'MQAAAAEK9Opf' THEN 'Belongs to: FY26 Back to School Wave 1'
+        WHEN 'MQAAAAEEt1EE' THEN 'Belongs to: RESTRICTED Project B 2026 Spring 1'
+        WHEN 'MQAAAAEEaiya' THEN 'Belongs to: RESTRICTED Project B 2026 Spring 1'
+        WHEN 'MQAAAAEE0QI8' THEN 'Belongs to: RESTRICTED Project B 2026 Spring 1'
+        ELSE NULL
+    END AS relates_to
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+WHERE "id" IN (
+    'MQAAAABnlKFK', 'MQAAAAEIsSOV', 'MQAAAABooWQv', 'MQAAAABqlXRg',
+    'IEADQP2VI5QPRQWK', 'MQAAAABrUCtn',
+    'MQAAAAEO6vxh', 'MQAAAAEEtZm0', 'MQAAAAEGPJGt', 'MQAAAAEDA33T',
+    'MQAAAAEJN1E2', 'MQAAAAEK9Opf', 'MQAAAAEEt1EE', 'MQAAAAEEaiya', 'MQAAAAEE0QI8'
+)
+ORDER BY project_group, project_label, "id";
