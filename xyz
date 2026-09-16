@@ -1,487 +1,157 @@
-WITH counts AS (
+"""Independent second-method verification: does the paginated
+GET /folders/{id}/tasks?descendants=true&subTasks=true call return the
+exact same task set as an independently-implemented manual subTaskIds
+closure-walk?
 
-    SELECT
-        'QUERY_1' AS query_name,
-        'OWNER_PROJECT_WEEKLY_AGG' AS current_table,
-        'OWNER_PROJECT_WEEKLY_AGG_NEW' AS new_table,
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.OWNER_PROJECT_WEEKLY_AGG),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.OWNER_PROJECT_WEEKLY_AGG_NEW)
+This is the same core proof used for Holiday (via resolve_scope.py, which
+also included some Holiday-specific extras - a folder-ancestry check and a
+known-top-level-task-id check - that don't generalize to other projects).
+This script isolates just the reusable part: two independently-coded ways
+of asking "what are every one of this project's descendant tasks," compared
+for an exact match. 0 delta means the folder endpoint's subTasks=true
+already gives full recursive depth on its own - not a fluke specific to
+Holiday's data shape.
 
-    UNION ALL
-
-    SELECT
-        'QUERY_2',
-        'WRIKE_OOO_OWNER',
-        'WRIKE_OOO_OWNER_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_OOO_OWNER),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_OOO_OWNER_NEW)
-
-    UNION ALL
-
-    SELECT
-        'QUERY_3',
-        'RAINBOW_OWNER_BYHOURS_FINAL',
-        'RAINBOW_OWNER_BYHOURS_FINAL_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.RAINBOW_OWNER_BYHOURS_FINAL),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.RAINBOW_OWNER_BYHOURS_FINAL_NEW)
-
-    UNION ALL
-
-    SELECT
-        'QUERY_4',
-        'WRIKE_PROJECT_ASSIGNEE_DETAIL',
-        'WRIKE_PROJECT_ASSIGNEE_DETAIL_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_PROJECT_ASSIGNEE_DETAIL),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_PROJECT_ASSIGNEE_DETAIL_NEW)
-
-    UNION ALL
-
-    SELECT
-        'QUERY_5',
-        'DEMAND_FORECAST',
-        'DEMAND_FORECAST_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.DEMAND_FORECAST_NEW)
-
-    UNION ALL
-
-    SELECT
-        'QUERY_6',
-        'SUPPLY_FORECAST',
-        'SUPPLY_FORECAST_NEW',
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST),
-        (SELECT COUNT(*) FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.SUPPLY_FORECAST_NEW)
-),
-
-table_metadata AS (
-    SELECT
-        TABLE_NAME,
-        LAST_ALTERED
-    FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.TABLES
-    WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-),
-
-schema_signatures AS (
-    SELECT
-        TABLE_NAME,
-        COUNT(*) AS column_count,
-        LISTAGG(
-            ORDINAL_POSITION || ':' ||
-            COLUMN_NAME || ':' ||
-            DATA_TYPE || ':' ||
-            COALESCE(TO_VARCHAR(CHARACTER_MAXIMUM_LENGTH), '') || ':' ||
-            COALESCE(TO_VARCHAR(NUMERIC_PRECISION), '') || ':' ||
-            COALESCE(TO_VARCHAR(NUMERIC_SCALE), ''),
-            '|'
-        ) WITHIN GROUP (ORDER BY ORDINAL_POSITION) AS schema_signature
-    FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
-    WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-    GROUP BY TABLE_NAME
-),
-
-manual_uat AS (
-    SELECT
-        column1 AS query_name,
-        column2 AS dashboard_result,
-        column3 AS manual_note
-    FROM VALUES
-        (
-            'QUERY_1',
-            'ALIGNED - MINOR EXPECTED DIFFERENCES',
-            'Capacity Utilization and Operational Insights aligned.'
-        ),
-        (
-            'QUERY_2',
-            'ALIGNED - MINOR EXPECTED DIFFERENCES',
-            'Capacity Utilization and Operational Insights aligned.'
-        ),
-        (
-            'QUERY_3',
-            'ALIGNED - MINOR EXPECTED DIFFERENCES',
-            'Capacity Utilization and Operational Insights aligned.'
-        ),
-        (
-            'QUERY_4',
-            'ALIGNED - MINOR EXPECTED DIFFERENCES',
-            'Capacity Utilization and Operational Insights aligned.'
-        ),
-        (
-            'QUERY_5',
-            'SNOWFLAKE FORECAST UAT',
-            'Rerun bidirectional row and key comparison after aligned refresh.'
-        ),
-        (
-            'QUERY_6',
-            'SNOWFLAKE FORECAST UAT',
-            'Previous bidirectional comparison returned zero differences.'
-        )
-),
-
-results AS (
-    SELECT
-        CURRENT_TIMESTAMP() AS check_time,
-        CURRENT_DATE() AS check_date,
-        c.query_name,
-        c.current_table,
-        c.new_table,
-        c.current_count,
-        c.new_count,
-        c.new_count - c.current_count AS signed_difference,
-        ABS(c.new_count - c.current_count) AS absolute_difference,
-
-        IFF(
-            GREATEST(c.current_count, c.new_count) = 0,
-            100,
-            ROUND(
-                100 * LEAST(c.current_count, c.new_count)
-                    / GREATEST(c.current_count, c.new_count),
-                2
-            )
-        ) AS alignment_percentage,
-
-        current_meta.last_altered AS current_refresh,
-        new_meta.last_altered AS new_refresh,
-
-        ROUND(
-            ABS(
-                DATEDIFF(
-                    'minute',
-                    current_meta.last_altered,
-                    new_meta.last_altered
-                )
-            ) / 60.0,
-            2
-        ) AS refresh_gap_hours,
-
-        current_schema.column_count AS current_column_count,
-        new_schema.column_count AS new_column_count,
-
-        IFF(
-            current_schema.schema_signature = new_schema.schema_signature,
-            'MATCH',
-            'MISMATCH'
-        ) AS schema_status,
-
-        u.dashboard_result,
-        u.manual_note
-
-    FROM counts c
-
-    LEFT JOIN table_metadata current_meta
-        ON current_meta.table_name = c.current_table
-
-    LEFT JOIN table_metadata new_meta
-        ON new_meta.table_name = c.new_table
-
-    LEFT JOIN schema_signatures current_schema
-        ON current_schema.table_name = c.current_table
-
-    LEFT JOIN schema_signatures new_schema
-        ON new_schema.table_name = c.new_table
-
-    LEFT JOIN manual_uat u
-        ON u.query_name = c.query_name
-),
-
-scored AS (
-    SELECT
-        *,
-        IFF(
-            current_count = new_count,
-            'MATCH',
-            'DIFFERENCE'
-        ) AS row_count_status,
-
-        CASE
-            WHEN schema_status = 'MISMATCH'
-                THEN 'FAIL - SCHEMA MISMATCH'
-
-            WHEN refresh_gap_hours > 2
-                THEN 'PENDING - ALIGNED REFRESH RECHECK'
-
-            WHEN current_count = new_count
-                THEN 'PASS - ROW COUNTS MATCH'
-
-            WHEN alignment_percentage >= 99.90
-                THEN 'PASS - MINOR ROW DIFFERENCE'
-
-            ELSE 'REVIEW REQUIRED'
-        END AS validation_status
-
-    FROM results
-)
-
-SELECT
-    check_time,
-    check_date,
-    query_name,
-    current_table,
-    new_table,
-    current_count,
-    new_count,
-    signed_difference,
-    absolute_difference,
-    alignment_percentage,
-    current_refresh,
-    new_refresh,
-    refresh_gap_hours,
-    current_column_count,
-    new_column_count,
-    schema_status,
-    row_count_status,
-    validation_status,
-    dashboard_result,
-
-    manual_note || ' ' ||
-    CASE
-        WHEN current_count = new_count
-            THEN 'Row counts match.'
-        ELSE
-            'Absolute row difference: ' ||
-            absolute_difference || '.'
-    END ||
-    CASE
-        WHEN refresh_gap_hours > 2
-            THEN ' Refreshes are ' || refresh_gap_hours ||
-                 ' hours apart; aligned-refresh recheck required.'
-        ELSE
-            ' Refresh timing is aligned.'
-    END AS notes
-
-FROM scored
-ORDER BY query_name;
-===============================================================
-"""Permission-aware Wrike API client for status-history backfill."""
+Usage:
+    python3 verify_closure_depth.py \
+        --project-id MQAAAABooWQv \
+        --project-name "FY26 Earth Day"
+"""
 
 from __future__ import annotations
 
+import argparse
+import getpass
+import os
 import time
-import json
 from datetime import datetime, timezone
-from collections.abc import Mapping
-from typing import Any
+from email.utils import parsedate_to_datetime
 
 import requests
 
-
-class WrikePermissionError(RuntimeError):
-    pass
+API_BASE = "https://www.wrike.com/api/v4"
 
 
-CATALOG_COLUMNS = [
-    "custom_status_id",
-    "status_name",
-    "status_group",
-    "status_color",
-    "workflow_id",
-    "workflow_name",
-    "status_hidden",
-    "workflow_hidden",
-]
+def token() -> str:
+    value = os.getenv("WRIKE_TOKEN", "").strip()
+    return value or getpass.getpass("Wrike token (hidden; not saved): ").strip()
 
 
-def flatten_workflows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """One row per custom status, flattened out of a GET /workflows response.
-
-    Kept as a plain function (not a method) so it's testable with a canned
-    payload and no token.
-    """
-    rows: list[dict[str, Any]] = []
-    for workflow in payload.get("data", []) or []:
-        for status in workflow.get("customStatuses", []) or []:
-            status_id = status.get("id")
-            if not status_id:
-                continue
-            rows.append(
-                {
-                    "custom_status_id": str(status_id),
-                    "status_name": str(status.get("name") or status_id),
-                    "status_group": status.get("group"),
-                    "status_color": status.get("color"),
-                    "workflow_id": str(workflow.get("id") or ""),
-                    "workflow_name": workflow.get("name"),
-                    "status_hidden": bool(status.get("hidden", False)),
-                    "workflow_hidden": bool(workflow.get("hidden", False)),
-                }
-            )
-    rows.sort(key=lambda row: (str(row["workflow_name"] or ""), str(row["status_name"])))
-    return rows
+def get_with_backoff(url, headers, params=None, max_retries=6, timeout=60):
+    for attempt in range(max_retries):
+        resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+        if resp.status_code != 429 or attempt == max_retries - 1:
+            return resp
+        retry_after = resp.headers.get("Retry-After")
+        wait = None
+        if retry_after:
+            try:
+                wait = max(0.0, float(retry_after))
+            except ValueError:
+                try:
+                    retry_dt = parsedate_to_datetime(retry_after)
+                    if retry_dt.tzinfo is None:
+                        retry_dt = retry_dt.replace(tzinfo=timezone.utc)
+                    wait = max(0.0, (retry_dt - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError):
+                    wait = None
+        if wait is None:
+            wait = min(120, 5 * (2 ** attempt))
+        print(f"Rate limited (429). Waiting {wait:.0f}s before retry {attempt + 1}/{max_retries}...")
+        time.sleep(wait)
+    return resp
 
 
-# dates.start/due are schedule fields a PM sets by hand, not events -- easy
-# to mix up with an actual status change (createdDate/completedDate) so
-# spelling it out here once instead of relying on people remembering.
-FIELD_MEANINGS: dict[str, str] = {
-    "createdDate": "when the object was created, set once, never changes",
-    "updatedDate": "last edit of any kind (status, dates, fields...), not just status",
-    "completedDate": "the one field actually tied to a real status change",
-    "customStatusId": "current status id only, no history - map to a name via /workflows",
-    "dates.start": "planned start date, set by a PM - not derived from an actual status change",
-    "dates.due": "planned due date, same deal, not an actual completion event",
-    "dates.type": "metadata about the dates block itself (Planned, Backlog, etc), not a date",
-    "project.authorId": "who created it",
-    "project.ownerIds": "current owner(s)",
-    "project.createdDate": "same as createdDate, nested copy",
-    "project.completedDate": "same as completedDate, nested copy",
-    "project.customStatusId": "same as customStatusId, nested copy",
-}
-
-_DATE_OR_STATUS_HINT = ("date", "status", "changed", "when")
-
-
-def describe_project_fields(project: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Walk a GET /folders/{id} response and label every date/status field.
-
-    Mainly so "is this an actual event or just a planned date someone typed
-    in" has one answer instead of everyone guessing per field.
-    """
-    rows: list[dict[str, Any]] = []
-
-    def visit(node: Any, path: str) -> None:
-        if isinstance(node, Mapping):
-            for key, value in node.items():
-                visit(value, f"{path}.{key}" if path else str(key))
-            return
-        lowered = path.lower()
-        if not any(hint in lowered for hint in _DATE_OR_STATUS_HINT):
-            return
-        meaning = FIELD_MEANINGS.get(path)
-        rows.append(
-            {
-                "field_path": path,
-                "value": node,
-                "meaning": meaning or "not documented here yet, check the Wrike API docs before relying on it",
-                "is_actual_event": path in {"completedDate", "project.completedDate"},
-                "is_planned_schedule_value": path in {"dates.start", "dates.due"},
-            }
+def fetch_all_folder_tasks(project_id: str, headers: dict) -> list[dict]:
+    """Method A: the authoritative, paginated folder endpoint."""
+    all_tasks: list[dict] = []
+    next_page_token = None
+    page = 1
+    while True:
+        params = (
+            {"nextPageToken": next_page_token}
+            if next_page_token
+            else {"descendants": "true", "subTasks": "true", "fields": '["subTaskIds"]'}
         )
+        resp = get_with_backoff(f"{API_BASE}/folders/{project_id}/tasks", headers, params=params)
+        if not resp.ok:
+            print(f"\nRequest failed ({resp.status_code}) for URL: {resp.url}\n{resp.text}\n")
+        resp.raise_for_status()
+        payload = resp.json()
+        page_tasks = payload.get("data", [])
+        all_tasks.extend(page_tasks)
+        print(f"  [Method A] Page {page}: {len(page_tasks)} tasks (running total {len(all_tasks)})")
+        next_page_token = payload.get("nextPageToken")
+        if not next_page_token:
+            break
+        page += 1
+    return all_tasks
 
-    visit(project, "")
-    rows.sort(key=lambda row: row["field_path"])
-    return rows
+
+def closure_walk(initial_tasks: list[dict], headers: dict) -> set[str]:
+    """Method B: independent manual subTaskIds closure-walk, starting from
+    the same initial page(s) but expanding purely via subTaskIds - a
+    structurally different code path than the folder endpoint's own
+    recursion, so agreement between the two is real evidence, not a
+    tautology.
+    """
+    seen: set[str] = set()
+    frontier: set[str] = set()
+    for task in initial_tasks:
+        seen.add(task["id"])
+        frontier.update(task.get("subTaskIds") or [])
+    frontier -= seen
+
+    round_num = 1
+    while frontier:
+        batch = list(frontier)[:100]
+        ids_param = ",".join(batch)
+        resp = get_with_backoff(f"{API_BASE}/tasks/{ids_param}", headers, params={"fields": '["subTaskIds"]'})
+        resp.raise_for_status()
+        for task in resp.json()["data"]:
+            seen.add(task["id"])
+            frontier.update(task.get("subTaskIds") or [])
+        frontier -= seen
+        print(f"  [Method B] Closure round {round_num}: {len(seen)} tasks found so far")
+        round_num += 1
+
+    return seen
 
 
-class WrikeClient:
-    def __init__(self, token: str, base_url: str = "https://www.wrike.com/api/v4", timeout: int = 60):
-        if not token:
-            raise ValueError("Wrike token is required")
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update({"Authorization": f"bearer {token}", "Accept": "application/json"})
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project-id", required=True)
+    parser.add_argument("--project-name", default="")
+    args = parser.parse_args()
 
-    def get(self, path: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        url = f"{self.base_url}/{path.lstrip('/')}"
-        for attempt in range(4):
-            response = self.session.get(url, params=params, timeout=self.timeout)
-            if response.status_code in {401, 403}:
-                raise WrikePermissionError(
-                    f"GET /{path.lstrip('/')} returned HTTP {response.status_code}; required permission/scope is unavailable."
-                )
-            if response.status_code == 429 or response.status_code >= 500:
-                if attempt < 3:
-                    time.sleep(min(2 ** attempt, 8))
-                    continue
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise ValueError(f"Wrike returned a non-object response for {path}")
-            return payload
-        raise RuntimeError(f"Wrike request failed after retries: {path}")
+    headers = {"Authorization": f"Bearer {token()}"}
 
-    def project(self, project_id: str) -> dict[str, Any]:
-        rows = self.get(f"folders/{project_id}").get("data", [])
-        if not rows:
-            raise LookupError(f"Project not found or not shared: {project_id}")
-        return rows[0]
+    print(f"\n{'=' * 70}\nVerifying {args.project_name or args.project_id}\n{'=' * 70}")
 
-    def status_names(self) -> dict[str, str]:
-        mapping: dict[str, str] = {}
-        for workflow in self.get("workflows", params={"includeSpaceWorkflow": "true"}).get("data", []):
-            for status in workflow.get("customStatuses", []):
-                if status.get("id"):
-                    mapping[str(status["id"])] = str(status.get("name") or status["id"])
-        return mapping
+    print("\nMethod A: paginated folder endpoint (descendants=true, subTasks=true)")
+    initial_tasks = fetch_all_folder_tasks(args.project_id, headers)
+    method_a_ids = {t["id"] for t in initial_tasks}
+    print(f"Method A total: {len(method_a_ids)}")
 
-    def workflows_payload(self) -> dict[str, Any]:
-        """Raw GET /workflows response, unmodified."""
-        return self.get("workflows", params={"includeSpaceWorkflow": "true"})
+    print("\nMethod B: independent manual subTaskIds closure-walk")
+    method_b_ids = closure_walk(initial_tasks, headers)
+    print(f"Method B total: {len(method_b_ids)}")
 
-    def status_catalog(self) -> list[dict[str, Any]]:
-        return flatten_workflows(self.workflows_payload())
+    only_in_b = method_b_ids - method_a_ids
+    only_in_a = method_a_ids - method_b_ids
 
-    def probe(self, path: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
-        """Like get(), but returns a status report instead of raising on non-200.
+    print(f"\n{'=' * 70}\nResult\n{'=' * 70}")
+    print(f"Method A (folder endpoint):     {len(method_a_ids)}")
+    print(f"Method B (closure-walk):        {len(method_b_ids)}")
+    print(f"In B but not A (delta):         {len(only_in_b)}")
+    print(f"In A but not B (delta):         {len(only_in_a)}")
 
-        Only use this for diagnostics/access checks, not for actually fetching
-        data - keeps Wrike's own error message so we're not just guessing why
-        something is a 403.
-        """
-        url = f"{self.base_url}/{path.lstrip('/')}"
-        record: dict[str, Any] = {
-            "endpoint": f"GET /{path.lstrip('/')}",
-            "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        }
-        try:
-            response = self.session.get(url, params=params, timeout=self.timeout)
-        except requests.RequestException as exc:
-            record.update({"status_code": None, "accessible": False, "error": str(exc)})
-            return record
-        record["status_code"] = response.status_code
-        record["accessible"] = response.status_code == 200
-        try:
-            body = response.json()
-        except ValueError:
-            body = None
-        if response.status_code != 200 and isinstance(body, Mapping):
-            record["wrike_error"] = body.get("error")
-            record["wrike_error_description"] = body.get("errorDescription")
-        elif response.status_code == 200 and isinstance(body, Mapping):
-            record["response_kind"] = body.get("kind")
-            data = body.get("data")
-            record["rows_returned"] = len(data) if isinstance(data, list) else None
-        return record
+    if not only_in_a and not only_in_b:
+        print("\n0 delta both directions - the two independent methods agree EXACTLY.")
+        print("The folder endpoint's subTasks=true is confirmed to reach full recursive depth for this project.")
+    else:
+        print("\nDELTA FOUND - the two methods disagree. Worth investigating which one is right before trusting this project's count.")
 
-    def audit_log(
-        self,
-        *,
-        object_ids: list[str] | None = None,
-        start: str = "2024-01-01T00:00:00Z",
-        end: str | None = None,
-        page_size: int = 1000,
-    ) -> list[dict[str, Any]]:
-        """Fetch Audit Log pages. Requires amReadOnlyAuditLog and account permission."""
-        end = end or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        compact = lambda value: json.dumps(value, separators=(",", ":"))
-        params: dict[str, Any] = {
-            "eventDate": compact({"start": start, "end": end}),
-            "operations": compact(["TaskStatusChanged"]),
-            "pageSize": page_size,
-        }
-        if object_ids:
-            params["objectIds"] = compact(object_ids[:10])
-            params["objectType"] = "Project"
-        output: list[dict[str, Any]] = []
-        next_page: str | None = None
-        while True:
-            if next_page:
-                params["nextPageToken"] = next_page
-            payload = self.get("audit_log", params=params)
-            output.extend(payload.get("data", []))
-            next_page = payload.get("nextPageToken")
-            if not next_page:
-                break
-        return output
 
-    def bi_export_manifest(self) -> dict[str, Any]:
-        """Fetch BI Export manifest. Requires dataExportFull and account permission."""
-        return self.get("data_export")
-
-    def list_webhooks(self) -> list[dict[str, Any]]:
-        """Registered webhook subscriptions (id, hookUrl, status, events).
-
-        Just subscription management, no date-range params - the `status`
-        field here is the subscription's own active/suspended flag, not a
-        project status, don't confuse the two when reading the response.
-        """
-        return self.get("webhooks").get("data", [])
+if __name__ == "__main__":
+    main()
