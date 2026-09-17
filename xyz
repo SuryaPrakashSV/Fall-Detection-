@@ -1,6 +1,32 @@
+def fetch_all_folder_tasks(project_id: str, headers: dict) -> set[str]:
+    all_ids: set[str] = set()
+    next_page_token = None
+    seen_tokens: set[str] = set()          # <-- NEW: add this line
+    page = 1
+    while True:
+        if next_page_token:
+            if next_page_token in seen_tokens:   # <-- NEW: add this block
+                print("  WARNING: repeated nextPageToken detected, stopping to avoid an infinite loop.")
+                break
+            seen_tokens.add(next_page_token)
+
         params = {"fields": '["subTaskIds"]'}
         if next_page_token:
             params["nextPageToken"] = next_page_token
         else:
             params["descendants"] = "true"
             params["subTasks"] = "true"
+
+        resp = get_with_backoff(f"{API_BASE}/folders/{project_id}/tasks", headers, params=params)
+        if not resp.ok:
+            print(f"\nRequest failed ({resp.status_code}) for URL: {resp.url}\n{resp.text}\n")
+        resp.raise_for_status()
+        payload = resp.json()
+        page_tasks = payload.get("data", [])
+        all_ids.update(t["id"] for t in page_tasks)
+        print(f"  Page {page}: {len(page_tasks)} tasks (running total {len(all_ids)})")
+        next_page_token = payload.get("nextPageToken")
+        if not next_page_token:
+            break
+        page += 1
+    return all_ids
