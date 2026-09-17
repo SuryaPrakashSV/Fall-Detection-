@@ -1,32 +1,244 @@
-def fetch_all_folder_tasks(project_id: str, headers: dict) -> set[str]:
-    all_ids: set[str] = set()
+"""Item #3 of finishing category 2: check whether the CURRENT status
+values for matched tasks are accurate in Snowflake, not just whether the
+task exists there.
+
+Everything up to this point verified task IDENTITY - does a task exist in
+Snowflake at all. This is a different, narrower question: for tasks that
+DO exist in both places, does Snowflake's stored status/customStatusId
+match what Wrike says RIGHT NOW.
+
+Important framing: some mismatch here is NORMAL and EXPECTED, not a bug.
+Wrike_STG is only refreshed periodically (confirmed ~every 2 hours from
+the real production source), so a task whose status changed in the last
+refresh window will legitimately show as "different" here without that
+meaning anything is broken. This script reports the mismatch rate so it
+can be judged in that context, not to hunt for defects.
+
+Usage:
+    python3 verify_status_accuracy.py \
+        --project-id MQAAAAEIsSOV \
+        --project-name "Holiday (FY27)"
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import os
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+
+import requests
+
+API_BASE = "https://www.wrike.com/api/v4"
+TABLE_FQN = 'GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"'
+
+HIERARCHY_COLUMNS = [
+    "parent_task_id",
+    "child_task_id",
+    "grandchild_task_id",
+    "baby_task_id",
+    "grandbaby_task_id",
+    "great_grandbaby_task_id",
+]
+
+
+def token() -> str:
+    value = os.getenv("WRIKE_TOKEN", "").strip()
+    return value or getpass.getpass("Wrike token (hidden; not saved): ").strip()
+
+
+def get_with_backoff(url, headers, params=None, max_retries=6, timeout=60):
+    for attempt in range(max_retries):
+        resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+        if resp.status_code != 429 or attempt == max_retries - 1:
+            return resp
+        retry_after = resp.headers.get("Retry-After")
+        wait = None
+        if retry_after:
+            try:
+                wait = max(0.0, float(retry_after))
+            except ValueError:
+                try:
+                    retry_dt = parsedate_to_datetime(retry_after)
+                    if retry_dt.tzinfo is None:
+                        retry_dt = retry_dt.replace(tzinfo=timezone.utc)
+                    wait = max(0.0, (retry_dt - datetime.now(timezone.utc)).total_seconds())
+                except (TypeError, ValueError):
+                    wait = None
+        if wait is None:
+            wait = min(120, 5 * (2 ** attempt))
+        print(f"Rate limited (429). Waiting {wait:.0f}s before retry {attempt + 1}/{max_retries}...")
+        time.sleep(wait)
+    return resp
+
+
+def fetch_live_statuses(project_id: str, headers: dict) -> dict[str, tuple[str, str]]:
+    """{task_id: (status, customStatusId)} straight from live Wrike."""
+    live: dict[str, tuple[str, str]] = {}
     next_page_token = None
-    seen_tokens: set[str] = set()          # <-- NEW: add this line
+    seen_tokens: set[str] = set()
     page = 1
     while True:
+        params = {"fields": '["status","customStatusId"]'}
         if next_page_token:
-            if next_page_token in seen_tokens:   # <-- NEW: add this block
-                print("  WARNING: repeated nextPageToken detected, stopping to avoid an infinite loop.")
+            if next_page_token in seen_tokens:
+                print("  WARNING: repeated nextPageToken detected, stopping.")
                 break
             seen_tokens.add(next_page_token)
-
-        params = {"fields": '["subTaskIds"]'}
-        if next_page_token:
             params["nextPageToken"] = next_page_token
         else:
             params["descendants"] = "true"
             params["subTasks"] = "true"
-
         resp = get_with_backoff(f"{API_BASE}/folders/{project_id}/tasks", headers, params=params)
         if not resp.ok:
-            print(f"\nRequest failed ({resp.status_code}) for URL: {resp.url}\n{resp.text}\n")
+            print(f"\nRequest failed ({resp.status_code}): {resp.text}\n")
         resp.raise_for_status()
         payload = resp.json()
         page_tasks = payload.get("data", [])
-        all_ids.update(t["id"] for t in page_tasks)
-        print(f"  Page {page}: {len(page_tasks)} tasks (running total {len(all_ids)})")
+        for t in page_tasks:
+            live[t["id"]] = (t.get("status"), t.get("customStatusId"))
+        print(f"  Page {page}: {len(page_tasks)} tasks (running total {len(live)})")
         next_page_token = payload.get("nextPageToken")
         if not next_page_token:
             break
         page += 1
-    return all_ids
+    return live
+
+
+def snowflake_connection_from_env():
+    import snowflake.connector
+
+    authenticator = os.getenv("SNOWFLAKE_AUTHENTICATOR", "snowflake").strip().lower()
+    base_required = ["SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SNOWFLAKE_WAREHOUSE"]
+    required = base_required if authenticator == "externalbrowser" else base_required + ["SNOWFLAKE_PASSWORD"]
+    missing = [name for name in required if not os.getenv(name)]
+    if missing:
+        raise SystemExit(f"Missing required environment variable(s) for Snowflake: {missing}.")
+
+    kwargs = dict(
+        account=os.environ["SNOWFLAKE_ACCOUNT"],
+        user=os.environ["SNOWFLAKE_USER"],
+        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
+        role=os.getenv("SNOWFLAKE_ROLE"),
+        database="GBI_RETAIL_BAP_DB",
+        schema="ASO_OPS_WSA_SNDBX_BIZ_APP",
+    )
+    if authenticator == "externalbrowser":
+        kwargs["authenticator"] = "externalbrowser"
+        print("Opening a browser window to complete SSO login - finish logging in there, then return here.")
+    else:
+        kwargs["password"] = os.environ["SNOWFLAKE_PASSWORD"]
+
+    return snowflake.connector.connect(**kwargs)
+
+
+def fetch_snowflake_statuses(cursor, project_id: str) -> dict[str, tuple[tuple, tuple]]:
+    """{task_id: (distinct_statuses_tuple, distinct_custom_status_ids_tuple)}.
+    Reports as tuples (not single values) because if a task's duplicate
+    fan-out rows ever disagreed with EACH OTHER on status, that's its own
+    finding worth surfacing, not something to silently average away.
+    """
+    union_parts = [
+        f'SELECT NULLIF(TRIM("{col}"), \'\') AS task_id, "status" AS status, "customStatusId" AS custom_status_id '
+        f'FROM {TABLE_FQN} WHERE "id" = %(project_id)s'
+        for col in HIERARCHY_COLUMNS
+    ]
+    query = f"""
+        SELECT task_id, status, custom_status_id
+        FROM ({" UNION ALL ".join(union_parts)})
+        WHERE task_id IS NOT NULL
+    """
+    cursor.execute(query, {"project_id": project_id})
+
+    per_task_statuses: dict[str, set] = {}
+    per_task_custom: dict[str, set] = {}
+    for task_id, status, custom_status_id in cursor.fetchall():
+        per_task_statuses.setdefault(task_id, set()).add(status)
+        per_task_custom.setdefault(task_id, set()).add(custom_status_id)
+
+    return {
+        task_id: (tuple(sorted(s for s in per_task_statuses[task_id] if s is not None)),
+                  tuple(sorted(c for c in per_task_custom[task_id] if c is not None)))
+        for task_id in per_task_statuses
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project-id", required=True)
+    parser.add_argument("--project-name", default="")
+    args = parser.parse_args()
+
+    headers = {"Authorization": f"Bearer {token()}"}
+
+    print(f"\n{'=' * 70}\nStatus accuracy check: {args.project_name or args.project_id}\n{'=' * 70}")
+
+    print("\nPulling live status values from Wrike...")
+    live = fetch_live_statuses(args.project_id, headers)
+    print(f"Live tasks with status info: {len(live)}")
+
+    connection = snowflake_connection_from_env()
+    try:
+        with connection.cursor() as cursor:
+            print("\nPulling stored status values from Snowflake...")
+            snowflake_statuses = fetch_snowflake_statuses(cursor, args.project_id)
+            print(f"Snowflake tasks with status info: {len(snowflake_statuses)}")
+    finally:
+        connection.close()
+
+    matched_ids = set(live.keys()) & set(snowflake_statuses.keys())
+    print(f"\nMatched tasks (present in both): {len(matched_ids)}")
+
+    internally_inconsistent = 0
+    status_matches = 0
+    status_mismatches = 0
+    custom_status_matches = 0
+    custom_status_mismatches = 0
+    mismatch_examples = []
+
+    for task_id in matched_ids:
+        live_status, live_custom = live[task_id]
+        sf_statuses, sf_customs = snowflake_statuses[task_id]
+
+        if len(sf_statuses) > 1 or len(sf_customs) > 1:
+            internally_inconsistent += 1
+
+        sf_status = sf_statuses[0] if len(sf_statuses) == 1 else None
+        sf_custom = sf_customs[0] if len(sf_customs) == 1 else None
+
+        if sf_status == live_status:
+            status_matches += 1
+        else:
+            status_mismatches += 1
+
+        if sf_custom == live_custom:
+            custom_status_matches += 1
+        else:
+            custom_status_mismatches += 1
+            if len(mismatch_examples) < 10:
+                mismatch_examples.append((task_id, live_custom, sf_custom))
+
+    print(f"\n{'=' * 70}\nResult\n{'=' * 70}")
+    print(f"General status ('status' field)   - matches: {status_matches}, mismatches: {status_mismatches}")
+    print(f"Detailed status ('customStatusId') - matches: {custom_status_matches}, mismatches: {custom_status_mismatches}")
+    print(f"Tasks where Snowflake's own duplicate rows disagreed with each other: {internally_inconsistent}")
+
+    if mismatch_examples:
+        print(f"\nSample customStatusId mismatches (task_id | live now | stored in Snowflake):")
+        for task_id, live_val, sf_val in mismatch_examples:
+            print(f"  {task_id} | {live_val} | {sf_val}")
+
+    print(
+        "\nNote: some mismatch is expected and normal - Wrike_STG only refreshes "
+        "periodically, so a task whose status changed since the last refresh will "
+        "legitimately show as different here without indicating any problem."
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+python3 verify_status_accuracy.py --project-id MQAAAAEIsSOV --project-name "Holiday (FY27)"
