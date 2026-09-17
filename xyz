@@ -2,10 +2,25 @@
 values for matched tasks are accurate in Snowflake, not just whether the
 task exists there.
 
+IMPORTANT FIX (v2): the first version of this script compared live
+Wrike's raw `customStatusId` (an opaque ID like "IEADQP2VJMEFMQKM")
+directly against Snowflake's `customStatusId` column - which gave a
+suspicious 0/194 match rate. The real production pipeline (Wrike_Data.py,
+function enrich_status_names()) OVERWRITES customStatusId with its
+human-readable NAME before uploading to Snowflake - so Snowflake's column
+never actually holds a raw ID, it holds a name like "On Track*" or
+"Resource Confirmed". Comparing a raw ID to a name is guaranteed to never
+match, regardless of whether the status is actually stale.
+
+This version fixes that by pulling the same live workflow/custom-status
+mapping the production job uses (GET /workflows?includeSpaceWorkflow=true)
+and translating each task's live customStatusId into its name BEFORE
+comparing - now genuinely apples-to-apples.
+
 Everything up to this point verified task IDENTITY - does a task exist in
 Snowflake at all. This is a different, narrower question: for tasks that
-DO exist in both places, does Snowflake's stored status/customStatusId
-match what Wrike says RIGHT NOW.
+DO exist in both places, does Snowflake's stored status match what Wrike
+says RIGHT NOW.
 
 Important framing: some mismatch here is NORMAL and EXPECTED, not a bug.
 Wrike_STG is only refreshed periodically (confirmed ~every 2 hours from
@@ -74,14 +89,36 @@ def get_with_backoff(url, headers, params=None, max_retries=6, timeout=60):
     return resp
 
 
-def fetch_live_statuses(project_id: str, headers: dict) -> dict[str, tuple[str, str]]:
-    """{task_id: (status, customStatusId)} straight from live Wrike."""
+def fetch_custom_status_name_map(headers: dict) -> dict[str, str]:
+    """Same source the production pipeline uses (enrich_status_names() in
+    Wrike_Data.py): every workflow's customStatuses list gives
+    {id: name} pairs. Building this ourselves lets us translate a live
+    task's raw customStatusId into the same name Snowflake stores.
+    """
+    resp = get_with_backoff(f"{API_BASE}/workflows", headers, params={"includeSpaceWorkflow": "true"})
+    if not resp.ok:
+        print(f"\nRequest failed fetching workflows ({resp.status_code}): {resp.text}\n")
+    resp.raise_for_status()
+
+    mapping: dict[str, str] = {}
+    for workflow in resp.json().get("data", []):
+        for custom_status in workflow.get("customStatuses") or []:
+            if isinstance(custom_status, dict) and custom_status.get("id"):
+                mapping[custom_status["id"]] = custom_status.get("name")
+    return mapping
+
+
+def fetch_live_statuses(project_id: str, headers: dict, status_name_map: dict[str, str]) -> dict[str, tuple[str, str]]:
+    """{task_id: (status, customStatusName)} from live Wrike - customStatusId
+    is translated into its name right here, using status_name_map, so it's
+    directly comparable to what Snowflake stores.
+    """
     live: dict[str, tuple[str, str]] = {}
     next_page_token = None
     seen_tokens: set[str] = set()
     page = 1
     while True:
-        params = {"fields": '["status","customStatusId"]'}
+        params = {}
         if next_page_token:
             if next_page_token in seen_tokens:
                 print("  WARNING: repeated nextPageToken detected, stopping.")
@@ -98,7 +135,9 @@ def fetch_live_statuses(project_id: str, headers: dict) -> dict[str, tuple[str, 
         payload = resp.json()
         page_tasks = payload.get("data", [])
         for t in page_tasks:
-            live[t["id"]] = (t.get("status"), t.get("customStatusId"))
+            raw_custom_status_id = t.get("customStatusId")
+            custom_status_name = status_name_map.get(raw_custom_status_id, raw_custom_status_id)
+            live[t["id"]] = (t.get("status"), custom_status_name)
         print(f"  Page {page}: {len(page_tasks)} tasks (running total {len(live)})")
         next_page_token = payload.get("nextPageToken")
         if not next_page_token:
@@ -135,18 +174,21 @@ def snowflake_connection_from_env():
 
 
 def fetch_snowflake_statuses(cursor, project_id: str) -> dict[str, tuple[tuple, tuple]]:
-    """{task_id: (distinct_statuses_tuple, distinct_custom_status_ids_tuple)}.
+    """{task_id: (distinct_statuses_tuple, distinct_custom_status_names_tuple)}.
     Reports as tuples (not single values) because if a task's duplicate
-    fan-out rows ever disagreed with EACH OTHER on status, that's its own
-    finding worth surfacing, not something to silently average away.
+    fan-out rows ever disagreed with EACH OTHER, that's its own finding
+    worth surfacing, not something to silently average away. Snowflake's
+    "customStatusId" column already holds the NAME (per the production
+    enrich_status_names() step), matching what fetch_live_statuses now
+    also produces.
     """
     union_parts = [
-        f'SELECT NULLIF(TRIM("{col}"), \'\') AS task_id, "status" AS status, "customStatusId" AS custom_status_id '
+        f'SELECT NULLIF(TRIM("{col}"), \'\') AS task_id, "status" AS status, "customStatusId" AS custom_status_name '
         f'FROM {TABLE_FQN} WHERE "id" = %(project_id)s'
         for col in HIERARCHY_COLUMNS
     ]
     query = f"""
-        SELECT task_id, status, custom_status_id
+        SELECT task_id, status, custom_status_name
         FROM ({" UNION ALL ".join(union_parts)})
         WHERE task_id IS NOT NULL
     """
@@ -154,9 +196,9 @@ def fetch_snowflake_statuses(cursor, project_id: str) -> dict[str, tuple[tuple, 
 
     per_task_statuses: dict[str, set] = {}
     per_task_custom: dict[str, set] = {}
-    for task_id, status, custom_status_id in cursor.fetchall():
+    for task_id, status, custom_status_name in cursor.fetchall():
         per_task_statuses.setdefault(task_id, set()).add(status)
-        per_task_custom.setdefault(task_id, set()).add(custom_status_id)
+        per_task_custom.setdefault(task_id, set()).add(custom_status_name)
 
     return {
         task_id: (tuple(sorted(s for s in per_task_statuses[task_id] if s is not None)),
@@ -175,8 +217,12 @@ def main() -> None:
 
     print(f"\n{'=' * 70}\nStatus accuracy check: {args.project_name or args.project_id}\n{'=' * 70}")
 
-    print("\nPulling live status values from Wrike...")
-    live = fetch_live_statuses(args.project_id, headers)
+    print("\nFetching Wrike's live custom-status ID -> name mapping...")
+    status_name_map = fetch_custom_status_name_map(headers)
+    print(f"Loaded {len(status_name_map)} custom status definitions.")
+
+    print("\nPulling live status values from Wrike (translating customStatusId -> name)...")
+    live = fetch_live_statuses(args.project_id, headers, status_name_map)
     print(f"Live tasks with status info: {len(live)}")
 
     connection = snowflake_connection_from_env()
@@ -199,7 +245,7 @@ def main() -> None:
     mismatch_examples = []
 
     for task_id in matched_ids:
-        live_status, live_custom = live[task_id]
+        live_status, live_custom_name = live[task_id]
         sf_statuses, sf_customs = snowflake_statuses[task_id]
 
         if len(sf_statuses) > 1 or len(sf_customs) > 1:
@@ -213,20 +259,20 @@ def main() -> None:
         else:
             status_mismatches += 1
 
-        if sf_custom == live_custom:
+        if sf_custom == live_custom_name:
             custom_status_matches += 1
         else:
             custom_status_mismatches += 1
             if len(mismatch_examples) < 10:
-                mismatch_examples.append((task_id, live_custom, sf_custom))
+                mismatch_examples.append((task_id, live_custom_name, sf_custom))
 
     print(f"\n{'=' * 70}\nResult\n{'=' * 70}")
-    print(f"General status ('status' field)   - matches: {status_matches}, mismatches: {status_mismatches}")
-    print(f"Detailed status ('customStatusId') - matches: {custom_status_matches}, mismatches: {custom_status_mismatches}")
+    print(f"General status ('status' field)        - matches: {status_matches}, mismatches: {status_mismatches}")
+    print(f"Detailed status (name, now translated)  - matches: {custom_status_matches}, mismatches: {custom_status_mismatches}")
     print(f"Tasks where Snowflake's own duplicate rows disagreed with each other: {internally_inconsistent}")
 
     if mismatch_examples:
-        print(f"\nSample customStatusId mismatches (task_id | live now | stored in Snowflake):")
+        print(f"\nSample customStatus-name mismatches (task_id | live now | stored in Snowflake):")
         for task_id, live_val, sf_val in mismatch_examples:
             print(f"  {task_id} | {live_val} | {sf_val}")
 
@@ -239,6 +285,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-python3 verify_status_accuracy.py --project-id MQAAAAEIsSOV --project-name "Holiday (FY27)"
