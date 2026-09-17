@@ -1,16 +1,10 @@
-mkdir -p evidence
-export WRIKE_TOKEN="paste_your_token_here"
-
-python3 verify_independent_folder_walk.py --project-id MQAAAAEIsSOV --project-name "Holiday (FY27)" 2>&1 | tee evidence/01_independent_walk_holiday.txt
-python3 verify_independent_folder_walk.py --project-id MQAAAABooWQv --project-name "FY26 Earth Day" 2>&1 | tee evidence/02_independent_walk_earthday.txt
-python3 verify_independent_folder_walk.py --project-id MQAAAABqlXRg --project-name "FY26 Back to School Wave 1" 2>&1 | tee evidence/03_independent_walk_backtoschool.txt
-python3 verify_independent_folder_walk.py --project-id MQAAAABnlKFK --project-name "ASA OS Compatibility" 2>&1 | tee evidence/04_independent_walk_asa.txt
-python3 verify_independent_folder_walk.py --project-id IEADQP2VI5QPRQWK --project-name "Apple Shopping Event (FY26)" 2>&1 | tee evidence/05_independent_walk_appleshopping.txt
-python3 verify_independent_folder_walk.py --project-id MQAAAABrUCtn --project-name "RESTRICTED Project B 2026 Spring 1" 2>&1 | tee evidence/06_independent_walk_restrictedb.txt
-
-python3 verify_status_accuracy.py --project-id MQAAAAEIsSOV --project-name "Holiday (FY27)" 2>&1 | tee evidence/07_status_accuracy_holiday.txt
-python3 verify_status_accuracy.py --project-id MQAAAABooWQv --project-name "FY26 Earth Day" 2>&1 | tee evidence/08_status_accuracy_earthday.txt
-python3 verify_status_accuracy.py --project-id MQAAAABqlXRg --project-name "FY26 Back to School Wave 1" 2>&1 | tee evidence/09_status_accuracy_backtoschool.txt
-python3 verify_status_accuracy.py --project-id MQAAAABnlKFK --project-name "ASA OS Compatibility" 2>&1 | tee evidence/10_status_accuracy_asa.txt
-python3 verify_status_accuracy.py --project-id IEADQP2VI5QPRQWK --project-name "Apple Shopping Event (FY26)" 2>&1 | tee evidence/11_status_accuracy_appleshopping.txt
-python3 verify_status_accuracy.py --project-id MQAAAABrUCtn --project-name "RESTRICTED Project B 2026 Spring 1" 2>&1 | tee evidence/12_status_accuracy_restrictedb.txt
+SELECT COUNT(DISTINCT COALESCE(
+    NULLIF(TRIM("great_grandbaby_task_id"), ''),
+    NULLIF(TRIM("grandbaby_task_id"), ''),
+    NULLIF(TRIM("baby_task_id"), ''),
+    NULLIF(TRIM("grandchild_task_id"), ''),
+    NULLIF(TRIM("child_task_id"), ''),
+    NULLIF(TRIM("parent_task_id"), '')
+)) AS task_count
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+WHERE "id" = 'MQAAAABnlKFK';
