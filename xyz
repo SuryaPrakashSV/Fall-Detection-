@@ -175,28 +175,38 @@ def snowflake_connection_from_env():
 
 def fetch_snowflake_statuses(cursor, project_id: str) -> dict[str, tuple[tuple, tuple]]:
     """{task_id: (distinct_statuses_tuple, distinct_custom_status_names_tuple)}.
-    Reports as tuples (not single values) because if a task's duplicate
-    fan-out rows ever disagreed with EACH OTHER, that's its own finding
-    worth surfacing, not something to silently average away. Snowflake's
-    "customStatusId" column already holds the NAME (per the production
-    enrich_status_names() step), matching what fetch_live_statuses now
-    also produces.
+
+    FIX: the original version of this function unioned all 6 hierarchy
+    columns and paired EVERY column's value with that row's status - but a
+    row's shallower hierarchy columns are ancestor BREADCRUMBS (path
+    context), not that row's own identity. That caused a deep task's
+    status to get incorrectly "borrowed" onto its parent/grandparent task
+    IDs too, making unrelated ancestor tasks falsely look like their
+    duplicate rows disagreed with each other.
+
+    This version uses COALESCE (deepest-populated column first) to get
+    each row's OWN single task identity - exactly one task_id per row,
+    paired only with that row's own status. Reports as tuples (not single
+    values) because if a task's duplicate FAN-OUT rows (same task, e.g.
+    one row per owner) ever genuinely disagree with each other, that's
+    still worth surfacing - this fix just removes the false ancestor-
+    contamination signal, not genuine fan-out inconsistency if it exists.
     """
-    union_parts = [
-        f'SELECT NULLIF(TRIM("{col}"), \'\') AS task_id, "status" AS status, "customStatusId" AS custom_status_name '
-        f'FROM {TABLE_FQN} WHERE "id" = %(project_id)s'
-        for col in HIERARCHY_COLUMNS
-    ]
+    coalesce_expr = "COALESCE(" + ", ".join(
+        f'NULLIF(TRIM("{col}"), \'\')' for col in reversed(HIERARCHY_COLUMNS)
+    ) + ")"
     query = f"""
-        SELECT task_id, status, custom_status_name
-        FROM ({" UNION ALL ".join(union_parts)})
-        WHERE task_id IS NOT NULL
+        SELECT {coalesce_expr} AS task_id, "status" AS status, "customStatusId" AS custom_status_name
+        FROM {TABLE_FQN}
+        WHERE "id" = %(project_id)s
     """
     cursor.execute(query, {"project_id": project_id})
 
     per_task_statuses: dict[str, set] = {}
     per_task_custom: dict[str, set] = {}
     for task_id, status, custom_status_name in cursor.fetchall():
+        if task_id is None:
+            continue
         per_task_statuses.setdefault(task_id, set()).add(status)
         per_task_custom.setdefault(task_id, set()).add(custom_status_name)
 
