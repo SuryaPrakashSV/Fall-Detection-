@@ -1,270 +1,552 @@
-"""End-to-end project task reconciliation, Wrike API vs Snowflake, with NO
-manual CSV export/download/upload step anywhere in the path.
+#!/usr/bin/env python3
+"""Local, token-visible Wrike task snapshots. Python 3.9+; no dependencies.
 
-This is the FINAL, most reliable tool built during the task/subtask
-investigation. It replaces the earlier reconcile_task_ids.py + manual
-Snowsight query + CSV-download workflow, which caused several real, silent
-bugs during this investigation (a UTF-8 BOM character, TASK_ID/task_id
-casing mismatches, an empty uploaded Snowsight table, and a FALSE "still
-missing" result for the Holiday project that was only caught by rerunning
-through a direct Snowflake connection instead). Everything here goes
-straight from the Wrike API and Snowflake into Python and back, so there is
-no manual re-typing or file round-tripping to silently corrupt results.
-
-For a project's full picture, it:
-  1. Pulls the live task count from Wrike's own authoritative
-     GET /folders/{id}/tasks?descendants=true&subTasks=true call, following
-     nextPageToken so large projects are never silently truncated.
-  2. Queries Snowflake directly for that project's task_id set, using the
-     ALL-hierarchy-column union (not just the deepest value via COALESCE -
-     COALESCE-deepest undercounting is a confirmed, known issue for some
-     projects, e.g. the original FR Mac Update project showed 42 real API
-     tasks but only 21 distinct Snowflake IDs via COALESCE-deepest alone).
-  3. Compares them: matched / API-only (missing under this project's own
-     Snowflake rows) / Snowflake-only (orphans).
-  4. For any API-only tasks, immediately checks the ENTIRE Wrike_STG table
-     (no project filter) to see if they're actually attributed to a
-     DIFFERENT project - distinguishing a genuine "real gap" (data truly
-     absent from Snowflake) from an "attribution-scope difference" (task
-     exists in Snowflake, just filed under a different, usually more
-     specific/nested project) in one run.
-
-Requires the same SNOWFLAKE_* environment variables used elsewhere in this
-project (SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_WAREHOUSE,
-SNOWFLAKE_ROLE, SNOWFLAKE_AUTHENTICATOR=externalbrowser for SSO), and a
-Wrike API token (via WRIKE_TOKEN env var or the hidden prompt).
-
-Usage:
-    python3 reconcile_project_direct.py \
-        --project-id MQAAAABnlKFK \
-        --project-name "ASA OS Compatibility"
-
-Verified results from this investigation (5 projects, all with real gap = 0):
-    ASA OS Compatibility        : API 11  / Snowflake 11  / gap 0   / real gap 0
-    Holiday (FY27)               : API 316 / Snowflake 193 / gap 123 / real gap 0
-    FY26 Earth Day                : API 237 / Snowflake 111 / gap 126 / real gap 0
-    FY26 Back to School Wave 1    : API 417 / Snowflake 252 / gap 165 / real gap 0
-    Apple Shopping Event (FY26)  : API 220 / Snowflake 177 / gap 43  / real gap 0
+Run: python3 wrike_task_snapshots.py capture
+All API requests are GET requests. No production or database writes.
 """
 
-from __future__ import annotations
-
 import argparse
+import csv
 import getpass
+import hashlib
+import io
+import json
 import os
+import random
+import sys
+import tempfile
 import time
+import uuid
+import warnings
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from http.client import HTTPException
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-import requests
 
-API_BASE = "https://www.wrike.com/api/v4"
-TABLE_FQN = 'GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"'
-
-HIERARCHY_COLUMNS = [
-    "parent_task_id",
-    "child_task_id",
-    "grandchild_task_id",
-    "baby_task_id",
-    "grandbaby_task_id",
-    "great_grandbaby_task_id",
+SCHEMA_VERSION = 1
+HOSTS = ("www.wrike.com", "app-eu.wrike.com")
+SCOPE = "account_tasks_including_subtasks_no_filters_v1"
+SNAPSHOT_FIELDS = [
+    "task_id", "title", "status", "custom_status_id", "observed_at",
+    "source_updated_at", "super_task_ids", "account_id", "run_id",
+]
+DIFF_FIELDS = [
+    "task_id", "previous_title", "current_title", "previous_status",
+    "current_status", "previous_custom_status_id", "current_custom_status_id",
+    "general_status_changed", "custom_status_changed", "custom_status_comparable",
+    "previous_observed_at", "current_observed_at", "previous_source_updated_at",
+    "current_source_updated_at", "previous_run_id", "current_run_id", "reason",
+]
+VISIBILITY_FIELDS = SNAPSHOT_FIELDS + ["comparison_run_id", "reason"]
+LIMITATIONS = [
+    "Coverage is limited to what this token's user can read in its current Wrike account.",
+    "COMPLETE means all returned pages were retrieved and validated; there is no independent total of accessible tasks.",
+    "A paginated scan is not an atomic view: tasks and permissions can change while pages are being read.",
+    "Missing means absent from this snapshot; it does not establish deletion.",
+    "Snapshots show differences between observations, not intervening transitions or their exact times.",
 ]
 
 
-def wrike_token() -> str:
-    value = os.getenv("WRIKE_TOKEN", "").strip()
-    return value or getpass.getpass("Wrike token (hidden; not saved): ").strip()
+class SnapshotError(Exception):
+    """Safe, non-secret diagnostic suitable for a summary or console."""
 
 
-def get_with_backoff(url, headers, params=None, max_retries=6, timeout=60):
-    """GET with retry/backoff on HTTP 429, respecting Retry-After (seconds
-    or HTTP-date) when Wrike sends one, falling back to exponential backoff
-    otherwise (Wrike's real-world limit is ~400 requests/minute per token).
-    """
-    for attempt in range(max_retries):
-        resp = requests.get(url, headers=headers, params=params, timeout=timeout)
-        if resp.status_code != 429 or attempt == max_retries - 1:
-            return resp
-        retry_after = resp.headers.get("Retry-After")
-        wait = None
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def timestamp(value):
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def parse_timestamp(value):
+    try:
+        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if result.tzinfo is None:
+            raise ValueError("timezone required")
+        return result.astimezone(timezone.utc)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise SnapshotError("Invalid observation timestamp in previous snapshot.") from exc
+
+
+def csv_encode(value):
+    """Reversible protection against spreadsheet formula interpretation."""
+    value = str(value)
+    if value.startswith(("'", "\t", "\r", "\n")) or value.lstrip().startswith(("=", "+", "-", "@")):
+        return "'" + value
+    return value
+
+
+def csv_decode(value):
+    if value.startswith("'") and csv_encode(value[1:]) == value:
+        return value[1:]
+    return value
+
+
+def atomic_write(path, data):
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def write_json(path, value):
+    atomic_write(path, (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+
+
+def write_csv(path, fields, rows):
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=fields, lineterminator="\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({key: csv_encode(row.get(key, "")) for key in fields})
+    atomic_write(path, buffer.getvalue().encode("utf-8"))
+
+
+@contextmanager
+def output_lock(output):
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise SnapshotError("This script requires macOS or Linux for its local capture lock.") from exc
+    output.mkdir(parents=True, exist_ok=True)
+    with (output / "capture.lock").open("a+", encoding="utf-8") as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SnapshotError("Another capture is using this output folder. Let it finish first.") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class WrikeClient:
+    def __init__(self, token, host="www.wrike.com", opener=None, sleep=time.sleep,
+                 now=utcnow, max_retries=6, pace=0.25):
+        if host not in HOSTS:
+            raise SnapshotError("Unsupported API host.")
+        if not token or any(character.isspace() for character in token):
+            raise SnapshotError("Enter a nonempty token without whitespace.")
+        self._token = token
+        self.host = host
+        self.opener = opener or build_opener(NoRedirect())
+        self.sleep = sleep
+        self.now = now
+        self.max_retries = max_retries
+        self.pace = pace
+        self.events = []
+        self.log_path = None
+
+    def log(self, event):
+        event = dict(event, at=timestamp(self.now()))
+        self.events.append(event)
+        if self.log_path:
+            with Path(self.log_path).open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(event, sort_keys=True) + "\n")
+                stream.flush()
+
+    def retry_delay(self, retry_after, attempt):
+        server_delay = None
         if retry_after:
             try:
-                wait = max(0.0, float(retry_after))
-            except ValueError:
+                server_delay = float(retry_after)
+            except (TypeError, ValueError):
                 try:
-                    retry_dt = parsedate_to_datetime(retry_after)
-                    if retry_dt.tzinfo is None:
-                        retry_dt = retry_dt.replace(tzinfo=timezone.utc)
-                    wait = max(0.0, (retry_dt - datetime.now(timezone.utc)).total_seconds())
-                except (TypeError, ValueError):
-                    wait = None
-        if wait is None:
-            wait = min(120, 5 * (2 ** attempt))
-        print(f"Rate limited (429). Waiting {wait:.0f}s before retry {attempt + 1}/{max_retries}...")
-        time.sleep(wait)
-    return resp
+                    date = parsedate_to_datetime(retry_after)
+                    if date.tzinfo is None:
+                        date = date.replace(tzinfo=timezone.utc)
+                    server_delay = (date - self.now()).total_seconds()
+                except (TypeError, ValueError, OverflowError):
+                    pass
+        if server_delay is not None and server_delay >= 0:
+            if server_delay > 300:
+                raise SnapshotError("Wrike requested a Retry-After delay longer than 300 seconds; retry this capture later.")
+            return max(server_delay, 1.0)
+        return min(120.0, 5.0 * (2 ** attempt)) + random.uniform(0, 1)
 
-
-def fetch_all_folder_tasks(project_id: str, headers: dict) -> set[str]:
-    """Authoritative, paginated pull of every descendant task under a
-    project folder. Confirmed (for the Holiday project, via a separate
-    manual subTaskIds closure-walk cross-check) that descendants=true +
-    subTasks=true already returns the full recursive set on its own - no
-    extra manual subtask-following needed.
-    """
-    all_ids: set[str] = set()
-    next_page_token = None
-    page = 1
-    while True:
-        params = (
-            {"nextPageToken": next_page_token}
-            if next_page_token
-            else {"descendants": "true", "subTasks": "true", "fields": '["subTaskIds"]'}
+    def get(self, endpoint, params=None):
+        if endpoint not in ("/account", "/contacts", "/tasks"):
+            raise SnapshotError("Unsupported read endpoint.")
+        query = "?" + urlencode(params) if params else ""
+        request = Request(
+            "https://" + self.host + "/api/v4" + endpoint + query,
+            headers={"Authorization": "Bearer " + self._token, "Accept": "application/json"},
+            method="GET",
         )
-        resp = get_with_backoff(f"{API_BASE}/folders/{project_id}/tasks", headers, params=params)
-        if not resp.ok:
-            print(f"\nRequest failed ({resp.status_code}) for URL: {resp.url}\n{resp.text}\n")
-        resp.raise_for_status()
-        payload = resp.json()
-        page_tasks = payload.get("data", [])
-        all_ids.update(t["id"] for t in page_tasks)
-        print(f"  Page {page}: {len(page_tasks)} tasks (running total {len(all_ids)})")
-        next_page_token = payload.get("nextPageToken")
-        if not next_page_token:
+        for attempt in range(self.max_retries + 1):
+            if self.pace:
+                self.sleep(self.pace)
+            event = {"endpoint": endpoint, "attempt": attempt + 1}
+            retry_after = None
+            try:
+                with self.opener.open(request, timeout=90) as response:
+                    status = response.getcode()
+                    raw = response.read(64 * 1024 * 1024 + 1)
+                if status != 200:
+                    self.log(dict(event, http_status=status, outcome="unexpected_response"))
+                    raise SnapshotError("Wrike returned an unexpected HTTP response.")
+                if len(raw) > 64 * 1024 * 1024:
+                    self.log(dict(event, http_status=status, outcome="oversized_response"))
+                    raise SnapshotError("Wrike response exceeded the 64 MiB page limit; capture is incomplete.")
+                try:
+                    value = json.loads(raw)
+                    if not isinstance(value, dict):
+                        raise ValueError("object required")
+                except (ValueError, UnicodeError) as exc:
+                    self.log(dict(event, http_status=status, outcome="invalid_json"))
+                    raise SnapshotError("Wrike returned invalid JSON; capture is incomplete.") from exc
+                self.log(dict(event, http_status=status, outcome="success"))
+                return value
+            except HTTPError as exc:
+                status = exc.code
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                exc.close()
+                event.update(http_status=status, outcome="http_error")
+                retryable = status in (429, 500, 502, 503, 504)
+                message = "Wrike HTTP %s on %s." % (status, endpoint)
+                if status in (401, 403):
+                    message += " Check token validity, account host and read permissions; no complete snapshot was committed."
+                elif status == 429:
+                    message += " Rate limiting persisted; retry later."
+            except (URLError, TimeoutError, ConnectionError, OSError, HTTPException):
+                # Deliberately do not log str(exc), URLs, headers or response bodies.
+                event.update(outcome="network_error")
+                retryable = True
+                message = "Network request failed on " + endpoint + "."
+            if not retryable or attempt >= self.max_retries:
+                self.log(event)
+                raise SnapshotError(message)
+            try:
+                delay = self.retry_delay(retry_after, attempt)
+            except SnapshotError:
+                self.log(dict(event, outcome=event["outcome"] + "_retry_deferred"))
+                raise
+            self.log(dict(event, retry_in_seconds=round(delay, 3)))
+            print("%s Retrying in %.1f seconds." % (message, delay), file=sys.stderr, flush=True)
+            self.sleep(delay)
+        raise SnapshotError("Request retry limit reached.")
+
+
+def only_identity(response, label):
+    records = response.get("data")
+    if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
+        raise SnapshotError("Could not establish a single " + label + " for comparison.")
+    identity = records[0].get("id")
+    if not isinstance(identity, str) or not identity or identity != identity.strip():
+        raise SnapshotError("Wrike returned an invalid " + label + " ID.")
+    return identity
+
+
+def fetch_identity(client):
+    return {
+        "account_id": only_identity(client.get("/account"), "account"),
+        "user_id": only_identity(client.get("/contacts", {"me": "true"}), "requesting user"),
+        "host": client.host,
+        "scope": SCOPE,
+    }
+
+
+def task_row(record, observed_at, account_id, run_id):
+    if not isinstance(record, dict):
+        raise SnapshotError("Wrike returned a task that is not an object.")
+    task_id, title, status = record.get("id"), record.get("title"), record.get("status")
+    if not isinstance(task_id, str) or not task_id or task_id != task_id.strip():
+        raise SnapshotError("Wrike returned a task without a valid ID.")
+    if not isinstance(title, str) or not isinstance(status, str) or not status.strip():
+        raise SnapshotError("Wrike returned a task without a title or current status.")
+    custom_status = record.get("customStatusId")
+    updated = record.get("updatedDate")
+    custom_status = "" if custom_status is None else custom_status
+    updated = "" if updated is None else updated
+    parents = record.get("superTaskIds")
+    if not isinstance(custom_status, str) or not isinstance(updated, str):
+        raise SnapshotError("Wrike returned an invalid custom status or update timestamp.")
+    if parents is not None and (not isinstance(parents, list) or
+                                any(not isinstance(parent, str) or not parent for parent in parents)):
+        raise SnapshotError("Wrike returned invalid superTaskIds.")
+    if record.get("accountId") not in (None, account_id):
+        raise SnapshotError("A task belongs to a different account; capture stopped.")
+    return {
+        "task_id": task_id, "title": title, "status": status,
+        "custom_status_id": custom_status, "observed_at": observed_at,
+        "source_updated_at": updated,
+        "super_task_ids": json.dumps(sorted(set(parents)), separators=(",", ":")) if parents is not None else "",
+        "account_id": account_id, "run_id": run_id,
+    }
+
+
+def collect_tasks(client, identity, run_id, rows, stats, now=utcnow):
+    params = {"pageSize": 1000, "subTasks": "true", "fields": '["superTaskIds"]'}
+    tokens = set()
+    while True:
+        response = client.get("/tasks", params)
+        observed_at = timestamp(now())
+        data = response.get("data")
+        if response.get("kind") != "tasks" or not isinstance(data, list):
+            raise SnapshotError("Wrike task response has an invalid kind or data collection.")
+        stats["pages_received"] += 1
+        stats["records_received"] += len(data)
+        before = len(rows)
+        for record in data:
+            row = task_row(record, observed_at, identity["account_id"], run_id)
+            old = rows.get(row["task_id"])
+            if old:
+                stats["duplicate_records"] += 1
+                if (old["status"], old["custom_status_id"]) != (row["status"], row["custom_status_id"]):
+                    stats["conflicting_duplicate_records"] += 1
+                    raise SnapshotError("A duplicate task ID had different statuses within this scan; retry for a consistent snapshot.")
+            # Deduplicate by the exact opaque ID, keeping the last observation.
+            rows[row["task_id"]] = row
+        print("Tasks: page %d, %d unique IDs (%d duplicate records)." % (
+            stats["pages_received"], len(rows), stats["duplicate_records"]), flush=True)
+        token = response.get("nextPageToken")
+        if token is None or token == "":
             break
-        page += 1
-    return all_ids
+        if not isinstance(token, str) or not token.strip():
+            raise SnapshotError("Wrike returned an invalid nextPageToken.")
+        if token in tokens:
+            raise SnapshotError("Wrike repeated a nextPageToken; capture is incomplete.")
+        if not data or len(rows) == before:
+            raise SnapshotError("Pagination made no progress while more pages were indicated; capture is incomplete.")
+        tokens.add(token)
+        params = dict(params, nextPageToken=token)
 
 
-def snowflake_connection_from_env():
-    """Same SSO/AppleConnect-capable connection pattern used throughout
-    this project. database/schema are set at connection time so bare
-    (unqualified) table names in queries below resolve correctly - an
-    earlier version of this script omitted these and hit
-    'Cannot perform CREATE TEMPTABLE. This session does not have a current
-    database' when creating a temporary lookup table.
-    """
-    import snowflake.connector
-
-    authenticator = os.getenv("SNOWFLAKE_AUTHENTICATOR", "snowflake").strip().lower()
-    base_required = ["SNOWFLAKE_ACCOUNT", "SNOWFLAKE_USER", "SNOWFLAKE_WAREHOUSE"]
-    required = base_required if authenticator == "externalbrowser" else base_required + ["SNOWFLAKE_PASSWORD"]
-    missing = [name for name in required if not os.getenv(name)]
-    if missing:
-        raise SystemExit(f"Missing required environment variable(s) for Snowflake: {missing}.")
-
-    kwargs = dict(
-        account=os.environ["SNOWFLAKE_ACCOUNT"],
-        user=os.environ["SNOWFLAKE_USER"],
-        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
-        role=os.getenv("SNOWFLAKE_ROLE"),
-        database="GBI_RETAIL_BAP_DB",
-        schema="ASO_OPS_WSA_SNDBX_BIZ_APP",
-    )
-    if authenticator == "externalbrowser":
-        kwargs["authenticator"] = "externalbrowser"
-        print("Opening a browser window to complete SSO login - finish logging in there, then return here.")
-    else:
-        kwargs["password"] = os.environ["SNOWFLAKE_PASSWORD"]
-
-    return snowflake.connector.connect(**kwargs)
-
-
-def snowflake_task_ids_for_project(cursor, project_id: str) -> set[str]:
-    """Union of every hierarchy column (not just the deepest-populated one
-    via COALESCE) - COALESCE-deepest is known to hide parent/intermediate
-    task IDs that only ever appear in a shallower column position.
-    """
-    union_parts = [
-        f'SELECT NULLIF(TRIM("{col}"), \'\') AS task_id FROM {TABLE_FQN} WHERE "id" = %(project_id)s'
-        for col in HIERARCHY_COLUMNS
-    ]
-    query = "SELECT DISTINCT task_id FROM (" + " UNION ALL ".join(union_parts) + ") WHERE task_id IS NOT NULL"
-    cursor.execute(query, {"project_id": project_id})
-    return {row[0] for row in cursor.fetchall()}
-
-
-def find_elsewhere(cursor, task_ids: set[str]) -> dict[str, tuple[str, str]]:
-    """For each task_id, find which project's rows it actually appears
-    under ANYWHERE in the whole table (no project filter). Loads the IDs
-    into a session-scoped temporary table straight from Python - avoids
-    ever retyping IDs by hand or round-tripping through a CSV file.
-    Returns {task_id: (owning_id, owning_title)} for ones found; omits
-    ones that are genuinely absent table-wide.
-    """
-    if not task_ids:
-        return {}
-
-    cursor.execute("CREATE OR REPLACE TEMPORARY TABLE TEMP_RECONCILE_LOOKUP (task_id VARCHAR)")
-    cursor.executemany(
-        "INSERT INTO TEMP_RECONCILE_LOOKUP (task_id) VALUES (%(task_id)s)",
-        [{"task_id": t} for t in task_ids],
-    )
-
-    union_parts = [
-        f'SELECT "id" AS owning_id, "title" AS owning_title, NULLIF(TRIM("{col}"), \'\') AS task_id FROM {TABLE_FQN}'
-        for col in HIERARCHY_COLUMNS
-    ]
-    query = f"""
-        WITH all_hierarchy AS ({" UNION ALL ".join(union_parts)})
-        SELECT DISTINCT m.task_id, a.owning_id, a.owning_title
-        FROM TEMP_RECONCILE_LOOKUP m
-        LEFT JOIN all_hierarchy a ON a.task_id = m.task_id
-        WHERE a.owning_id IS NOT NULL
-    """
-    cursor.execute(query)
-    return {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--project-id", required=True)
-    parser.add_argument("--project-name", default="")
-    args = parser.parse_args()
-
-    headers = {"Authorization": f"Bearer {wrike_token()}"}
-
-    print(f"\n{'=' * 70}\nPulling live Wrike task IDs for {args.project_name or args.project_id}\n{'=' * 70}")
-    api_ids = fetch_all_folder_tasks(args.project_id, headers)
-    print(f"Wrike API total: {len(api_ids)}")
-
-    connection = snowflake_connection_from_env()
+def previous_complete(output):
+    candidates = []
+    for path in (output / "runs").glob("*/summary.json"):
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise SnapshotError("An existing run summary is unreadable; check the local runs folder before continuing.") from exc
+        if not isinstance(manifest, dict) or manifest.get("status") not in ("RUNNING", "INCOMPLETE", "COMPLETE"):
+            raise SnapshotError("An existing run summary has an invalid status.")
+        if manifest["status"] != "COMPLETE":
+            continue
+        if manifest.get("schema_version") != SCHEMA_VERSION or manifest.get("csv_encoding") != "apostrophe_v1":
+            raise SnapshotError("A completed snapshot uses an unsupported schema or CSV encoding.")
+        candidates.append((parse_timestamp(manifest.get("finished_at")), path, manifest))
+    if not candidates:
+        return None, {}
+    _, summary_path, manifest = max(candidates, key=lambda entry: (entry[0], str(entry[1])))
     try:
-        with connection.cursor() as cursor:
-            print(f"\n{'=' * 70}\nQuerying Snowflake directly (all-hierarchy-column union)\n{'=' * 70}")
-            snowflake_ids = snowflake_task_ids_for_project(cursor, args.project_id)
-            print(f"Snowflake (this project's own rows): {len(snowflake_ids)}")
+        name = manifest["files"]["snapshot"]
+        if not isinstance(name, str) or Path(name).name != name or not name.endswith(".csv"):
+            raise SnapshotError("Invalid previous snapshot filename.")
+        snapshot_path = summary_path.parent / name
+        if snapshot_path.resolve().parent != summary_path.parent.resolve():
+            raise SnapshotError("Previous snapshot is outside its run folder.")
+        data = snapshot_path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != manifest["snapshot_sha256"]:
+            raise SnapshotError("The previous complete snapshot was edited or corrupted; its checksum does not match.")
+        reader = csv.DictReader(io.StringIO(data.decode("utf-8"), newline=""))
+        if reader.fieldnames != SNAPSHOT_FIELDS:
+            raise SnapshotError("Previous snapshot columns do not match this script.")
+        rows = {}
+        for raw in reader:
+            if None in raw or any(value is None for value in raw.values()):
+                raise SnapshotError("Previous snapshot has a malformed CSV row.")
+            row = {key: csv_decode(value) for key, value in raw.items()}
+            task_id = row["task_id"]
+            if not task_id or task_id in rows or not row["status"]:
+                raise SnapshotError("Previous snapshot has invalid or duplicate task IDs or missing statuses.")
+            if row["run_id"] != manifest["run_id"] or row["account_id"] != manifest["identity"]["account_id"]:
+                raise SnapshotError("Previous snapshot identity does not match its summary.")
+            parse_timestamp(row["observed_at"])
+            rows[task_id] = row
+        if len(rows) != manifest["counts"]["unique_tasks"]:
+            raise SnapshotError("Previous snapshot row count does not match its summary.")
+    except (KeyError, OSError, UnicodeError, csv.Error, TypeError) as exc:
+        raise SnapshotError("Could not validate the previous complete snapshot; no new baseline will be committed.") from exc
+    return manifest, rows
 
-            matched = api_ids & snowflake_ids
-            api_only = api_ids - snowflake_ids
-            snowflake_only = snowflake_ids - api_ids
 
-            print(f"\nMatched:                 {len(matched)}")
-            print(f"API-only (not under this project's Snowflake rows): {len(api_only)}")
-            print(f"Snowflake-only (orphans): {len(snowflake_only)}")
+def compare(previous, current, previous_run_id, current_run_id, first_baseline=False):
+    changes, coverage, newly_visible, missing = [], [], [], []
+    for task_id in sorted(current.keys() - previous.keys()):
+        newly_visible.append(dict(current[task_id], comparison_run_id=current_run_id,
+                                  reason="FIRST_BASELINE" if first_baseline else "NEWLY_VISIBLE_NOT_NECESSARILY_NEW"))
+    for task_id in sorted(previous.keys() - current.keys()):
+        missing.append(dict(previous[task_id], comparison_run_id=current_run_id,
+                            reason="NOT_IN_CURRENT_SNAPSHOT_CAUSE_UNKNOWN"))
+    for task_id in sorted(previous.keys() & current.keys()):
+        old, new = previous[task_id], current[task_id]
+        general_changed = old["status"] != new["status"]
+        comparable = bool(old["custom_status_id"] and new["custom_status_id"])
+        custom_changed = comparable and old["custom_status_id"] != new["custom_status_id"]
+        row = {
+            "task_id": task_id,
+            "general_status_changed": str(general_changed).lower(),
+            "custom_status_changed": str(custom_changed).lower(),
+            "custom_status_comparable": str(comparable).lower(),
+            "previous_run_id": previous_run_id, "current_run_id": current_run_id,
+        }
+        for key in ("title", "status", "custom_status_id", "observed_at", "source_updated_at"):
+            row["previous_" + key] = old[key]
+            row["current_" + key] = new[key]
+        if general_changed or custom_changed:
+            changes.append(dict(row, reason="STATUS_DIFFERED_BETWEEN_OBSERVATIONS"))
+        if bool(old["custom_status_id"]) != bool(new["custom_status_id"]):
+            reason = "CUSTOM_STATUS_BECAME_AVAILABLE" if new["custom_status_id"] else "CUSTOM_STATUS_NO_LONGER_AVAILABLE"
+            coverage.append(dict(row, reason=reason))
+    return {"status_changes": changes, "newly_visible": newly_visible,
+            "missing_from_current": missing, "status_coverage_changes": coverage}
 
-            if api_only:
-                print(
-                    f"\n{'=' * 70}\nChecking whether the {len(api_only)} API-only tasks "
-                    f"exist elsewhere in Wrike_STG\n{'=' * 70}"
-                )
-                found = find_elsewhere(cursor, api_only)
-                truly_absent = api_only - set(found.keys())
 
-                by_project: dict[str, int] = {}
-                for owning_id, owning_title in found.values():
-                    label = f"{owning_id} ({owning_title})"
-                    by_project[label] = by_project.get(label, 0) + 1
+def capture(output, client, now=utcnow):
+    output = Path(output).expanduser().resolve()
+    with output_lock(output):
+        started = now()
+        run_id = started.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "_" + uuid.uuid4().hex[:8]
+        run_dir = output / "runs" / run_id
+        run_dir.mkdir(parents=True)
+        client.log_path = run_dir / "requests.jsonl"
+        stats = {"pages_received": 0, "records_received": 0, "duplicate_records": 0,
+                 "conflicting_duplicate_records": 0}
+        rows = {}
+        manifest = {
+            "schema_version": SCHEMA_VERSION, "csv_encoding": "apostrophe_v1",
+            "status": "RUNNING", "run_id": run_id, "started_at": timestamp(started),
+            "finished_at": None, "identity": None, "previous_run_id": None,
+            "counts": stats, "files": {"request_log": "requests.jsonl"},
+            "errors": [], "warnings": [], "limitations": LIMITATIONS,
+        }
+        write_json(run_dir / "summary.json", manifest)
+        try:
+            previous_manifest, previous_rows = previous_complete(output)
+            if previous_manifest and parse_timestamp(previous_manifest["finished_at"]) > started:
+                raise SnapshotError("The previous run is dated in the future; correct the computer clock before capturing.")
+            manifest["previous_run_id"] = previous_manifest["run_id"] if previous_manifest else None
+            identity = fetch_identity(client)
+            manifest["identity"] = identity
+            if previous_manifest and previous_manifest["identity"] != identity:
+                raise SnapshotError("Account, requesting user, host or capture scope differs from the previous baseline. Use a separate --output folder for a different identity.")
+            collect_tasks(client, identity, run_id, rows, stats, now=now)
+            result = compare(previous_rows, rows, manifest["previous_run_id"], run_id,
+                             first_baseline=previous_manifest is None)
+            snapshot_name = "tasks_" + run_id + ".csv"
+            write_csv(run_dir / snapshot_name, SNAPSHOT_FIELDS, (rows[key] for key in sorted(rows)))
+            manifest["files"]["snapshot"] = snapshot_name
+            manifest["snapshot_sha256"] = hashlib.sha256((run_dir / snapshot_name).read_bytes()).hexdigest()
+            for name, records in result.items():
+                fields = DIFF_FIELDS if name in ("status_changes", "status_coverage_changes") else VISIBILITY_FIELDS
+                write_csv(run_dir / (name + ".csv"), fields, records)
+                manifest["files"][name] = name + ".csv"
+                stats[name] = len(records)
+            common = previous_rows.keys() & rows.keys()
+            stats["compared_tasks"] = len(common)
+            stats["no_status_difference_observed"] = len(common) - len(result["status_changes"])
+            stats["common_tasks_without_comparable_custom_status"] = sum(
+                not (previous_rows[key]["custom_status_id"] and rows[key]["custom_status_id"]) for key in common)
+            stats["tasks_without_custom_status_id"] = sum(not row["custom_status_id"] for row in rows.values())
+            stats["tasks_with_super_task_ids"] = sum(row["super_task_ids"] not in ("", "[]") for row in rows.values())
+            stats["tasks_without_subtask_metadata"] = sum(row["super_task_ids"] == "" for row in rows.values())
+            if stats["tasks_without_custom_status_id"]:
+                manifest["warnings"].append("Some tasks have no custom status ID; changes within the same general status may be unobservable for them.")
+            if not rows:
+                manifest["warnings"].append("Wrike returned zero tasks. Verify this token's account and task visibility before interpreting missing tasks.")
+            if previous_rows and len(result["missing_from_current"]) > 0:
+                manifest["warnings"].append("Some prior tasks are absent. Visibility, permissions, deletion or changes during scanning may be involved; the cause is unknown.")
+            if stats["duplicate_records"]:
+                manifest["warnings"].append("Duplicate task IDs were returned and deduplicated. The scan is not atomic.")
+            manifest["baseline"] = previous_manifest is None
+            manifest["status"] = "COMPLETE"
+        except (SnapshotError, OSError, KeyboardInterrupt) as exc:
+            manifest["status"] = "INCOMPLETE"
+            error = str(exc) if isinstance(exc, SnapshotError) else (
+                "Capture interrupted by user." if isinstance(exc, KeyboardInterrupt) else "Local file operation failed; check available disk space and folder permissions.")
+            manifest["errors"].append(error)
+            # Do not leave a failed run's comparison files looking usable.
+            for key, name in list(manifest["files"].items()):
+                if key != "request_log":
+                    try:
+                        (run_dir / name).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    del manifest["files"][key]
+            manifest.pop("snapshot_sha256", None)
+            if rows:
+                partial_name = "partial_tasks_" + run_id + ".csv"
+                write_csv(run_dir / partial_name, SNAPSHOT_FIELDS, (rows[key] for key in sorted(rows)))
+                manifest["files"]["partial_snapshot"] = partial_name
+        stats["unique_tasks"] = len(rows)
+        stats["requests_attempted"] = len(client.events)
+        stats["failed_request_attempts"] = sum(event.get("outcome") != "success" for event in client.events)
+        stats["retries_scheduled"] = sum("retry_in_seconds" in event for event in client.events)
+        if stats["failed_request_attempts"] and manifest["status"] == "COMPLETE":
+            manifest["warnings"].append("Some API requests failed but recovered through retries; see requests.jsonl.")
+        manifest["finished_at"] = timestamp(now())
+        # The COMPLETE manifest is the commit marker. Only committed runs are future baselines.
+        write_json(run_dir / "summary.json", manifest)
+        return manifest, run_dir
 
-                print(f"Found under a DIFFERENT project: {len(found)}")
-                for label, count in sorted(by_project.items(), key=lambda kv: -kv[1]):
-                    print(f"  {count} task(s) -> {label}")
-                print(f"Genuinely absent table-wide (real gap): {len(truly_absent)}")
-                if truly_absent:
-                    print(f"  {sorted(truly_absent)[:20]}{' ...' if len(truly_absent) > 20 else ''}")
-    finally:
-        connection.close()
+
+def print_result(manifest, run_dir):
+    counts = manifest["counts"]
+    print("\n%s | %d unique tasks | %d pages | %d duplicate records" % (
+        manifest["status"], counts["unique_tasks"], counts["pages_received"], counts["duplicate_records"]))
+    print("Failed API attempts: %d | retries scheduled: %d" % (
+        counts["failed_request_attempts"], counts["retries_scheduled"]))
+    if manifest["status"] == "COMPLETE":
+        print("First baseline." if manifest["baseline"] else "Compared with: " + manifest["previous_run_id"])
+        print("Status differences: %d | newly visible: %d | missing: %d | custom-status coverage differences: %d" % (
+            counts["status_changes"], counts["newly_visible"], counts["missing_from_current"], counts["status_coverage_changes"]))
+    else:
+        print("No complete snapshot committed; this run will not be used as a comparison baseline.")
+    for message in manifest["errors"]:
+        print("ERROR: " + message)
+    for message in manifest["warnings"]:
+        print("WARNING: " + message)
+    print("Access: only tasks visible to this user in this Wrike account; no independent total is available.")
+    print("Observation times are not exact status-change times; changes between runs can be missed.")
+    print("Files: " + str(run_dir))
+    print("Run report: " + str(run_dir / "summary.json"))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    command = commands.add_parser("capture", help="Capture all token-visible tasks and compare with the last complete run.")
+    command.add_argument("--output", type=Path, default=Path("output/task_snapshots"),
+                         help="Local output folder; reuse the same folder for each run (default: output/task_snapshots).")
+    command.add_argument("--host", choices=HOSTS, default=HOSTS[0], help="Wrike API host for this account.")
+    args = parser.parse_args(argv)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            token = getpass.getpass("Wrike token (hidden; used only for this run): ").strip()
+        client = WrikeClient(token, host=args.host)
+        manifest, run_dir = capture(args.output, client)
+        print_result(manifest, run_dir)
+        return 0 if manifest["status"] == "COMPLETE" else 1
+    except getpass.GetPassWarning:
+        print("ERROR: A terminal with a hidden password prompt is required. Run this command in Terminal.", file=sys.stderr)
+    except (EOFError, KeyboardInterrupt):
+        print("Capture cancelled.", file=sys.stderr)
+    except SnapshotError as exc:
+        print("ERROR: " + str(exc), file=sys.stderr)
+    except OSError:
+        print("ERROR: Could not write local files. Check folder permissions and disk space.", file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
