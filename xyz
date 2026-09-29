@@ -54,3 +54,131 @@ SELECT
     COUNT(*) OVER () AS TOTAL_UNIQUE_WORKFLOW_STATUSES
 FROM unique_statuses
 ORDER BY WORKFLOW_STATUS_NAME;
+
+
+
+                write_csv(run_dir / (name + ".csv"), fields, records)
+                manifest["files"][name] = name + ".csv"
+                stats[name] = len(records)
+            common = previous_rows.keys() & rows.keys()
+            stats["compared_tasks"] = len(common)
+            stats["no_status_difference_observed"] = len(common) - len(result["status_changes"])
+            stats["common_tasks_without_comparable_custom_status"] = sum(
+                not (previous_rows[key]["custom_status_id"] and rows[key]["custom_status_id"]) for key in common)
+            stats["tasks_without_custom_status_id"] = sum(not row["custom_status_id"] for row in rows.values())
+            stats["tasks_without_task_updated_at"] = sum(not row["task_updated_at"] for row in rows.values())
+            stats["tasks_without_custom_fields_metadata"] = sum(row["custom_fields_json"] == "" for row in rows.values())
+            stats["tasks_with_additional_status_fields"] = sum(row["additional_status_fields_json"] != "{}" for row in rows.values())
+            stats["tasks_with_exact_general_status_change_time"] = 0
+            stats["tasks_with_exact_workflow_status_change_time"] = 0
+            if stats["tasks_without_task_updated_at"]:
+                manifest["warnings"].append("Some tasks have no updatedDate; their task_updated_at is blank.")
+            if stats["tasks_without_custom_fields_metadata"]:
+                manifest["warnings"].append("Some task responses omitted customFields despite the request. Blank means not returned; [] means an empty returned list.")
+            stats["tasks_with_super_task_ids"] = sum(row["super_task_ids"] not in ("", "[]") for row in rows.values())
+            stats["tasks_without_subtask_metadata"] = sum(row["super_task_ids"] == "" for row in rows.values())
+            if stats["tasks_without_custom_status_id"]:
+                manifest["warnings"].append("Some tasks have no custom status ID; changes within the same general status may be unobservable for them.")
+            if not rows:
+                manifest["warnings"].append("Wrike returned zero tasks. Verify this token's account and task visibility before interpreting missing tasks.")
+            if previous_rows and len(result["missing_from_current"]) > 0:
+                manifest["warnings"].append("Some prior tasks are absent. Visibility, permissions, deletion or changes during scanning may be involved; the cause is unknown.")
+            if stats["duplicate_records"]:
+                manifest["warnings"].append("Duplicate task IDs were returned and deduplicated. The scan is not atomic.")
+            manifest["baseline"] = previous_manifest is None
+            manifest["status"] = "COMPLETE"
+        except (SnapshotError, OSError, KeyboardInterrupt) as exc:
+            manifest["status"] = "INCOMPLETE"
+            error = str(exc) if isinstance(exc, SnapshotError) else (
+                "Capture interrupted by user." if isinstance(exc, KeyboardInterrupt) else "Local file operation failed; check available disk space and folder permissions.")
+            manifest["errors"].append(error)
+            # Do not leave a failed run's comparison files looking usable.
+            for key, name in list(manifest["files"].items()):
+                if key != "request_log":
+                    try:
+                        (run_dir / name).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    del manifest["files"][key]
+            manifest.pop("snapshot_sha256", None)
+            if rows:
+                partial_name = "partial_tasks_" + run_id + ".csv"
+                write_csv(run_dir / partial_name, SNAPSHOT_FIELDS, (rows[key] for key in sorted(rows)))
+                manifest["files"]["partial_snapshot"] = partial_name
+        stats["unique_tasks"] = len(rows)
+        stats["requests_attempted"] = len(client.events)
+        stats["failed_request_attempts"] = sum(event.get("outcome") != "success" for event in client.events)
+        stats["retries_scheduled"] = sum("retry_in_seconds" in event for event in client.events)
+        if stats["failed_request_attempts"] and manifest["status"] == "COMPLETE":
+            if manifest.get("workflow_lookup", {}).get("errors"):
+                manifest["warnings"].append("API failures are logged in requests.jsonl; unresolved workflow lookup errors are listed separately in this summary.")
+            else:
+                manifest["warnings"].append("Some API requests failed but recovered through retries; see requests.jsonl.")
+        manifest["finished_at"] = timestamp(now())
+        # The COMPLETE manifest is the commit marker. Only committed runs are future baselines.
+        write_json(run_dir / "summary.json", manifest)
+        return manifest, run_dir
+
+
+def print_result(manifest, run_dir):
+    counts = manifest["counts"]
+    print("\n%s | %d unique tasks | %d pages | %d duplicate records" % (
+        manifest["status"], counts["unique_tasks"], counts["pages_received"], counts["duplicate_records"]))
+    print("Failed API attempts: %d | retries scheduled: %d" % (
+        counts["failed_request_attempts"], counts["retries_scheduled"]))
+    if manifest["status"] == "COMPLETE":
+        print("First baseline." if manifest["baseline"] else "Compared with: " + manifest["previous_run_id"])
+        print("Status differences: %d | newly visible: %d | missing: %d | custom-status coverage differences: %d" % (
+            counts["status_changes"], counts["newly_visible"], counts["missing_from_current"], counts["status_coverage_changes"]))
+        labels = manifest["workflow_lookup"]
+        print("Workflow catalog: %s | %d workflows | %d custom status IDs | %d distinct status names" % (
+            labels["status"], labels.get("workflow_count", 0), labels.get("custom_status_id_count", 0),
+            labels.get("distinct_status_name_count", 0)))
+        print("Tasks with resolved workflow status: %d | unresolved or inconsistent: %d" % (
+            counts["tasks_with_resolved_workflow_status"], counts["tasks_with_unresolved_workflow_status"]))
+        print("Tasks without updatedDate: %d | without customFields metadata: %d" % (
+            counts["tasks_without_task_updated_at"], counts["tasks_without_custom_fields_metadata"]))
+    else:
+        print("No complete snapshot committed; this run will not be used as a comparison baseline.")
+    for message in manifest["errors"]:
+        print("ERROR: " + message)
+    for message in manifest["warnings"]:
+        print("WARNING: " + message)
+    print("Access: only tasks visible to this user in this Wrike account; no independent total is available.")
+    print("Observation times are not exact status-change times; changes between runs can be missed.")
+    print("task_updated_at is the entire task's last update. Exact status-change columns are blank; *_last_change_observed_at records detection only.")
+    print("Files: " + str(run_dir))
+    print("Run report: " + str(run_dir / "summary.json"))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version="Wrike task snapshots 3 (status/timestamp detail; reads v1 and v2 baselines)")
+    commands = parser.add_subparsers(dest="command", required=True)
+    command = commands.add_parser("capture", help="Capture all token-visible tasks and compare with the last complete run.")
+    command.add_argument("--output", type=Path, default=Path("output/task_snapshots"),
+                         help="Local output folder; reuse the same folder for each run (default: output/task_snapshots).")
+    command.add_argument("--host", choices=HOSTS, default=HOSTS[0], help="Wrike API host for this account.")
+    args = parser.parse_args(argv)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            token = getpass.getpass("Wrike token (hidden; used only for this run): ").strip()
+        client = WrikeClient(token, host=args.host)
+        manifest, run_dir = capture(args.output, client)
+        print_result(manifest, run_dir)
+        return 0 if manifest["status"] == "COMPLETE" else 1
+    except getpass.GetPassWarning:
+        print("ERROR: A terminal with a hidden password prompt is required. Run this command in Terminal.", file=sys.stderr)
+    except (EOFError, KeyboardInterrupt):
+        print("Capture cancelled.", file=sys.stderr)
+    except SnapshotError as exc:
+        print("ERROR: " + str(exc), file=sys.stderr)
+    except OSError:
+        print("ERROR: Could not write local files. Check folder permissions and disk space.", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
