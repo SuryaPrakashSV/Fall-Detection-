@@ -1,43 +1,68 @@
-WITH task_rows AS (
-    SELECT
-        NULLIF(TRIM("status"), '') AS general_status,
-        NULLIF(TRIM("customStatusId"), '') AS workflow_status
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE COALESCE(
-        NULLIF(NULLIF(UPPER(TRIM("parent_task_id")), 'PLACEHOLDER'), ''),
-        NULLIF(NULLIF(UPPER(TRIM("child_task_id")), 'PLACEHOLDER'), ''),
-        NULLIF(NULLIF(UPPER(TRIM("grandchild_task_id")), 'PLACEHOLDER'), ''),
-        NULLIF(NULLIF(UPPER(TRIM("baby_task_id")), 'PLACEHOLDER'), ''),
-        NULLIF(NULLIF(UPPER(TRIM("grandbaby_task_id")), 'PLACEHOLDER'), ''),
-        NULLIF(NULLIF(UPPER(TRIM("great_grandbaby_task_id")), 'PLACEHOLDER'), '')
-    ) IS NOT NULL
-)
-SELECT DISTINCT
-    general_status,
-    workflow_status,
-    COUNT(DISTINCT general_status) OVER () AS general_status_count,
-    COUNT(DISTINCT workflow_status) OVER () AS workflow_status_count
-FROM task_rows
-ORDER BY general_status, workflow_status;
+-- Wrike effort reconciliation: capture current Snowflake evidence.
+-- Run this SELECT once and download the entire result as CSV.
+-- Suggested filename: snowflake_effort_evidence_2026-09-29.csv
+-- Keep the downloaded CSV unchanged; preserve raw numeric dates as text
+-- when reading it in Python. Do not round dates through a spreadsheet.
+--
+-- This is a current snapshot, not the saved September 24 baseline.
+-- evidence_exported_at is the query/export time; Data refresh is retained
+-- separately. evidence_total_rows permits a full-download row-count check.
+--
+-- Preserve repeated, null, zero and placeholder rows for the audit.
+-- The final metric, deduplication key, project attribution and reconciliation
+-- must be established from these rows and the corresponding extraction code.
+-- No effort fields are added together or converted to hours here.
+
+SELECT
+    CURRENT_TIMESTAMP() AS "evidence_exported_at",
+    COUNT(*) OVER () AS "evidence_total_rows",
+    w."Data refresh",
+    w."id",
+    w."key",
+    w."title",
+    w."is_project",
+    w."parent_folder_id",
+    w."child_folder_id",
+    w."grandchild_folder_id",
+    w."baby_folder_id",
+    w."grandbaby_folder_id",
+    w."parent_task_id",
+    w."child_task_id",
+    w."grandchild_task_id",
+    w."baby_task_id",
+    w."grandbaby_task_id",
+    w."great_grandbaby_task_id",
+    w."Owner_userid",
+    w."Responsible_userId",
+    w."effortAllocation_mode",
+    w."effortAllocation_totalEffort",
+    w."effortAllocation_dailyAllocationPercentage",
+    w."effortAllocation_allocatedEffort",
+    w."totalEffortMinutes",
+    w."owner_dailyAllocation",
+    w."owner_dailyAllocation_date",
+    w."owner_effortMinutes_per_day",
+    w."effort [days]",
+    w."total hours",
+    w."allocated hours",
+    w."booked effort",
+    w."forecasted hours"
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" AS w;
 
 
 
 SELECT
-    t."status" AS GENERAL_STATUS,
-    t."customStatusId" AS WORKFLOW_STATUS,
-    COUNT(*) OVER () AS SOURCE_TASK_ROW_COUNT,
-    t.*
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" AS t
-WHERE COALESCE(
-    NULLIF(NULLIF(UPPER(TRIM(t."parent_task_id")), 'PLACEHOLDER'), ''),
-    NULLIF(NULLIF(UPPER(TRIM(t."child_task_id")), 'PLACEHOLDER'), ''),
-    NULLIF(NULLIF(UPPER(TRIM(t."grandchild_task_id")), 'PLACEHOLDER'), ''),
-    NULLIF(NULLIF(UPPER(TRIM(t."baby_task_id")), 'PLACEHOLDER'), ''),
-    NULLIF(NULLIF(UPPER(TRIM(t."grandbaby_task_id")), 'PLACEHOLDER'), ''),
-    NULLIF(NULLIF(UPPER(TRIM(t."great_grandbaby_task_id")), 'PLACEHOLDER'), '')
-) IS NOT NULL;
-
-
+    COLUMN_NAME,
+    DATA_TYPE
+FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+  AND TABLE_NAME = 'Wrike_STG'
+  AND (
+      COLUMN_NAME ILIKE '%effort%'
+      OR COLUMN_NAME ILIKE '%hour%'
+      OR COLUMN_NAME ILIKE '%allocat%'
+  )
+ORDER BY ORDINAL_POSITION;
 
 
 
