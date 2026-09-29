@@ -140,6 +140,33 @@ ORDER BY TASK_ID;
 
 
 
+
+SELECT
+    ORDINAL_POSITION,
+    COLUMN_NAME,
+    DATA_TYPE
+FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
+  AND TABLE_NAME = 'Wrike_STG'
+  AND COLUMN_NAME ILIKE ANY (
+      '%status%',
+      '%state%',
+      '%stage%',
+      '%approval%',
+      '%health%',
+      '%custom%field%'
+  )
+ORDER BY ORDINAL_POSITION;
+
+
+
+
+
+
+
+
+
+
 #!/usr/bin/env python3
 """Local, token-visible Wrike task snapshots, version 3. Python 3.9+.
 
