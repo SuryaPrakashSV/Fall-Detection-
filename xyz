@@ -306,9 +306,118 @@ def bridge(baseline, akash, project_ids):
             'scope_note': 'Exclusive difference sets partition task IDs; project-level reports may overlap'}
 
 
-def write_csv(path, rows):
+DIFFERENCE_FIELDS = (
+    'task_id', 'difference_type', 'baseline_effort_hours', 'akash_effort_hours',
+    'baseline_minus_akash_hours', 'baseline_effort_issues', 'akash_effort_issues',
+    'baseline_titles_json', 'akash_titles_json',
+    'baseline_direct_container_ids_json', 'akash_direct_container_ids_json',
+    'baseline_folder_hierarchy_ids_json', 'akash_folder_hierarchy_ids_json',
+    'baseline_folder_hierarchy_paths_json', 'akash_folder_hierarchy_paths_json',
+    'baseline_missing_56_project_ids_json', 'akash_missing_56_project_ids_json',
+    'baseline_excluded_item_scope_ids_json', 'akash_excluded_item_scope_ids_json',
+    'baseline_excluded_item_scope_names_json', 'akash_excluded_item_scope_names_json',
+    'baseline_qualified_metadata_rows', 'akash_qualified_metadata_rows')
+DIFFERENCE_TYPES = ('BASELINE_ONLY_OUTSIDE_56', 'AKASH_ONLY',
+                    'SHARED_EFFORT_CHANGED', 'SHARED_EFFORT_UNKNOWN')
+
+
+def difference_types(baseline, akash, project_ids):
+    """Keep unexplained differences; omit the known baseline-only 56-project set."""
+    a, b = set(baseline.tasks), set(akash.tasks)
+    known_missing = set().union(*(baseline.scope_tasks[p] for p in project_ids))
+    result = {key: 'BASELINE_ONLY_OUTSIDE_56' for key in (a - b) - known_missing}
+    result.update({key: 'AKASH_ONLY' for key in b - a})
+    for key in a & b:
+        av, bv = baseline.tasks[key]['minutes'], akash.tasks[key]['minutes']
+        if av is None or bv is None:
+            result[key] = 'SHARED_EFFORT_UNKNOWN'
+        elif av != bv:
+            result[key] = 'SHARED_EFFORT_CHANGED'
+    return result
+
+
+def selected_metadata(data, keys):
+    """Second pass retains metadata only for selected, exactly mapped task keys."""
+    expected = {k: data.audit[k] for k in ('path', 'bytes', 'mtime_ns', 'sha256')}
+    stable(data.path, expected)
+    result = {key: {'titles': set(), 'direct_container_ids': set(),
+        'folder_hierarchy_ids': set(), 'folder_hierarchy_paths': set(),
+        'qualified_rows': 0} for key in keys}
+    required = ['key', 'id', 'title', *FOLDERS, *TASKS]
+    for row in csv_rows(data.path, required):
+        key = ident(row['key'])
+        if key not in result:
+            continue
+        container = ident(row['id'])
+        path = tuple(ident(row[name]) for name in FOLDERS)
+        folders = set(path) - {''}
+        deepest = next((ident(row[name]) for name in reversed(TASKS) if ident(row[name])), '')
+        if not key or key == container or key in folders or key != deepest:
+            continue
+        info = result[key]
+        title = clean(row['title'])
+        if title.lower() not in NULLS:
+            info['titles'].add(title)
+        if container:
+            info['direct_container_ids'].add(container)
+        info['folder_hierarchy_ids'].update(folders)
+        info['folder_hierarchy_paths'].add(path)
+        info['qualified_rows'] += 1
+    stable(data.path, expected)
+    for key, info in result.items():
+        if not info['qualified_rows']:
+            raise ValueError(data.label + ': no qualifying metadata rows for selected task ' + key)
+    return result
+
+
+def task_difference_rows(baseline, akash, types, baseline_meta, akash_meta, project_ids, cohort):
+    members, excluded_members = [], []
+    excluded_ids = set(cohort) - set(project_ids)
+    for source in (baseline, akash):
+        membership = defaultdict(set)
+        for pid in project_ids:
+            for key in source.scope_tasks[pid] & types.keys():
+                membership[key].add(pid)
+        members.append(membership)
+        excluded = defaultdict(set)
+        for pid in excluded_ids:
+            for key in source.scope_tasks[pid] & types.keys():
+                excluded[key].add(pid)
+        excluded_members.append(excluded)
+    result = []
+    for key in sorted(types, key=lambda k: (types[k], k)):
+        av = baseline.tasks[key]['minutes'] if key in baseline.tasks else None
+        bv = akash.tasks[key]['minutes'] if key in akash.tasks else None
+        # Absence is blank in each source column; the arithmetic delta uses
+        # zero only for a task absent from that saved source, never for null effort.
+        delta = (av if key not in akash.tasks else -bv if key not in baseline.tasks and bv is not None
+                 else av - bv if av is not None and bv is not None else None)
+        row = {'task_id': key, 'difference_type': types[key],
+            'baseline_effort_hours': hours(av), 'akash_effort_hours': hours(bv),
+            'baseline_minus_akash_hours': hours(delta)}
+        for index, (prefix, source, metadata) in enumerate((
+                ('baseline', baseline, baseline_meta), ('akash', akash, akash_meta))):
+            info = metadata.get(key, {})
+            row[prefix + '_effort_issues'] = '; '.join(sorted(source.tasks[key]['issues'])) if key in source.tasks else ''
+            for field in ('titles', 'direct_container_ids', 'folder_hierarchy_ids'):
+                row[prefix + '_' + field + '_json'] = json.dumps(sorted(info.get(field, ())), ensure_ascii=False)
+            paths = [dict(zip(FOLDERS, path)) for path in sorted(info.get('folder_hierarchy_paths', ()))]
+            row[prefix + '_folder_hierarchy_paths_json'] = json.dumps(paths, ensure_ascii=False)
+            row[prefix + '_missing_56_project_ids_json'] = json.dumps(sorted(members[index][key]))
+            excluded = sorted(excluded_members[index][key])
+            row[prefix + '_excluded_item_scope_ids_json'] = json.dumps(excluded)
+            row[prefix + '_excluded_item_scope_names_json'] = json.dumps(
+                {pid: cohort[pid]['project_name'] for pid in excluded}, ensure_ascii=False)
+            row[prefix + '_qualified_metadata_rows'] = info.get('qualified_rows', 0)
+        result.append(row)
+    return sorted(result, key=lambda row: (row['difference_type'],
+        not bool(row['baseline_minus_akash_hours']),
+        -abs(Decimal(row['baseline_minus_akash_hours'] or '0')), row['task_id']))
+
+
+def write_csv(path, rows, fieldnames=None):
     with path.open('x', encoding='utf-8-sig', newline='') as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(handle, fieldnames=fieldnames or list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
 
@@ -358,10 +467,27 @@ def main():
         union_total.update(minutes=None, hours='', scope_incomplete_ids=absent)
     memberships = Counter(k for p in project_ids for k in current.scope_tasks[p])
     comparisons = {}
+    comparison_sources, difference_sets, selected_keys = {}, {}, defaultdict(set)
     if 'akash' in datasets:
         comparisons['current_snowflake_vs_saved_akash'] = bridge(current, datasets['akash'], project_ids)
+        comparison_sources['current_snowflake_vs_saved_akash'] = 'snowflake'
         if 'surya' in datasets:
             comparisons['saved_surya_vs_saved_akash'] = bridge(datasets['surya'], datasets['akash'], project_ids)
+            comparison_sources['saved_surya_vs_saved_akash'] = 'surya'
+    for comparison, source in comparison_sources.items():
+        types = difference_types(datasets[source], datasets['akash'], project_ids)
+        difference_sets[comparison] = types
+        selected_keys[source].update(types.keys() & datasets[source].tasks.keys())
+        selected_keys['akash'].update(types.keys() & datasets['akash'].tasks.keys())
+    metadata = {name: selected_metadata(datasets[name], keys) for name, keys in selected_keys.items()}
+    difference_reports = {}
+    for comparison, source in comparison_sources.items():
+        types = difference_sets[comparison]
+        difference_reports[comparison] = task_difference_rows(datasets[source], datasets['akash'], types,
+            metadata.get(source, {}), metadata.get('akash', {}), project_ids, cohort)
+        comparisons[comparison]['task_difference_file'] = 'task_differences_' + comparison + '.csv'
+        counts = Counter(types.values())
+        comparisons[comparison]['task_difference_counts'] = {kind: counts[kind] for kind in DIFFERENCE_TYPES}
     notes = [
         'Metric: effortAllocation_totalEffort minutes / 60, one consistent value per unique task key.',
         'These are recorded planned task effort hours, not actual timelog hours or owner allocation hours.',
@@ -372,6 +498,7 @@ def main():
         'The 56-project union counts each task once. The five excluded item scopes can overlap it.',
         'No active/open status filter is applied. The original 56-project cohort remains fixed.',
         'Saved snapshots have different refresh times. Arithmetic equality is not proof of complete API extraction.',
+        'Task difference files show baseline-only tasks outside the 56, Akash-only tasks and changed/unknown shared effort; differences do not establish an access cause.',
         'No original files, Snowflake tables or Wrike data were changed.'
     ]
     details = {'report_generated_at_utc': datetime.now(timezone.utc).isoformat(),
@@ -385,6 +512,8 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     write_csv(output / 'missing_projects_effort_hours.csv', projects)
     write_csv(output / 'excluded_items_effort_hours.csv', excluded)
+    for comparison, difference_rows in difference_reports.items():
+        write_csv(output / comparisons[comparison]['task_difference_file'], difference_rows, DIFFERENCE_FIELDS)
     summary = ['WRIKE RECORDED TASK EFFORT RECONCILIATION', '',
         f'Current Snowflake dataset rows: {current.audit["data_rows"]:,}',
         'Complete current CSV download check: PASSED (row count and single export marker)',
@@ -393,6 +522,11 @@ def main():
         f'Unique task keys in the 56-project union: {len(union):,}',
         'Unique task effort hours in that union: ' + (union_total['hours'] or 'UNKNOWN'),
         f'Tasks shared across missing project scopes: {details["tasks_shared_across_missing_project_scopes"]:,}', '']
+    no_tasks = [row for row in projects if row['status'] == 'NO_RECORDED_TASKS']
+    if no_tasks:
+        summary += ['Projects with NO_RECORDED_TASKS in this exported hierarchy:']
+        summary += [f'  {row["project_name"] or "(blank name)"} | {row["project_id"]}' for row in no_tasks]
+        summary += ['']
     for name, data in datasets.items():
         total = data.total(data.tasks, data.unknown_identity_rows)
         summary += [f'{name}: {data.audit["data_rows"]:,} rows; {len(data.tasks):,} unique mapped task keys; '
@@ -406,7 +540,9 @@ def main():
             summary.append(f'  {term}: {amount["hours"] or "UNKNOWN"} hours; {amount["task_count"]:,} tasks')
         summary += ['  Arithmetic residual: ' + (comparison['arithmetic_residual_hours'] or 'UNKNOWN') + ' hours',
                     '  Baseline minus (Akash + 56-project union): ' +
-                    (comparison['baseline_minus_Akash_minus_56_hours'] or 'UNKNOWN') + ' hours']
+                    (comparison['baseline_minus_Akash_minus_56_hours'] or 'UNKNOWN') + ' hours',
+                    '  Task difference groups: ' + json.dumps(comparison['task_difference_counts']),
+                    '  Task difference file: ' + comparison['task_difference_file']]
     if not comparisons:
         summary += ['', 'COMPARISONS SKIPPED: a valid saved Akash export was not available.']
     summary += ['', *notes, '', 'Saved reports: ' + str(output)]
