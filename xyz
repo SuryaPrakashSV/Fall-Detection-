@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""Profile saved Wrike effort evidence without uploading it or calling any API.
+"""Calculate recorded task effort from saved CSVs; no network or external writes.
 
-Run in ~/Desktop/wrike-local-baseline:
-    python3 check_wrike_effort.py
+Metric: effortAllocation_totalEffort, in minutes, once per unique metadata task
+key; divide by 60 for hours. This is planned/recorded task effort, not timelog
+actual hours. Owner/day expansions and hierarchy repetition are collapsed only
+when every occurrence of a task has the same valid nonnegative value. Source
+zeros are retained (the upstream pipeline may have replaced missing with zero).
 
-Optional paths:
-    python3 check_wrike_effort.py --evidence /path/to/snowflake_effort_evidence.csv \
-        --missing /path/to/missing_items.csv
+Project membership is the union of id and the five folder hierarchy columns.
+Project totals therefore overlap and must NOT be summed. Global totals count a
+task once even if it appears in multiple projects. Folder/project own records
+are excluded to avoid mixing their effort with descendant task effort.
 
-Python 3 standard library only. Input files are read-only. No credentials,
-extraction-script imports, network calls, or Snowflake connection are used.
-Outputs are diagnostic reports, NOT final project hours or a reconciliation.
-Dates and IDs stay as text. Null values do not become zero. Conflicting values
-at a candidate grain are reported, never resolved with MAX or SUM(DISTINCT).
+Run in the folder containing this script, snowflake_effort_evidence.csv and
+missing_items.csv: python3 calculate_wrike_effort.py
+Only Python's standard library is required. Inputs remain unchanged.
 """
-
 import argparse
-import ast
 import csv
 import hashlib
 import json
@@ -29,576 +29,396 @@ from pathlib import Path
 
 getcontext().prec = 60
 csv.field_size_limit(16 * 1024 * 1024)
-NULLS = {"", "null", "none", "nan", "nat", "<na>", "\\n"}
-FOLDERS = ("parent_folder_id", "child_folder_id", "grandchild_folder_id",
-           "baby_folder_id", "grandbaby_folder_id")
-TASKS = ("parent_task_id", "child_task_id", "grandchild_task_id",
-         "baby_task_id", "grandbaby_task_id", "great_grandbaby_task_id")
-EFFORT = ("effortAllocation_totalEffort", "effortAllocation_dailyAllocationPercentage",
-          "effortAllocation_allocatedEffort", "totalEffortMinutes",
-          "owner_effortMinutes_per_day", "effort [days]", "total hours",
-          "allocated hours", "booked effort", "forecasted hours")
-NUMERIC = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\Z")
-DAILY = "owner_effortMinutes_per_day"
-OWNER_TOTAL = "totalEffortMinutes"
+FOLDERS = ('parent_folder_id', 'child_folder_id', 'grandchild_folder_id',
+           'baby_folder_id', 'grandbaby_folder_id')
+TASKS = ('parent_task_id', 'child_task_id', 'grandchild_task_id',
+         'baby_task_id', 'grandbaby_task_id', 'great_grandbaby_task_id')
+METRIC = 'effortAllocation_totalEffort'
+NULLS = {'', 'null', 'none', 'nan', 'nat', '<na>', '\\n'}
+NUMERIC = re.compile(r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\Z')
+SAVED_SURYA = 'output/local_validation/20260924T213922_287354Z/wrike_local_full.csv'
+SAVED_AKASH = 'output/local_validation/20260925T001910_967424Z/wrike_local_full.csv'
+MISSING_FALLBACK = ('output/akash_comparison/20260925T002311_148327Z_73a909/'
+                    'targeted_check_20260925T005523_170267Z/lookup_results.csv')
 
 
 def clean(value):
-    return (value or "").strip()
+    return (value or '').strip()
 
 
-def present(value):
-    return clean(value).lower() not in NULLS
-
-
-def identifier(value):
+def ident(value):
     value = clean(value)
-    return value if present(value) and value.upper() != "PLACEHOLDER" else ""
+    return '' if value.lower() in NULLS or value.upper() == 'PLACEHOLDER' else value
 
 
-def number(value):
-    """No thousands-separator, percentage, time-string or locale guesses."""
+def numeric(value):
     value = clean(value)
-    if not present(value):
-        return "null", None
+    if value.lower() in NULLS:
+        return None, 'NULL_EFFORT'
     if len(value) > 100 or not NUMERIC.fullmatch(value):
-        return "invalid", None
+        return None, 'INVALID_EFFORT'
     try:
-        result = Decimal(value)
-        if not result.is_finite() or (result and abs(result.adjusted()) > 30):
-            return "invalid", None
-        return "number", result
+        number = Decimal(value)
+        if not number.is_finite() or (number and abs(number.adjusted()) > 30):
+            return None, 'INVALID_EFFORT'
+        return (None, 'NEGATIVE_EFFORT') if number < 0 else (number, '')
     except InvalidOperation:
-        return "invalid", None
+        return None, 'INVALID_EFFORT'
 
 
-def fmt(value):
-    return str(value) if value is not None else ""
+def hours(value):
+    return '' if value is None else format(value / Decimal(60), '.10f').rstrip('0').rstrip('.')
 
 
 def fingerprint(path):
-    stat = path.stat()
-    return stat.st_size, stat.st_mtime_ns, stat.st_ino
-
-
-def audit(path, before, rows):
+    before = path.stat()
     digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(block)
-    if fingerprint(path) != before:
-        raise ValueError("Input changed during the check: " + str(path))
-    return {"path": str(path), "bytes": before[0], "data_rows": rows,
-            "sha256": digest.hexdigest()}
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    after = path.stat()
+    facts = lambda s: (s.st_size, s.st_mtime_ns, s.st_ino)
+    if facts(before) != facts(after):
+        raise ValueError('Input changed while hashing: ' + str(path))
+    return {'path': str(path), 'bytes': after.st_size, 'mtime_ns': after.st_mtime_ns,
+            'sha256': digest.hexdigest()}
 
 
-def rows_from(path, required):
-    with path.open("r", encoding="utf-8-sig", newline="") as source:
-        reader = csv.DictReader(source, strict=True)
-        headers = reader.fieldnames or []
-        normalized = [clean(name) for name in headers]
-        if not normalized or "" in normalized or len(set(normalized)) != len(normalized):
-            raise ValueError(str(path) + ": empty, blank, or duplicate headers")
-        missing = sorted(set(required) - set(normalized))
-        if missing:
-            raise ValueError(str(path) + ": missing columns: " + ", ".join(missing))
-        reader.fieldnames = normalized
+def csv_rows(path, required):
+    with path.open('r', encoding='utf-8-sig', newline='') as handle:
+        reader = csv.DictReader(handle, strict=True)
+        headers = [clean(h) for h in (reader.fieldnames or [])]
+        if not headers or '' in headers or len(headers) != len(set(headers)):
+            raise ValueError(str(path) + ': empty/duplicate CSV headers')
+        absent = sorted(set(required) - set(headers))
+        if absent:
+            raise ValueError(str(path) + ': missing columns ' + ', '.join(absent))
+        reader.fieldnames = headers
         for row in reader:
-            if None in row or any(value is None for value in row.values()):
-                raise ValueError(str(path) + ": malformed CSV near line " + str(reader.line_num))
+            if None in row or any(v is None for v in row.values()):
+                raise ValueError(str(path) + ': malformed row near line ' + str(reader.line_num))
             yield row
 
 
-def resolve_file(requested, root, filename, fallback=None):
-    if requested:
-        path = Path(requested).expanduser().resolve()
-    else:
-        candidates = [root / filename]
-        if fallback:
-            candidates.append(root / fallback)
-        path = next((p for p in candidates if p.is_file()), candidates[0])
-    if not path.is_file():
-        raise ValueError("File not found: " + str(path) + "\n"
-                         "Place it in the script's folder or supply its path with --evidence / --missing.")
-    return path.resolve()
+def stable(path, before):
+    if fingerprint(path) != before:
+        raise ValueError('Input changed during calculation: ' + str(path))
 
 
-def read_missing(path):
+def read_cohort(path):
     before = fingerprint(path)
     result = {}
-    required = ("project_id", "snowflake_name", "is_confirmed_project_in_snowflake",
-                "in_akash_reference", "outcome", "http_status")
-    for row in rows_from(path, required):
-        pid = identifier(row["project_id"])
+    required = ('project_id', 'snowflake_name', 'is_confirmed_project_in_snowflake',
+                'in_akash_reference', 'outcome', 'http_status')
+    for row in csv_rows(path, required):
+        pid = ident(row['project_id'])
+        flag, error = numeric(row['is_confirmed_project_in_snowflake'])
+        reference, ref_error = numeric(row['in_akash_reference'])
+        status, status_error = numeric(row['http_status'])
         if not pid or pid in result:
-            raise ValueError("Missing-items CSV has a blank/placeholder or repeated project_id")
-        flags = {}
-        for field in ("is_confirmed_project_in_snowflake", "in_akash_reference"):
-            kind, value = number(row[field])
-            if kind != "number" or value not in (Decimal(0), Decimal(1)):
-                raise ValueError("Expected a 0/1 flag for " + pid + " in " + field)
-            flags[field] = int(value)
-        kind, status = number(row["http_status"])
-        if clean(row["outcome"]) != "NOT_FOUND" or kind != "number" or status != 404:
-            raise ValueError("Expected the saved NOT_FOUND / 404 result for " + pid)
-        result[pid] = {"name": clean(row["snowflake_name"]),
-                       "project": flags["is_confirmed_project_in_snowflake"],
-                       "reference": flags["in_akash_reference"]}
-    if not result:
-        raise ValueError("The missing-items CSV contains no data rows")
-    return result, audit(path, before, len(result))
+            raise ValueError('The missing-items file has a blank/placeholder or duplicate project ID')
+        if error or flag not in (0, 1) or ref_error or reference not in (0, 1):
+            raise ValueError('Expected 0/1 classification and reference flags for ' + pid)
+        if clean(row['outcome']) != 'NOT_FOUND' or status_error or status != 404:
+            raise ValueError('Expected the saved NOT_FOUND / 404 outcome for ' + pid)
+        result[pid] = {'project_id': pid, 'project_name': clean(row['snowflake_name']),
+                       'confirmed_project': int(flag), 'in_akash_reference': int(reference)}
+    if len(result) != 61 or sum(v['confirmed_project'] for v in result.values()) != 56:
+        raise ValueError('Use the original 61-item missing_items.csv containing 56 confirmed projects')
+    stable(path, before)
+    before['data_rows'] = len(result)
+    return result, before
 
 
-class FieldProfile:
-    def __init__(self):
-        self.counts = Counter()
-        self.invalid_examples = []
-        self.raw_sum = Decimal(0)
-
-    def add(self, text):
-        kind, value = number(text)
-        self.counts[kind] += 1
-        if kind == "number":
-            self.raw_sum += value
-            self.counts["positive" if value > 0 else "negative" if value < 0 else "zero"] += 1
-        elif kind == "invalid" and len(self.invalid_examples) < 3:
-            sample = clean(text)[:100]
-            if sample not in self.invalid_examples:
-                self.invalid_examples.append(sample)
-        return kind, value
-
-    def report(self):
-        return {**dict(self.counts), "raw_physical_row_sum_not_a_valid_total": fmt(self.raw_sum),
-                "invalid_examples": self.invalid_examples}
-
-
-class Grain:
-    """Candidate grouping diagnostics, NOT permission to deduplicate the data."""
-    def __init__(self, description):
-        self.description = description
-        self.groups = {}
-        self.unkeyed = Counter()
-
-    def add(self, key, parsed):
-        kind, value = parsed
-        if not all(key):
-            self.unkeyed[kind] += 1
-            if kind == "number" and value != 0:
-                self.unkeyed["nonzero_number"] += 1
-            return
-        # count, non-null numeric values, null count, invalid count
-        entry = self.groups.setdefault(key, [0, set(), 0, 0])
-        entry[0] += 1
-        if kind == "number":
-            entry[1].add(value)
-        elif kind == "null":
-            entry[2] += 1
-        else:
-            entry[3] += 1
-
-    def report(self):
-        counts = Counter()
-        for count, values, nulls, invalid in self.groups.values():
-            counts["groups"] += 1
-            counts["extra_rows_at_candidate_grain"] += count - 1
-            counts["conflicting_numeric_groups"] += len(values) > 1
-            counts["mixed_null_numeric_groups"] += bool(values) and nulls > 0
-            counts["invalid_value_groups"] += invalid > 0
-            counts["no_numeric_value_groups"] += not values
-        return {"candidate_grain": self.description, **dict(counts),
-                "rows_without_complete_grain": dict(self.unkeyed)}
-
-
-def profile_raw_allocation(text, daily, counts, samples):
-    if not present(text):
-        counts["null"] += 1
-        return
-    text = clean(text)
-    if len(text) > 65536:
-        counts["too_large_to_parse"] += 1
-        return
-    try:
-        obj = json.loads(text, parse_float=Decimal)
-    except (ValueError, RecursionError):
-        try:
-            # literal_eval accepts Python literals only; never execute CSV text.
-            obj = ast.literal_eval(text)
-        except (ValueError, SyntaxError, RecursionError, MemoryError):
-            counts["unparsed"] += 1
-            return
-    if isinstance(obj, str) and len(obj) <= 65536:
-        counts["serialized_string_outer_layer"] += 1
-        try:
-            obj = json.loads(obj, parse_float=Decimal)
-        except (ValueError, RecursionError):
-            try:
-                obj = ast.literal_eval(obj)
-            except (ValueError, SyntaxError, RecursionError, MemoryError):
-                counts["unparsed_inner_string"] += 1
-                return
-    counts[type(obj).__name__] += 1
-    if isinstance(obj, list):
-        counts["nonempty_list"] += bool(obj)
-        return
-    if not isinstance(obj, dict):
-        return
-    if len(samples) < 3:
-        sample = {k: str(obj[k])[:100] for k in ("date", "effortMinutes") if k in obj}
-        if sample not in samples:
-            samples.append(sample)
-    if "effortMinutes" in obj:
-        raw_kind, raw_value = number(str(obj["effortMinutes"]))
-        if daily[0] == raw_kind == "number":
-            counts["raw_effort_matches_flat_column" if raw_value == daily[1]
-                   else "raw_effort_differs_from_flat_column"] += 1
-        else:
-            counts["raw_effort_not_comparable"] += 1
-
-
-def project_bucket():
-    return {"direct_rows": 0, "hierarchy_rows": 0, "union_rows": 0, "own_rows": 0,
-            "direct_keys": set(), "union_keys": set(), "own_flags": set(),
-            "own_titles": set(), "daily_numeric_rows": 0, "daily_nonzero_rows": 0,
-            "daily_null_rows": 0, "daily_invalid_rows": 0,
-            "daily_incomplete_grain_rows": 0, "multi_missing_project_rows": 0}
-
-
-def scan_evidence(path, missing):
-    before = fingerprint(path)
-    required = ("evidence_exported_at", "evidence_total_rows", "Data refresh", "id", "key",
-                "title", "is_project", "Owner_userid", "Responsible_userId",
-                "owner_dailyAllocation", "owner_dailyAllocation_date",
-                "effortAllocation_mode") + FOLDERS + TASKS + EFFORT
-    fields = {name: FieldProfile() for name in EFFORT}
-    grains = {
-        "effortAllocation_totalEffort": Grain("key (entity), regardless of container/owner/date"),
-        "effortAllocation_allocatedEffort": Grain("key (entity), regardless of container/owner/date"),
-        OWNER_TOTAL: Grain("key + Owner_userid, regardless of container/date"),
-        DAILY: Grain("key + Owner_userid + raw owner_dailyAllocation_date, regardless of container"),
-    }
-    scoped_daily = Grain("id + key + Owner_userid + raw owner_dailyAllocation_date")
-    counts = Counter()
-    exported = Counter()
-    refreshed = Counter()
-    date_shapes = Counter()
-    date_samples = []
-    modes = Counter()
-    mode_coverage = defaultdict(Counter)
-    allocation_shapes = Counter()
-    allocation_samples = []
-    container_ids = set()
-    entity_keys = set()
-    task_keys = set()
-    folder_keys = set()
-    key_containers = defaultdict(set)
-    key_scopes = defaultdict(set)
-    own_projects = set()
-    baseline_projects = {pid for pid, item in missing.items() if item["project"]}
-    projects = {pid: project_bucket() for pid in missing}
-    expected_rows = None
-    extra_effort_headers = []
-    absent_custom_headers = []
-    incomplete_daily_owners = set()
-    row_count = 0
-    for row in rows_from(path, required):
-        row_count += 1
-        if row_count == 1:
-            extra_effort_headers = [h for h in row if h not in EFFORT and h not in required
-                                    and any(s in h.lower() for s in ("effort", "hour", "allocat"))]
-            absent_custom_headers = [h for h in ("[xa] effort h/d", "[xa] effort total p/d",
-                                     "[xa] mission control effort") if h not in row]
-        expected = clean(row["evidence_total_rows"])
-        if not re.fullmatch(r"\d+", expected) or int(expected) < 1:
-            raise ValueError("Invalid evidence_total_rows at CSV data row " + str(row_count))
-        if expected_rows is None:
-            expected_rows = int(expected)
-        elif int(expected) != expected_rows:
-            raise ValueError("Mixed evidence_total_rows values; do not combine separate exports")
-        export_mark = clean(row["evidence_exported_at"])
-        if not present(export_mark):
-            raise ValueError("Blank evidence_exported_at at CSV data row " + str(row_count))
-        exported[export_mark] += 1
-        refreshed[clean(row["Data refresh"])] += 1
-        cid, key = identifier(row["id"]), identifier(row["key"])
-        owner, responsible = identifier(row["Owner_userid"]), identifier(row["Responsible_userId"])
-        raw_date = clean(row["owner_dailyAllocation_date"])
-        date = raw_date if present(raw_date) else ""
-        folder_ids = {identifier(row[f]) for f in FOLDERS} - {""}
-        task_ids = {identifier(row[f]) for f in TASKS} - {""}
-        counts["blank_or_placeholder_container_rows"] += not cid
-        counts["blank_or_placeholder_entity_rows"] += not key
-        counts["owner_responsible_mismatch_rows"] += bool(owner and responsible and owner != responsible)
-        counts["owner_present_responsible_blank_rows"] += bool(owner and not responsible)
-        if cid:
-            container_ids.add(cid)
-        if key:
-            entity_keys.add(key)
-            if cid:
-                key_containers[key].add(cid)
-            if key in task_ids:
-                task_keys.add(key)
-            if key in folder_ids or (cid and key == cid):
-                folder_keys.add(key)
-            key_scopes[key].update(folder_ids | ({cid} if cid else set()))
-        own = bool(cid and key == cid)
-        if own and clean(row["is_project"]).upper() == "Y":
-            own_projects.add(cid)
-        task_path = [identifier(row[f]) for f in TASKS]
-        deepest_task = next((value for value in reversed(task_path) if value), "")
-        if not own:
-            if not deepest_task:
-                counts["non_own_rows_without_any_task_id"] += 1
-            elif key == deepest_task:
-                counts["non_own_rows_key_matches_deepest_task_id"] += 1
-            elif key and key in task_ids:
-                counts["non_own_rows_key_matches_earlier_task_id_only"] += 1
+class Dataset:
+    def __init__(self, label, path, cohort, evidence=False, expected_rows=None):
+        self.label, self.path = label, path
+        self.tasks = {}
+        self.scope_tasks, self.direct_tasks = defaultdict(set), defaultdict(set)
+        self.scope_rows, self.direct_rows = Counter(), Counter()
+        self.scope_ambiguity, self.direct_ambiguity = Counter(), Counter()
+        self.mapping_counts, self.effort_counts = Counter(), Counter()
+        self.refresh = Counter()
+        self.exported = Counter()
+        self.ambiguous_keys, self.folder_keys = set(), set()
+        self.unknown_identity_rows = 0
+        before = fingerprint(path)
+        required = ['id', 'key', METRIC, 'Data refresh', *FOLDERS, *TASKS]
+        if evidence:
+            required += ['evidence_exported_at', 'evidence_total_rows']
+        count, expected, marker_errors = 0, set(), Counter()
+        for row in csv_rows(path, required):
+            count += 1
+            if count % 50000 == 0:
+                print(f'{label}: read {count:,} rows', flush=True)
+            self.refresh[clean(row['Data refresh']) or '(blank)'] += 1
+            if evidence:
+                export_time = clean(row['evidence_exported_at'])
+                self.exported[export_time] += 1
+                value, error = numeric(row['evidence_total_rows'])
+                if error or value <= 0 or value != value.to_integral_value():
+                    marker_errors['invalid_count_marker_rows'] += 1
+                else:
+                    expected.add(int(value))
+            key, container = ident(row['key']), ident(row['id'])
+            folders = {ident(row[name]) for name in FOLDERS} - {''}
+            scopes = (folders | {container}) & cohort.keys()
+            direct = {container} & cohort.keys()
+            self.scope_rows.update(scopes)
+            self.direct_rows.update(direct)
+            task_path = [ident(row[name]) for name in TASKS]
+            deepest = next((v for v in reversed(task_path) if v), '')
+            folder_identity = bool(key and (key == container or key in folders))
+            contradictory_identity = bool(folder_identity and key in task_path)
+            if folder_identity and not contradictory_identity:
+                self.mapping_counts['folder_or_project_own_rows_excluded'] += 1
+                self.folder_keys.add(key)
+                continue
+            if contradictory_identity or not key or not deepest or key != deepest:
+                self.mapping_counts['ambiguous_identity_rows'] += 1
+                self.unknown_identity_rows += 1
+                self.scope_ambiguity.update(scopes)
+                self.direct_ambiguity.update(direct)
+                if key:
+                    self.ambiguous_keys.add(key)
+                continue
+            self.mapping_counts['task_rows'] += 1
+            value, error = numeric(row[METRIC])
+            self.effort_counts[error or ('ZERO_EFFORT' if value == 0 else 'POSITIVE_EFFORT')] += 1
+            task = self.tasks.setdefault(key, {'values': set(), 'issues': set(), 'rows': 0})
+            task['rows'] += 1
+            if error:
+                task['issues'].add(error)
             else:
-                counts["non_own_rows_with_task_ids_but_key_matches_none"] += 1
-        mode = clean(row["effortAllocation_mode"])
-        modes[mode] += 1
-        if not date:
-            date_shapes["null"] += 1
-        elif re.fullmatch(r"[+-]?\d+", date):
-            date_shapes["integer_text_" + str(len(date.lstrip("+-"))) + "_digits"] += 1
-        elif NUMERIC.fullmatch(date):
-            date_shapes["decimal_or_scientific_text_review_precision"] += 1
-        else:
-            date_shapes["other_text"] += 1
-        if date and date not in date_samples and len(date_samples) < 5:
-            date_samples.append(date)
-        parsed = {name: fields[name].add(row[name]) for name in EFFORT}
-        for field in ("effortAllocation_totalEffort", OWNER_TOTAL, DAILY):
-            kind, value = parsed[field]
-            mode_coverage[mode][field + ":" + kind] += 1
-            if kind == "number" and value != 0:
-                mode_coverage[mode][field + ":nonzero"] += 1
-        grains["effortAllocation_totalEffort"].add((key,), parsed["effortAllocation_totalEffort"])
-        grains["effortAllocation_allocatedEffort"].add((key,), parsed["effortAllocation_allocatedEffort"])
-        grains[OWNER_TOTAL].add((key, owner), parsed[OWNER_TOTAL])
-        grains[DAILY].add((key, owner, date), parsed[DAILY])
-        scoped_daily.add((cid, key, owner, date), parsed[DAILY])
-        if key and owner and not date:
-            incomplete_daily_owners.add((key, owner))
-        profile_raw_allocation(row["owner_dailyAllocation"], parsed[DAILY],
-                               allocation_shapes, allocation_samples)
-        direct = {cid} & missing.keys()
-        hierarchy = folder_ids & missing.keys()
-        hits = direct | hierarchy
-        counts["rows_with_multiple_missing_confirmed_project_matches"] += len(hits & baseline_projects) > 1
-        for pid in hits:
-            bucket = projects[pid]
-            bucket["direct_rows"] += pid in direct
-            bucket["hierarchy_rows"] += pid in hierarchy
-            bucket["union_rows"] += 1
-            if key:
-                bucket["union_keys"].add(key)
-                if pid in direct:
-                    bucket["direct_keys"].add(key)
-            if cid == key == pid:
-                bucket["own_rows"] += 1
-                bucket["own_flags"].add(clean(row["is_project"]))
-                if present(row["title"]):
-                    bucket["own_titles"].add(clean(row["title"]))
-            kind, value = parsed[DAILY]
-            bucket["daily_numeric_rows"] += kind == "number"
-            bucket["daily_nonzero_rows"] += kind == "number" and value != 0
-            bucket["daily_null_rows"] += kind == "null"
-            bucket["daily_invalid_rows"] += kind == "invalid"
-            bucket["daily_incomplete_grain_rows"] += kind == "number" and not all((key, owner, date))
-            bucket["multi_missing_project_rows"] += len(hits & baseline_projects) > 1
-        if row_count % 50000 == 0:
-            print("Checked {:,} CSV rows...".format(row_count), flush=True)
-    if not row_count or row_count != expected_rows:
-        raise ValueError("Incomplete CSV: parsed {:,} data rows; source evidence_total_rows={!r}. "
-                         "Download the complete result before using it.".format(row_count, expected_rows))
-    if len(exported) != 1:
-        raise ValueError("Multiple evidence_exported_at values: mixed exports cannot be validated together")
-    # Compare owner-level totals with their candidate daily groups. This tests
-    # structure, not whether every Wrike task or allocation was fetched.
-    daily_by_owner = defaultdict(lambda: {"sum": Decimal(0), "usable": True})
-    for (key, owner, date), (_, values, nulls, invalid) in grains[DAILY].groups.items():
-        bucket = daily_by_owner[(key, owner)]
-        if len(values) != 1 or nulls or invalid:
-            bucket["usable"] = False
-        else:
-            bucket["sum"] += next(iter(values))
-    owner_check = Counter()
-    for owner_key, (_, values, nulls, invalid) in grains[OWNER_TOTAL].groups.items():
-        daily = daily_by_owner.get(owner_key)
-        if len(values) != 1 or nulls or invalid:
-            owner_check["owner_total_ambiguous_or_missing"] += 1
-        elif owner_key in incomplete_daily_owners:
-            owner_check["daily_rows_with_missing_date"] += 1
-        elif daily is None:
-            owner_check["no_fully_keyed_daily_groups"] += 1
-        elif not daily["usable"]:
-            owner_check["daily_groups_ambiguous_or_missing"] += 1
-        elif next(iter(values)) == daily["sum"]:
-            owner_check["numeric_values_match_at_candidate_grains"] += 1
-        else:
-            owner_check["numeric_values_differ_at_candidate_grains"] += 1
-    owner_check["daily_owner_groups_without_owner_total_group"] = len(
-        set(daily_by_owner) - grains[OWNER_TOTAL].groups.keys())
-    task_only = task_keys - folder_keys
-    folder_only = folder_keys - task_keys
-    profile = {
-        "evidence": audit(path, before, row_count), "source_row_count": expected_rows,
-        "export_markers": dict(exported), "data_refresh_values": dict(refreshed),
-        "unique_container_ids": len(container_ids), "unique_entity_keys": len(entity_keys),
-        "own_row_confirmed_project_ids": len(own_projects),
-        "entity_key_classification": {"task_column_match_only": len(task_only),
-            "folder_or_own_row_match_only": len(folder_only),
-            "both_task_and_folder_match": len(task_keys & folder_keys),
-            "neither_match": len(entity_keys - task_keys - folder_keys)},
-        "entity_keys_in_multiple_containers": sum(len(c) > 1 for c in key_containers.values()),
-        "entity_keys_in_missing_and_other_direct_containers": sum(
-            bool(c & baseline_projects) and bool(c - baseline_projects) for c in key_containers.values()),
-        "entity_keys_in_multiple_current_project_scopes": sum(
-            len(c & own_projects) > 1 for c in key_scopes.values()),
-        "entity_keys_in_missing_and_other_project_scopes": sum(
-            bool(c & baseline_projects) and bool(c & (own_projects - baseline_projects))
-            for c in key_scopes.values()),
-        "row_diagnostics": dict(counts), "effort_fields": {k: v.report() for k, v in fields.items()},
-        "candidate_grains": {k: v.report() for k, v in grains.items()},
-        "daily_candidate_grain_with_container": scoped_daily.report(),
-        "owner_total_vs_daily_diagnostic": dict(owner_check),
-        "date_representation": dict(date_shapes), "raw_date_samples": date_samples,
-        "effort_modes": dict(modes), "raw_allocation_shapes": dict(allocation_shapes),
-        "effort_coverage_by_mode": {k: dict(v) for k, v in mode_coverage.items()},
-        "raw_allocation_samples": allocation_samples,
-        "extra_effort_headers_not_profiled": extra_effort_headers,
-        "not_in_this_export": absent_custom_headers,
-    }
-    project_rows = []
-    for pid, item in missing.items():
-        bucket = projects[pid]
-        keys = bucket["union_keys"]
-        project_rows.append({"project_id": pid, "baseline_name": item["name"],
-            "baseline_confirmed_project": item["project"], "in_akash_reference": item["reference"],
-            "current_own_row_confirmed_project": int(pid in own_projects),
-            "current_own_row_names": " | ".join(sorted(bucket["own_titles"])),
-            "current_own_row_flags": " | ".join(sorted(bucket["own_flags"])),
-            "direct_entity_keys": len(bucket["direct_keys"]), "union_entity_keys": len(keys),
-            "union_task_column_match_only_keys": len(keys & task_only),
-            "union_folder_or_own_row_match_only_keys": len(keys & folder_only),
-            "union_ambiguous_or_unclassified_keys": len(keys - task_only - folder_only),
-            **{k: v for k, v in bucket.items() if not isinstance(v, set)},
-            "scope_note": "union = id matches OR any of five folder IDs matches; overlapping scopes, not additive",
-            "hours_status": "NOT CALCULATED: metric, grouping and project attribution require review"})
-    return profile, project_rows
+                task['values'].add(value)
+            for pid in scopes:
+                self.scope_tasks[pid].add(key)
+            for pid in direct:
+                self.direct_tasks[pid].add(key)
+        if evidence and (marker_errors or expected != {count} or
+                         len(self.exported) != 1 or any(v.lower() in NULLS for v in self.exported)):
+            raise ValueError('Snowflake export completeness check failed: ' +
+                             str({'read_rows': count, 'count_markers': sorted(expected),
+                                  'marker_errors': dict(marker_errors),
+                                  'export_time_count': len(self.exported)}))
+        if expected_rows is not None and count != expected_rows:
+            raise ValueError(f'{label}: expected {expected_rows:,} rows in this saved snapshot; found {count:,}')
+        if not count:
+            raise ValueError(label + ': empty export')
+        for key, task in self.tasks.items():
+            if len(task['values']) > 1:
+                task['issues'].add('CONFLICTING_EFFORT')
+            if key in self.ambiguous_keys or key in self.folder_keys:
+                task['issues'].add('AMBIGUOUS_IDENTITY')
+            task['minutes'] = (next(iter(task['values']))
+                               if len(task['values']) == 1 and not task['issues'] else None)
+        stable(path, before)
+        before.update(data_rows=count, data_refresh_counts=dict(self.refresh),
+                      evidence_exported_at_counts=dict(self.exported))
+        self.audit = before
+
+    def total(self, keys, identity_block=False):
+        keys = set(keys)
+        unknown = sum(self.tasks[k]['minutes'] is None for k in keys)
+        value = None if unknown or identity_block else sum(
+            (self.tasks[k]['minutes'] for k in keys), Decimal(0))
+        return {'task_count': len(keys), 'unknown_effort_task_count': unknown,
+                'identity_block': bool(identity_block), 'minutes': value,
+                'hours': hours(value)}
+
+    def details(self):
+        issues = Counter(issue for task in self.tasks.values() for issue in task['issues'])
+        return {'input': self.audit, 'mapping_counts': dict(self.mapping_counts),
+                'effort_row_counts': dict(self.effort_counts),
+                'task_issue_counts': dict(issues),
+                'repeated_task_rows_collapsed': sum(t['rows'] - 1 for t in self.tasks.values()),
+                'recorded_unique_task_effort': self.total(self.tasks, self.unknown_identity_rows)}
 
 
-def save_reports(root, profile, project_rows):
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
-    out = root / "output" / "effort_check" / timestamp
-    out.mkdir(parents=True, exist_ok=False)
-    project_only = [row for row in project_rows if row["baseline_confirmed_project"]]
-    excluded = [row for row in project_rows if not row["baseline_confirmed_project"]]
-    profile["excluded_items"] = excluded
-    profile["project_cohort"] = {
-        "missing_items": len(project_rows), "confirmed_projects": len(project_only),
-        "not_confirmed_projects": len(excluded),
-        "projects_absent_from_direct_id_scope": sum(not r["direct_rows"] for r in project_only),
-        "projects_absent_from_direct_and_hierarchy_scope": sum(not r["union_rows"] for r in project_only),
-        "projects_without_numeric_daily_effort": sum(not r["daily_numeric_rows"] for r in project_only)}
-    warnings = [
-        "This is a field/grain diagnostic. No final effort hours or token reconciliation are established.",
-        "The current Snowflake snapshot and saved September 24 token exports are different snapshots.",
-        "Null effort is unknown/missing; it is not treated as zero. No effort fields are added together.",
-        "Project attribution and overlapping project/task scopes must be reviewed before summing projects.",
-        "The 56-project cohort comes from the saved baseline flag, not flags inherited by task rows.",
-        "The four confirmed folders and one unclassified missing item need separate scope review.",
-        "Owner-total/daily matches alone do not establish that all tasks or allocations were fetched.",
-        "Status fields are absent from this export; no active-project/open-task filter was applied.",
-    ]
-    if (len(project_rows), len(project_only)) != (61, 56):
-        warnings.insert(0, "COHORT MISMATCH: expected 61 missing items / 56 confirmed projects; review the selected CSV.")
-    if len(profile["data_refresh_values"]) != 1 or any(not present(v) for v in profile["data_refresh_values"]):
-        warnings.insert(0, "DATA REFRESH REVIEW: blank or multiple Data refresh values were found.")
-    profile["warnings"] = warnings
-    details = out / "effort_check_details.json"
-    details.write_text(json.dumps(profile, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    projects_path = out / "missing_projects_effort_check.csv"
-    if project_only:
-        with projects_path.open("w", encoding="utf-8-sig", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(project_only[0]))
-            writer.writeheader()
-            writer.writerows(project_only)
-    lines = ["WRIKE EFFORT EVIDENCE CHECK — DIAGNOSTICS ONLY", "",
-             "Evidence: " + profile["evidence"]["path"],
-             "Missing list: " + profile["missing_input"]["path"],
-             "Full CSV check: PASS — {:,} parsed data rows = source count".format(profile["source_row_count"]),
-             "Export marker: " + next(iter(profile["export_markers"])),
-             "Data refresh values: " + json.dumps(profile["data_refresh_values"], ensure_ascii=False),
-             "Missing items: {}; confirmed projects: {}; other items: {}".format(
-                 len(project_rows), len(project_only), len(excluded)),
-             "Unique container IDs: {:,}; entity keys: {:,}".format(
-                 profile["unique_container_ids"], profile["unique_entity_keys"]), "",
-             "EFFORT FIELDS (physical rows; counts only)",
-             "field | numeric | null | positive | zero | negative | non-numeric"]
-    for field, stats in profile["effort_fields"].items():
-        lines.append(field + " | " + " | ".join(str(stats.get(k, 0)) for k in
-                     ("number", "null", "positive", "zero", "negative", "invalid")))
-    lines += ["", "CANDIDATE GROUPING CHECKS (extra rows are not automatically erroneous duplicates)"]
-    for field, stats in profile["candidate_grains"].items():
-        lines += [field + ": " + stats["candidate_grain"],
-                  "  groups={}; extra rows={}; conflicting groups={}; mixed null/numeric={}; invalid groups={}".format(
-                      *(stats.get(k, 0) for k in ("groups", "extra_rows_at_candidate_grain",
-                      "conflicting_numeric_groups", "mixed_null_numeric_groups", "invalid_value_groups"))),
-                  "  incomplete grain rows=" + json.dumps(stats["rows_without_complete_grain"])]
-    lines += ["", "Owner total vs daily: " + json.dumps(profile["owner_total_vs_daily_diagnostic"]),
-              "Daily grouping WITH container: " + json.dumps(profile["daily_candidate_grain_with_container"]),
-              "Raw allocation checks: " + json.dumps(profile["raw_allocation_shapes"]),
-              "Raw date representation: " + json.dumps(profile["date_representation"]),
-              "Raw date samples (no conversion): " + json.dumps(profile["raw_date_samples"]),
-              "Entity classification: " + json.dumps(profile["entity_key_classification"]),
-              "Keys in multiple containers: " + str(profile["entity_keys_in_multiple_containers"]),
-              "Keys in missing-project AND other DIRECT containers: " + str(profile["entity_keys_in_missing_and_other_direct_containers"]),
-              "Keys in multiple current project scopes (ID or ancestor match): " + str(profile["entity_keys_in_multiple_current_project_scopes"]),
-              "Keys in missing AND other current project scopes: " + str(profile["entity_keys_in_missing_and_other_project_scopes"]),
-              "Project coverage: " + json.dumps(profile["project_cohort"]),
-              "Row diagnostics: " + json.dumps(profile["row_diagnostics"]), "", "REVIEW NOTES"]
-    lines += ["- " + note for note in warnings]
-    lines += ["", "Small files to share:", "  " + str(out / "effort_check_summary.txt"),
-              "  " + str(projects_path), "  " + str(details),
-              "", "Input files were not changed. No API calls were made. No token is needed."]
-    summary = out / "effort_check_summary.txt"
-    summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return out, summary
+def project_rows(data, cohort, project_ids):
+    memberships = Counter(k for pid in project_ids for k in data.scope_tasks[pid])
+    output = []
+    for pid in sorted(cohort, key=lambda p: (cohort[p]['project_name'].casefold(), p)):
+        item, keys = cohort[pid], data.scope_tasks[pid]
+        inclusive = data.total(keys, data.scope_ambiguity[pid])
+        direct = data.total(data.direct_tasks[pid], data.direct_ambiguity[pid])
+        issues = sorted({issue for k in keys for issue in data.tasks[k]['issues']})
+        if data.scope_ambiguity[pid]:
+            issues.append('AMBIGUOUS_IDENTITY_ROWS')
+        if not data.scope_rows[pid]:
+            issues.append('ID_ABSENT_FROM_EXPORTED_HIERARCHY')
+            inclusive.update(minutes=None, hours='')
+        if not data.direct_rows[pid]:
+            direct.update(minutes=None, hours='')
+        status = 'INCOMPLETE' if issues else ('NO_RECORDED_TASKS' if not keys else 'CALCULATED')
+        output.append({'project_id': pid, 'project_name': item['project_name'],
+            'is_confirmed_project_in_saved_baseline': item['confirmed_project'],
+            'effort_hours': inclusive['hours'], 'task_count': len(keys),
+            'unknown_effort_task_count': inclusive['unknown_effort_task_count'],
+            'status': status, 'issues': '; '.join(issues),
+            'shared_with_other_missing_projects_task_count':
+                sum(memberships[k] > 1 for k in keys) if pid in project_ids else '',
+            'direct_container_effort_hours': direct['hours'],
+            'direct_container_task_count': direct['task_count'],
+            'direct_container_status': ('ID_ABSENT_AS_DIRECT_CONTAINER' if not data.direct_rows[pid]
+                else 'INCOMPLETE' if direct['minutes'] is None
+                else 'NO_RECORDED_TASKS' if not direct['task_count'] else 'CALCULATED'),
+            'hierarchy_scope_dataset_rows': data.scope_rows[pid],
+            'scope_ambiguous_identity_rows': data.scope_ambiguity[pid],
+            'in_akash_reference': item['in_akash_reference'],
+            'scope_note': 'Task keys under id or five folder hierarchy IDs; overlapping project totals',
+            'metric_note': 'Recorded task effortAllocation_totalEffort minutes / 60; source zeros retained'})
+    return output
+
+
+def bridge(baseline, akash, project_ids):
+    a, b = set(baseline.tasks), set(akash.tasks)
+    shared, a_only, b_only = a & b, a - b, b - a
+    cohort_tasks = set().union(*(baseline.scope_tasks[p] for p in project_ids))
+    missing_only, outside = a_only & cohort_tasks, a_only - cohort_tasks
+    groups = {'baseline': baseline.total(a, baseline.unknown_identity_rows),
+              'akash': akash.total(b, akash.unknown_identity_rows),
+              'baseline_only_in_56': baseline.total(missing_only),
+              'baseline_only_outside_56': baseline.total(outside),
+              'akash_only': akash.total(b_only),
+              'baseline_56_task_union': baseline.total(cohort_tasks,
+                  sum(baseline.scope_ambiguity[p] for p in project_ids) or
+                  any(not baseline.scope_rows[p] for p in project_ids))}
+    unknown = sum(baseline.tasks[k]['minutes'] is None or akash.tasks[k]['minutes'] is None
+                  for k in shared)
+    delta = None if unknown else sum(
+        (baseline.tasks[k]['minutes'] - akash.tasks[k]['minutes'] for k in shared), Decimal(0))
+    groups['shared_task_effort_delta'] = {'task_count': len(shared),
+        'unknown_effort_task_count': unknown, 'minutes': delta, 'hours': hours(delta)}
+    terms = [groups[name]['minutes'] for name in ('baseline', 'akash', 'akash_only',
+             'shared_task_effort_delta', 'baseline_only_in_56', 'baseline_only_outside_56')]
+    residual = None if any(v is None for v in terms) else terms[0] - (
+        terms[1] - terms[2] + terms[3] + terms[4] + terms[5])
+    simple = [groups[name]['minutes'] for name in ('baseline', 'akash', 'baseline_56_task_union')]
+    simple_gap = None if any(v is None for v in simple) else simple[0] - simple[1] - simple[2]
+    return {'baseline_label': baseline.label, 'akash_label': akash.label,
+            'snapshot_note': 'Different saved snapshot times; arithmetic bridge only, not proof of API completeness or permissions',
+            'equation': 'baseline = Akash - Akash_only + shared_effort_delta + baseline_only_in_56 + baseline_only_outside_56',
+            'partitions': groups, 'arithmetic_residual_hours': hours(residual),
+            'baseline_minus_Akash_minus_56_hours': hours(simple_gap),
+            'tasks_in_baseline_56_and_Akash': len(cohort_tasks & b),
+            'complete_arithmetic_bridge': residual is not None and residual == 0,
+            'scope_note': 'Exclusive difference sets partition task IDs; project-level reports may overlap'}
+
+
+def write_csv(path, rows):
+    with path.open('x', encoding='utf-8-sig', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--evidence", help="Path to the complete Snowflake evidence CSV")
-    parser.add_argument("--missing", help="Path to missing_items.csv (the saved lookup result)")
+    parser.add_argument('--evidence', help='Current Snowflake evidence CSV')
+    parser.add_argument('--missing', help='Original 61-item missing_items.csv')
+    parser.add_argument('--surya', help='Saved 211,897-row Surya export; optional comparison')
+    parser.add_argument('--akash', help='Saved 169,002-row Akash export; optional comparison')
+    parser.add_argument('--output', help='Parent folder for a new timestamped report directory')
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
+    resolve = lambda given, default: Path(given).expanduser().resolve() if given else root / default
+    evidence = resolve(args.evidence, 'snowflake_effort_evidence.csv')
+    # Prefer the archived 61-item result; the shared copy may have been filtered
+    # or renamed in Numbers since the access comparison was completed.
+    missing = resolve(args.missing, MISSING_FALLBACK)
+    if not args.missing and not missing.is_file():
+        missing = root / 'missing_items.csv'
+    for path in (evidence, missing):
+        if not path.is_file():
+            raise ValueError('File not found: ' + str(path))
+    cohort, cohort_audit = read_cohort(missing)
+    project_ids = {p for p, item in cohort.items() if item['confirmed_project']}
+    print('Calculating saved CSVs locally; no token or API calls are used.', flush=True)
+    current = Dataset('Current Snowflake evidence', evidence, cohort, evidence=True)
+    datasets, skipped = {'snowflake': current}, {}
+    for name, given, default, expected in (
+            ('surya', args.surya, SAVED_SURYA, 211897), ('akash', args.akash, SAVED_AKASH, 169002)):
+        path = resolve(given, default)
+        if not path.is_file():
+            skipped[name] = 'SKIPPED: file not found: ' + str(path)
+            continue
+        try:
+            datasets[name] = Dataset('Saved ' + name.capitalize() + ' export', path, cohort,
+                                     expected_rows=expected)
+        except (ValueError, OSError, UnicodeError, csv.Error) as error:
+            skipped[name] = 'SKIPPED: ' + str(error)
+    rows = project_rows(current, cohort, project_ids)
+    projects = [row for row in rows if row['is_confirmed_project_in_saved_baseline']]
+    excluded = [row for row in rows if not row['is_confirmed_project_in_saved_baseline']]
+    union = set().union(*(current.scope_tasks[p] for p in project_ids))
+    union_total = current.total(union, sum(current.scope_ambiguity[p] for p in project_ids))
+    absent = [p for p in project_ids if not current.scope_rows[p]]
+    if absent:
+        union_total.update(minutes=None, hours='', scope_incomplete_ids=absent)
+    memberships = Counter(k for p in project_ids for k in current.scope_tasks[p])
+    comparisons = {}
+    if 'akash' in datasets:
+        comparisons['current_snowflake_vs_saved_akash'] = bridge(current, datasets['akash'], project_ids)
+        if 'surya' in datasets:
+            comparisons['saved_surya_vs_saved_akash'] = bridge(datasets['surya'], datasets['akash'], project_ids)
+    notes = [
+        'Metric: effortAllocation_totalEffort minutes / 60, one consistent value per unique task key.',
+        'These are recorded planned task effort hours, not actual timelog hours or owner allocation hours.',
+        'Null, invalid, negative or conflicting task effort remains UNKNOWN; affected totals are blank.',
+        'Source zero values are retained; upstream imputation may mean zero does not prove no planned effort.',
+        'Folder/project own rows are excluded; all task/subtask levels are included as distinct task keys.',
+        'Project membership uses id plus five folder ancestors; per-project hours are NON-ADDITIVE.',
+        'The 56-project union counts each task once. The five excluded item scopes can overlap it.',
+        'No active/open status filter is applied. The original 56-project cohort remains fixed.',
+        'Saved snapshots have different refresh times. Arithmetic equality is not proof of complete API extraction.',
+        'No original files, Snowflake tables or Wrike data were changed.'
+    ]
+    details = {'report_generated_at_utc': datetime.now(timezone.utc).isoformat(),
+        'cohort_input': cohort_audit, 'confirmed_project_count': len(project_ids),
+        'excluded_item_count': len(excluded), 'metric': METRIC,
+        'missing_56_unique_task_union': union_total,
+        'tasks_shared_across_missing_project_scopes': sum(n > 1 for n in memberships.values()),
+        'datasets': {name: data.details() for name, data in datasets.items()},
+        'skipped_inputs': skipped, 'comparisons': comparisons, 'notes': notes}
+    output = resolve(args.output, 'output/effort_reconciliation') / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')
+    output.mkdir(parents=True, exist_ok=False)
+    write_csv(output / 'missing_projects_effort_hours.csv', projects)
+    write_csv(output / 'excluded_items_effort_hours.csv', excluded)
+    summary = ['WRIKE RECORDED TASK EFFORT RECONCILIATION', '',
+        f'Current Snowflake dataset rows: {current.audit["data_rows"]:,}',
+        'Complete current CSV download check: PASSED (row count and single export marker)',
+        f'Project report rows: {len(projects)}; excluded item rows: {len(excluded)}',
+        f'Project statuses: {dict(Counter(row["status"] for row in projects))}',
+        f'Unique task keys in the 56-project union: {len(union):,}',
+        'Unique task effort hours in that union: ' + (union_total['hours'] or 'UNKNOWN'),
+        f'Tasks shared across missing project scopes: {details["tasks_shared_across_missing_project_scopes"]:,}', '']
+    for name, data in datasets.items():
+        total = data.total(data.tasks, data.unknown_identity_rows)
+        summary += [f'{name}: {data.audit["data_rows"]:,} rows; {len(data.tasks):,} unique mapped task keys; '
+                    f'recorded effort hours {total["hours"] or "UNKNOWN"}',
+                    '  Data refresh: ' + json.dumps(dict(data.refresh), ensure_ascii=False),
+                    f'  Ambiguous identity rows: {data.unknown_identity_rows:,}; unknown task effort: {total["unknown_effort_task_count"]:,}']
+    summary += ['', *skipped.values()]
+    for name, comparison in comparisons.items():
+        summary += ['', name, comparison['equation']]
+        for term, amount in comparison['partitions'].items():
+            summary.append(f'  {term}: {amount["hours"] or "UNKNOWN"} hours; {amount["task_count"]:,} tasks')
+        summary += ['  Arithmetic residual: ' + (comparison['arithmetic_residual_hours'] or 'UNKNOWN') + ' hours',
+                    '  Baseline minus (Akash + 56-project union): ' +
+                    (comparison['baseline_minus_Akash_minus_56_hours'] or 'UNKNOWN') + ' hours']
+    if not comparisons:
+        summary += ['', 'COMPARISONS SKIPPED: a valid saved Akash export was not available.']
+    summary += ['', *notes, '', 'Saved reports: ' + str(output)]
+    (output / 'effort_reconciliation_summary.txt').write_text('\n'.join(summary) + '\n', encoding='utf-8')
+    (output / 'effort_reconciliation_details.json').write_text(
+        json.dumps(details, indent=2, ensure_ascii=False, default=str) + '\n', encoding='utf-8')
+    print('\n'.join(summary), flush=True)
+
+
+if __name__ == '__main__':
     try:
-        evidence = resolve_file(args.evidence, root, "snowflake_effort_evidence.csv")
-        missing_path = resolve_file(args.missing, root, "missing_items.csv", Path(
-            "output/akash_comparison/20260925T002311_148327Z_73a909/"
-            "targeted_check_20260925T005523_170267Z/lookup_results.csv"))
-        if evidence == missing_path:
-            raise ValueError("Evidence and missing-items inputs must be different files")
-        print("Evidence: " + str(evidence), flush=True)
-        print("Missing list: " + str(missing_path), flush=True)
-        print("Reading local CSV files only; no token or network needed.", flush=True)
-        missing, missing_audit = read_missing(missing_path)
-        profile, project_rows = scan_evidence(evidence, missing)
-        profile["missing_input"] = missing_audit
-        out, summary = save_reports(root, profile, project_rows)
-        print("\nFull CSV check passed: {:,} data rows.".format(profile["source_row_count"]))
-        print("Missing list: {} items; {} confirmed projects.".format(
-            len(missing), sum(item["project"] for item in missing.values())))
-        print("Diagnostic reports saved to: " + str(out))
-        print("Share the small file: " + str(summary))
-        print("Final effort hours are not yet established. Do not send these diagnostics as final totals.")
-        return 0
-    except (ValueError, OSError, csv.Error, UnicodeError) as exc:
-        print("\nCHECK STOPPED: " + str(exc), file=sys.stderr)
-        print("No validated report was produced. Keep the original input CSVs unchanged.", file=sys.stderr)
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+        main()
+    except (ValueError, OSError, UnicodeError, csv.Error) as exc:
+        print('STOPPED: ' + str(exc), file=sys.stderr)
+        sys.exit(1)
