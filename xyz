@@ -1,1085 +1,603 @@
--- Wrike effort reconciliation: capture current Snowflake evidence.
--- Run this SELECT once and download the entire result as CSV.
--- Suggested filename: snowflake_effort_evidence_2026-09-29.csv
--- Keep the downloaded CSV unchanged; preserve raw numeric dates as text
--- when reading it in Python. Do not round dates through a spreadsheet.
---
--- This is a current snapshot, not the saved September 24 baseline.
--- evidence_exported_at is the query/export time; Data refresh is retained
--- separately. evidence_total_rows permits a full-download row-count check.
---
--- Preserve repeated, null, zero and placeholder rows for the audit.
--- The final metric, deduplication key, project attribution and reconciliation
--- must be established from these rows and the corresponding extraction code.
--- No effort fields are added together or converted to hours here.
-
-SELECT
-    CURRENT_TIMESTAMP() AS "evidence_exported_at",
-    COUNT(*) OVER () AS "evidence_total_rows",
-    w."Data refresh",
-    w."id",
-    w."key",
-    w."title",
-    w."is_project",
-    w."parent_folder_id",
-    w."child_folder_id",
-    w."grandchild_folder_id",
-    w."baby_folder_id",
-    w."grandbaby_folder_id",
-    w."parent_task_id",
-    w."child_task_id",
-    w."grandchild_task_id",
-    w."baby_task_id",
-    w."grandbaby_task_id",
-    w."great_grandbaby_task_id",
-    w."Owner_userid",
-    w."Responsible_userId",
-    w."effortAllocation_mode",
-    w."effortAllocation_totalEffort",
-    w."effortAllocation_dailyAllocationPercentage",
-    w."effortAllocation_allocatedEffort",
-    w."totalEffortMinutes",
-    w."owner_dailyAllocation",
-    w."owner_dailyAllocation_date",
-    w."owner_effortMinutes_per_day",
-    w."effort [days]",
-    w."total hours",
-    w."allocated hours",
-    w."booked effort",
-    w."forecasted hours"
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" AS w;
-
-
-
-SELECT
-    COLUMN_NAME,
-    DATA_TYPE
-FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
-WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-  AND TABLE_NAME = 'Wrike_STG'
-  AND (
-      COLUMN_NAME ILIKE '%effort%'
-      OR COLUMN_NAME ILIKE '%hour%'
-      OR COLUMN_NAME ILIKE '%allocat%'
-  )
-ORDER BY ORDINAL_POSITION;
-
-
-
-
-
-WITH unique_statuses AS (
-    SELECT DISTINCT
-        TRIM("WORKFLOW_STATUS") AS WORKFLOW_STATUS_NAME
-    FROM TABLE(RESULT_SCAN(LAST_QUERY_ID()))
-    WHERE NULLIF(TRIM("WORKFLOW_STATUS"), '') IS NOT NULL
-)
-SELECT
-    WORKFLOW_STATUS_NAME,
-    COUNT(*) OVER () AS TOTAL_UNIQUE_WORKFLOW_STATUSES
-FROM unique_statuses
-ORDER BY WORKFLOW_STATUS_NAME;
-
-
-
-
-
-
-
-
-
-WITH task_ids AS (
-    SELECT TRIM(task_id) AS task_id
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    UNPIVOT (
-        task_id FOR hierarchy_level IN (
-            "parent_task_id",
-            "child_task_id",
-            "grandchild_task_id",
-            "baby_task_id",
-            "grandbaby_task_id",
-            "great_grandbaby_task_id"
-        )
-    )
-)
-SELECT COUNT(DISTINCT task_id) AS UNIQUE_SNOWFLAKE_TASK_IDS
-FROM task_ids
-WHERE task_id <> ''
-  AND UPPER(task_id) <> 'PLACEHOLDER';
-
-
-
-
-
-
-WITH task_ids AS (
-    SELECT TRIM(task_id) AS task_id
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    UNPIVOT (
-        task_id FOR hierarchy_level IN (
-            "parent_task_id",
-            "child_task_id",
-            "grandchild_task_id",
-            "baby_task_id",
-            "grandbaby_task_id",
-            "great_grandbaby_task_id"
-        )
-    )
-)
-SELECT COUNT(DISTINCT task_id) AS UNIQUE_SNOWFLAKE_TASK_IDS
-FROM task_ids
-WHERE task_id <> ''
-  AND UPPER(task_id) <> 'PLACEHOLDER';
-
-
-
-
-
-
-
-WITH task_ids AS (
-    SELECT TRIM(task_id) AS task_id
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    UNPIVOT (
-        task_id FOR hierarchy_level IN (
-            "parent_task_id",
-            "child_task_id",
-            "grandchild_task_id",
-            "baby_task_id",
-            "grandbaby_task_id",
-            "great_grandbaby_task_id"
-        )
-    )
-)
-SELECT DISTINCT task_id AS TASK_ID
-FROM task_ids
-WHERE task_id <> ''
-  AND UPPER(task_id) <> 'PLACEHOLDER'
-ORDER BY TASK_ID;
-
-
-
-
-
-
-
-
-
-
-SELECT
-    ORDINAL_POSITION,
-    COLUMN_NAME,
-    DATA_TYPE
-FROM GBI_RETAIL_BAP_DB.INFORMATION_SCHEMA.COLUMNS
-WHERE TABLE_SCHEMA = 'ASO_OPS_WSA_SNDBX_BIZ_APP'
-  AND TABLE_NAME = 'Wrike_STG'
-  AND COLUMN_NAME ILIKE ANY (
-      '%status%',
-      '%state%',
-      '%stage%',
-      '%approval%',
-      '%health%',
-      '%custom%field%'
-  )
-ORDER BY ORDINAL_POSITION;
-
-
-
-
-
-
-
-
-
-
 #!/usr/bin/env python3
-"""Local, token-visible Wrike task snapshots, version 3. Python 3.9+.
+"""Profile saved Wrike effort evidence without uploading it or calling any API.
 
-Run: python3 wrike_task_snapshots.py capture
-All API requests are GET requests. No production or database writes.
+Run in ~/Desktop/wrike-local-baseline:
+    python3 check_wrike_effort.py
 
-Readable custom status and workflow names are accompanied by a workflow_statuses.csv
-catalog and unresolved_status_ids.csv. Labels are looked up after task capture
-from account workflows and workflows in all returned spaces (including archived
-spaces). Label lookup errors are reported separately from task capture errors.
-Raw status IDs remain the basis of comparison. Names alone do not imply a task
-transition. COMPLETE refers to task capture; workflow_lookup.status separately
-describes the label catalog. Both remain limited to this token's visibility.
+Optional paths:
+    python3 check_wrike_effort.py --evidence /path/to/snowflake_effort_evidence.csv \
+        --missing /path/to/missing_items.csv
 
-Version 3 provides general_status, workflow_status and task_updated_at as clear
-column names, while retaining the original columns. task_updated_at (updatedDate)
-is the TASK update time, not a status transition time. general_status_changed_at
-and workflow_status_changed_at remain blank: this capture has no verified source
-for exact status transition times. status_change_time_source explains why.
-The *_last_change_observed_at columns record when a comparison first detected a
-difference, not when the change happened. Baselines have no inferred change time.
-
-Also saves task creation/completion dates, scheduling type, importance, custom
-item type ID, raw custom fields, and any additional top-level status/state fields
-returned in the task object. These attributes are not automatically lifecycle
-statuses. Comparisons continue to use general status and raw custom status ID.
-Separate objects such as approvals and timelogs are outside this task snapshot.
-
-Reuse output/task_snapshots: version-1 and version-2 baselines are read without
-modifying them. Newly added source fields stay blank for old baselines; readable
-names absent from v1 are not backfilled with today's labels. Do not downgrade
-the script after saving a version-3 snapshot. No history is reconstructed.
-
-API references:
-https://developers.wrike.com/reference/gettasksempty
-https://developers.wrike.com/reference/getworkflowsempty
-https://developers.wrike.com/reference/getspacessingleworkflows
-https://developers.wrike.com/reference/gettasksmultitasks_history
+Python 3 standard library only. Input files are read-only. No credentials,
+extraction-script imports, network calls, or Snowflake connection are used.
+Outputs are diagnostic reports, NOT final project hours or a reconciliation.
+Dates and IDs stay as text. Null values do not become zero. Conflicting values
+at a candidate grain are reported, never resolved with MAX or SUM(DISTINCT).
 """
 
 import argparse
+import ast
 import csv
-import getpass
 import hashlib
-import io
 import json
-import os
-import random
 import re
 import sys
-import tempfile
-import time
-import uuid
-import warnings
-from contextlib import contextmanager
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
-from http.client import HTTPException
+from decimal import Decimal, InvalidOperation, getcontext
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
-from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-
-SCHEMA_VERSION = 3
-HOSTS = ("www.wrike.com", "app-eu.wrike.com")
-SCOPE = "account_tasks_including_subtasks_no_filters_v1"
-SNAPSHOT_FIELDS_V1 = [
-    "task_id", "title", "status", "custom_status_id", "observed_at",
-    "source_updated_at", "super_task_ids", "account_id", "run_id",
-]
-LABEL_FIELDS = ["custom_status_name", "workflow_id", "workflow_name",
-                "workflow_status_group", "status_name_resolution", "workflow_observed_at"]
-SNAPSHOT_FIELDS_V2 = SNAPSHOT_FIELDS_V1 + LABEL_FIELDS
-DETAIL_FIELDS = [
-    "general_status", "workflow_status", "task_updated_at",
-    "general_status_changed_at", "workflow_status_changed_at", "status_change_time_source",
-    "general_status_last_change_observed_at", "workflow_status_last_change_observed_at",
-    "task_created_at", "task_completed_at", "task_type", "importance",
-    "custom_item_type_id", "custom_fields_json", "additional_status_fields_json",
-]
-FRONT_FIELDS = ["task_id", "title", "general_status", "workflow_status", "custom_status_id",
-                "task_updated_at", "observed_at", "general_status_last_change_observed_at",
-                "workflow_status_last_change_observed_at"]
-SNAPSHOT_FIELDS = FRONT_FIELDS + [key for key in SNAPSHOT_FIELDS_V2 + DETAIL_FIELDS if key not in FRONT_FIELDS]
-SNAPSHOT_SCHEMAS = {1: SNAPSHOT_FIELDS_V1, 2: SNAPSHOT_FIELDS_V2, 3: SNAPSHOT_FIELDS}
-TASK_OPTIONAL_FIELDS = ["superTaskIds", "customItemTypeId", "customFields"]
-UNKNOWN_STATUS_TIME = "NOT_AVAILABLE_FROM_THIS_TASK_SNAPSHOT"
-# Custom fields can exceed Python's default 128 KiB CSV-cell limit.
+getcontext().prec = 60
 csv.field_size_limit(16 * 1024 * 1024)
-DIFF_FIELDS = [
-    "task_id", "previous_title", "current_title", "previous_status",
-    "current_status", "previous_custom_status_id", "current_custom_status_id",
-    "general_status_changed", "custom_status_changed", "custom_status_comparable",
-    "previous_observed_at", "current_observed_at", "previous_source_updated_at",
-    "current_source_updated_at", "previous_run_id", "current_run_id", "reason",
-]
-DIFF_FIELDS += [prefix + name for name in LABEL_FIELDS for prefix in ("previous_", "current_")]
-DIFF_FIELDS += [prefix + name for name in DETAIL_FIELDS for prefix in ("previous_", "current_")]
-VISIBILITY_FIELDS = SNAPSHOT_FIELDS + ["comparison_run_id", "reason"]
-CATALOG_FIELDS = ["workflow_id", "workflow_name", "custom_status_id", "custom_status_name",
-                  "workflow_status_group", "workflow_hidden", "status_hidden", "scope",
-                  "space_id", "workflow_observed_at"]
-UNRESOLVED_FIELDS = ["custom_status_id", "status_name_resolution", "task_count"]
-LIMITATIONS = [
-    "Coverage is limited to what this token's user can read in its current Wrike account.",
-    "COMPLETE means all returned pages were retrieved and validated; there is no independent total of accessible tasks.",
-    "A paginated scan is not an atomic view: tasks and permissions can change while pages are being read.",
-    "Missing means absent from this snapshot; it does not establish deletion.",
-    "Snapshots show differences between observations, not intervening transitions or their exact times.",
-    "Workflow labels are a separate lookup after task capture; their observation times may differ from task observation times.",
-    "The workflow catalog lists statuses returned for the account and visible spaces, not a task's past or mandatory future stages.",
-    "task_updated_at/source_updated_at is updatedDate for the entire task, not the last update time of a particular status or custom field.",
-    "Exact general/workflow status change times are unavailable in this capture; *_changed_at columns are blank. task_completed_at is retained separately, never substituted for them.",
-    "*_last_change_observed_at is the most recent detection time across successive complete snapshots with comparable values, not an exact event time. Baseline or visibility/coverage gaps leave it unknown.",
-    "Task type, importance and custom fields are attributes, not additional lifecycle statuses. Raw custom fields and additional top-level status/state fields are saved for inspection, not used as lifecycle transitions.",
-    "Approvals, timelogs and project records are separate objects and are not fetched by this task snapshot.",
-]
+NULLS = {"", "null", "none", "nan", "nat", "<na>", "\\n"}
+FOLDERS = ("parent_folder_id", "child_folder_id", "grandchild_folder_id",
+           "baby_folder_id", "grandbaby_folder_id")
+TASKS = ("parent_task_id", "child_task_id", "grandchild_task_id",
+         "baby_task_id", "grandbaby_task_id", "great_grandbaby_task_id")
+EFFORT = ("effortAllocation_totalEffort", "effortAllocation_dailyAllocationPercentage",
+          "effortAllocation_allocatedEffort", "totalEffortMinutes",
+          "owner_effortMinutes_per_day", "effort [days]", "total hours",
+          "allocated hours", "booked effort", "forecasted hours")
+NUMERIC = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\Z")
+DAILY = "owner_effortMinutes_per_day"
+OWNER_TOTAL = "totalEffortMinutes"
 
 
-class SnapshotError(Exception):
-    """Safe, non-secret diagnostic suitable for a summary or console."""
-
-    def __init__(self, message, http_status=None):
-        super().__init__(message)
-        self.http_status = http_status
+def clean(value):
+    return (value or "").strip()
 
 
-def utcnow():
-    return datetime.now(timezone.utc)
+def present(value):
+    return clean(value).lower() not in NULLS
 
 
-def timestamp(value):
-    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+def identifier(value):
+    value = clean(value)
+    return value if present(value) and value.upper() != "PLACEHOLDER" else ""
 
 
-def parse_timestamp(value):
+def number(value):
+    """No thousands-separator, percentage, time-string or locale guesses."""
+    value = clean(value)
+    if not present(value):
+        return "null", None
+    if len(value) > 100 or not NUMERIC.fullmatch(value):
+        return "invalid", None
     try:
-        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        if result.tzinfo is None:
-            raise ValueError("timezone required")
-        return result.astimezone(timezone.utc)
-    except (ValueError, TypeError, AttributeError) as exc:
-        raise SnapshotError("Invalid observation timestamp in previous snapshot.") from exc
+        result = Decimal(value)
+        if not result.is_finite() or (result and abs(result.adjusted()) > 30):
+            return "invalid", None
+        return "number", result
+    except InvalidOperation:
+        return "invalid", None
 
 
-def csv_encode(value):
-    """Reversible protection against spreadsheet formula interpretation."""
-    value = str(value)
-    if value.startswith(("'", "\t", "\r", "\n")) or value.lstrip().startswith(("=", "+", "-", "@")):
-        return "'" + value
-    return value
+def fmt(value):
+    return str(value) if value is not None else ""
 
 
-def csv_decode(value):
-    if value.startswith("'") and csv_encode(value[1:]) == value:
-        return value[1:]
-    return value
+def fingerprint(path):
+    stat = path.stat()
+    return stat.st_size, stat.st_mtime_ns, stat.st_ino
 
 
-def atomic_write(path, data):
-    path = Path(path)
-    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+def audit(path, before, rows):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    if fingerprint(path) != before:
+        raise ValueError("Input changed during the check: " + str(path))
+    return {"path": str(path), "bytes": before[0], "data_rows": rows,
+            "sha256": digest.hexdigest()}
 
 
-def write_json(path, value):
-    atomic_write(path, (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+def rows_from(path, required):
+    with path.open("r", encoding="utf-8-sig", newline="") as source:
+        reader = csv.DictReader(source, strict=True)
+        headers = reader.fieldnames or []
+        normalized = [clean(name) for name in headers]
+        if not normalized or "" in normalized or len(set(normalized)) != len(normalized):
+            raise ValueError(str(path) + ": empty, blank, or duplicate headers")
+        missing = sorted(set(required) - set(normalized))
+        if missing:
+            raise ValueError(str(path) + ": missing columns: " + ", ".join(missing))
+        reader.fieldnames = normalized
+        for row in reader:
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(str(path) + ": malformed CSV near line " + str(reader.line_num))
+            yield row
 
 
-def write_csv(path, fields, rows):
-    buffer = io.StringIO(newline="")
-    writer = csv.DictWriter(buffer, fieldnames=fields, lineterminator="\n")
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({key: csv_encode(row.get(key, "")) for key in fields})
-    atomic_write(path, buffer.getvalue().encode("utf-8"))
-
-
-@contextmanager
-def output_lock(output):
-    try:
-        import fcntl
-    except ImportError as exc:
-        raise SnapshotError("This script requires macOS or Linux for its local capture lock.") from exc
-    output.mkdir(parents=True, exist_ok=True)
-    with (output / "capture.lock").open("a+", encoding="utf-8") as stream:
-        try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise SnapshotError("Another capture is using this output folder. Let it finish first.") from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-
-
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-class WrikeClient:
-    def __init__(self, token, host="www.wrike.com", opener=None, sleep=time.sleep,
-                 now=utcnow, max_retries=6, pace=0.25):
-        if host not in HOSTS:
-            raise SnapshotError("Unsupported API host.")
-        if not token or any(character.isspace() for character in token):
-            raise SnapshotError("Enter a nonempty token without whitespace.")
-        self._token = token
-        self.host = host
-        self.opener = opener or build_opener(NoRedirect())
-        self.sleep = sleep
-        self.now = now
-        self.max_retries = max_retries
-        self.pace = pace
-        self.events = []
-        self.log_path = None
-
-    def log(self, event):
-        event = dict(event, at=timestamp(self.now()))
-        self.events.append(event)
-        if self.log_path:
-            with Path(self.log_path).open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(event, sort_keys=True) + "\n")
-                stream.flush()
-
-    def retry_delay(self, retry_after, attempt):
-        server_delay = None
-        if retry_after:
-            try:
-                server_delay = float(retry_after)
-            except (TypeError, ValueError):
-                try:
-                    date = parsedate_to_datetime(retry_after)
-                    if date.tzinfo is None:
-                        date = date.replace(tzinfo=timezone.utc)
-                    server_delay = (date - self.now()).total_seconds()
-                except (TypeError, ValueError, OverflowError):
-                    pass
-        if server_delay is not None and server_delay >= 0:
-            if server_delay > 300:
-                raise SnapshotError("Wrike requested a Retry-After delay longer than 300 seconds; retry this capture later.")
-            return max(server_delay, 1.0)
-        return min(120.0, 5.0 * (2 ** attempt)) + random.uniform(0, 1)
-
-    def get(self, endpoint, params=None):
-        space_workflows = re.fullmatch(r"/spaces/[A-Za-z0-9_.:%=-]+/workflows", endpoint)
-        if endpoint not in ("/account", "/contacts", "/tasks", "/workflows", "/spaces") and not space_workflows:
-            raise SnapshotError("Unsupported read endpoint.")
-        query = "?" + urlencode(params) if params else ""
-        request = Request(
-            "https://" + self.host + "/api/v4" + endpoint + query,
-            headers={"Authorization": "Bearer " + self._token, "Accept": "application/json"},
-            method="GET",
-        )
-        for attempt in range(self.max_retries + 1):
-            if self.pace:
-                self.sleep(self.pace)
-            event = {"endpoint": endpoint, "attempt": attempt + 1}
-            retry_after = None
-            try:
-                with self.opener.open(request, timeout=90) as response:
-                    status = response.getcode()
-                    raw = response.read(64 * 1024 * 1024 + 1)
-                if status != 200:
-                    self.log(dict(event, http_status=status, outcome="unexpected_response"))
-                    raise SnapshotError("Wrike returned an unexpected HTTP response.")
-                if len(raw) > 64 * 1024 * 1024:
-                    self.log(dict(event, http_status=status, outcome="oversized_response"))
-                    raise SnapshotError("Wrike response exceeded the 64 MiB page limit; capture is incomplete.")
-                try:
-                    value = json.loads(raw)
-                    if not isinstance(value, dict):
-                        raise ValueError("object required")
-                except (ValueError, UnicodeError) as exc:
-                    self.log(dict(event, http_status=status, outcome="invalid_json"))
-                    raise SnapshotError("Wrike returned invalid JSON; capture is incomplete.") from exc
-                self.log(dict(event, http_status=status, outcome="success"))
-                return value
-            except HTTPError as exc:
-                status = exc.code
-                retry_after = exc.headers.get("Retry-After") if exc.headers else None
-                exc.close()
-                event.update(http_status=status, outcome="http_error")
-                retryable = status in (429, 500, 502, 503, 504)
-                message = "Wrike HTTP %s on %s." % (status, endpoint)
-                if status in (401, 403):
-                    message += " Check token validity, account host and read permissions."
-                elif status == 429:
-                    message += " Rate limiting persisted; retry later."
-            except (URLError, TimeoutError, ConnectionError, OSError, HTTPException):
-                # Deliberately do not log str(exc), URLs, headers or response bodies.
-                event.update(outcome="network_error")
-                status = None
-                retryable = True
-                message = "Network request failed on " + endpoint + "."
-            if not retryable or attempt >= self.max_retries:
-                self.log(event)
-                raise SnapshotError(message, http_status=status)
-            try:
-                delay = self.retry_delay(retry_after, attempt)
-            except SnapshotError as exc:
-                self.log(dict(event, outcome=event["outcome"] + "_retry_deferred"))
-                exc.http_status = status
-                raise
-            self.log(dict(event, retry_in_seconds=round(delay, 3)))
-            print("%s Retrying in %.1f seconds." % (message, delay), file=sys.stderr, flush=True)
-            self.sleep(delay)
-        raise SnapshotError("Request retry limit reached.")
-
-
-def only_identity(response, label):
-    records = response.get("data")
-    if not isinstance(records, list) or len(records) != 1 or not isinstance(records[0], dict):
-        raise SnapshotError("Could not establish a single " + label + " for comparison.")
-    identity = records[0].get("id")
-    if not isinstance(identity, str) or not identity or identity != identity.strip():
-        raise SnapshotError("Wrike returned an invalid " + label + " ID.")
-    return identity
-
-
-def fetch_identity(client):
-    return {
-        "account_id": only_identity(client.get("/account"), "account"),
-        "user_id": only_identity(client.get("/contacts", {"me": "true"}), "requesting user"),
-        "host": client.host,
-        "scope": SCOPE,
-    }
-
-
-def catalog_records(response, scope, space_id, observed_at):
-    """Parse one workflow response completely before admitting its entries."""
-    if response.get("kind") != "workflows" or not isinstance(response.get("data"), list):
-        raise SnapshotError("Workflow response has an invalid kind or data collection.")
-    if response.get("nextPageToken"):
-        raise SnapshotError("Workflow response unexpectedly indicates more pages; catalog coverage is incomplete.")
-    records, workflow_ids = [], set()
-    for workflow in response["data"]:
-        if not isinstance(workflow, dict):
-            raise SnapshotError("Invalid workflow object in catalog.")
-        workflow_id, name = workflow.get("id"), workflow.get("name")
-        statuses = workflow.get("customStatuses")
-        if not isinstance(workflow_id, str) or not workflow_id.strip() or not isinstance(name, str) or not name.strip():
-            raise SnapshotError("Workflow catalog contains a missing ID or name.")
-        if not isinstance(statuses, list):
-            raise SnapshotError("Workflow catalog contains an invalid customStatuses list.")
-        workflow_ids.add(workflow_id)
-        for status in statuses:
-            if not isinstance(status, dict):
-                raise SnapshotError("Invalid custom status object in catalog.")
-            status_id, status_name = status.get("id"), status.get("name")
-            group = status.get("group", "")
-            if not isinstance(status_id, str) or not status_id.strip() or not isinstance(status_name, str) or not status_name.strip():
-                raise SnapshotError("Workflow catalog contains a missing custom status ID or name.")
-            if not isinstance(group, str):
-                raise SnapshotError("Workflow catalog contains an invalid status group.")
-            def boolean_text(value):
-                if value is None:
-                    return ""
-                if not isinstance(value, bool):
-                    raise SnapshotError("Workflow catalog contains an invalid hidden flag.")
-                return str(value).lower()
-            records.append({
-                "workflow_id": workflow_id, "workflow_name": name,
-                "custom_status_id": status_id, "custom_status_name": status_name,
-                "workflow_status_group": group,
-                "workflow_hidden": boolean_text(workflow.get("hidden")),
-                "status_hidden": boolean_text(status.get("hidden")),
-                "scope": scope, "space_id": space_id, "workflow_observed_at": observed_at,
-            })
-    return records, workflow_ids
-
-
-def fetch_workflow_catalog(client, now=utcnow):
-    catalog, workflow_ids = [], set()
-    report = {"status": "COMPLETE", "errors": [], "spaces_returned": 0,
-              "space_lookups_attempted": 0, "space_lookups_succeeded": 0,
-              "account_lookup_succeeded": False}
-
-    def record_error(endpoint, exc):
-        report["errors"].append({"endpoint": endpoint, "message": str(exc), "http_status": exc.http_status})
-        report["status"] = "PARTIAL"
-
-    def read_workflows(endpoint, scope, space_id=""):
-        response = client.get(endpoint)
-        records, ids = catalog_records(response, scope, space_id, timestamp(now()))
-        catalog.extend(records)
-        workflow_ids.update(ids)
-
-    try:
-        read_workflows("/workflows", "ACCOUNT")
-        report["account_lookup_succeeded"] = True
-    except SnapshotError as exc:
-        record_error("/workflows", exc)
-        # Do not continue hammering the API after exhausted rate/server retries.
-        if exc.http_status == 401 or exc.http_status == 429 or (exc.http_status and exc.http_status >= 500):
-            report["remaining_lookups_skipped"] = True
-            return catalog, report
-    try:
-        response = client.get("/spaces", {"withArchived": "true"})
-        spaces = response.get("data")
-        if response.get("kind") != "spaces" or not isinstance(spaces, list) or response.get("nextPageToken"):
-            raise SnapshotError("Space response is invalid or unexpectedly paginated; space workflow coverage is incomplete.")
-        space_ids = set()
-        for space in spaces:
-            space_id = space.get("id") if isinstance(space, dict) else None
-            if not isinstance(space_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:=\-]{1,256}", space_id):
-                raise SnapshotError("Space response contains an invalid space ID.")
-            space_ids.add(space_id)
-        report["spaces_returned"] = len(space_ids)
-    except SnapshotError as exc:
-        record_error("/spaces", exc)
-        space_ids = set()
-    for number, space_id in enumerate(sorted(space_ids), 1):
-        endpoint = "/spaces/" + quote(space_id, safe="") + "/workflows"
-        report["space_lookups_attempted"] += 1
-        try:
-            read_workflows(endpoint, "SPACE", space_id)
-            report["space_lookups_succeeded"] += 1
-        except SnapshotError as exc:
-            record_error(endpoint, exc)
-            if exc.http_status == 401 or exc.http_status == 429 or (exc.http_status and exc.http_status >= 500):
-                report["remaining_lookups_skipped"] = number < len(space_ids)
-                break
-        print("Workflow lookup: space %d of %d." % (number, len(space_ids)), flush=True)
-    # Preserve conflicting entries so the mapper can reject ambiguity; remove exact duplicates.
-    unique = {tuple(row[key] for key in CATALOG_FIELDS if key != "workflow_observed_at"): row for row in catalog}
-    catalog = sorted(unique.values(), key=lambda row: (row["workflow_id"], row["custom_status_id"], row["scope"], row["space_id"]))
-    report["workflow_count"] = len(workflow_ids)
-    report["custom_status_id_count"] = len({row["custom_status_id"] for row in catalog})
-    report["distinct_status_name_count"] = len({row["custom_status_name"] for row in catalog})
-    return catalog, report
-
-
-def add_workflow_labels(rows, catalog):
-    lookup, conflicts = {}, set()
-    identity_fields = ("workflow_id", "workflow_name", "custom_status_name", "workflow_status_group")
-    for entry in catalog:
-        status_id = entry["custom_status_id"]
-        if status_id in lookup and any(lookup[status_id][key] != entry[key] for key in identity_fields):
-            conflicts.add(status_id)
-        lookup[status_id] = entry
-    unresolved = {}
-    resolved_count = 0
-    for row in rows.values():
-        for key in LABEL_FIELDS:
-            row[key] = ""
-        status_id = row["custom_status_id"]
-        if not status_id:
-            resolution = "MISSING_CUSTOM_STATUS_ID"
-        elif status_id in conflicts:
-            resolution = "CONFLICTING_CATALOG_ENTRIES"
-        elif status_id not in lookup:
-            resolution = "UNRESOLVED_ID"
-        else:
-            entry = lookup[status_id]
-            for key in LABEL_FIELDS:
-                if key != "status_name_resolution":
-                    row[key] = entry[key]
-            resolution = "MATCHED"
-            if row["workflow_status_group"] and row["workflow_status_group"] != row["status"]:
-                resolution = "GROUP_MISMATCH"
-            else:
-                resolved_count += 1
-        row["status_name_resolution"] = resolution
-        if resolution != "MATCHED":
-            key = (status_id, resolution)
-            unresolved[key] = unresolved.get(key, 0) + 1
-    output = [{"custom_status_id": key[0], "status_name_resolution": key[1], "task_count": count}
-              for key, count in sorted(unresolved.items())]
-    return output, resolved_count, len(conflicts)
-
-
-def task_row(record, observed_at, account_id, run_id):
-    if not isinstance(record, dict):
-        raise SnapshotError("Wrike returned a task that is not an object.")
-    task_id, title, status = record.get("id"), record.get("title"), record.get("status")
-    if not isinstance(task_id, str) or not task_id or task_id != task_id.strip():
-        raise SnapshotError("Wrike returned a task without a valid ID.")
-    if not isinstance(title, str) or not isinstance(status, str) or not status.strip():
-        raise SnapshotError("Wrike returned a task without a title or current status.")
-    custom_status = record.get("customStatusId")
-    updated = record.get("updatedDate")
-    custom_status = "" if custom_status is None else custom_status
-    updated = "" if updated is None else updated
-    parents = record.get("superTaskIds")
-    if not isinstance(custom_status, str) or not isinstance(updated, str):
-        raise SnapshotError("Wrike returned an invalid custom status or update timestamp.")
-    if parents is not None and (not isinstance(parents, list) or
-                                any(not isinstance(parent, str) or not parent for parent in parents)):
-        raise SnapshotError("Wrike returned invalid superTaskIds.")
-    if record.get("accountId") not in (None, account_id):
-        raise SnapshotError("A task belongs to a different account; capture stopped.")
-    def optional_text(mapping, key):
-        value = mapping.get(key)
-        if value is None:
-            return ""
-        if not isinstance(value, str):
-            raise SnapshotError("Wrike returned an invalid task attribute: " + key + ".")
-        return value
-
-    dates = record.get("dates")
-    if dates is not None and not isinstance(dates, dict):
-        raise SnapshotError("Wrike returned invalid task dates.")
-    custom_fields = record.get("customFields")
-    if custom_fields is not None and (not isinstance(custom_fields, list) or
-                                      any(not isinstance(field, dict) for field in custom_fields)):
-        raise SnapshotError("Wrike returned invalid task customFields.")
-    # Preserve additional status-bearing fields exactly, without guessing their
-    # meaning or manufacturing field-specific timestamps from task updatedDate.
-    extra_status_fields = {key: value for key, value in record.items()
-                           if key not in ("status", "customStatusId") and
-                           ("status" in key.lower() or "state" in key.lower())}
-    row = {
-        "task_id": task_id, "title": title, "status": status,
-        "custom_status_id": custom_status, "observed_at": observed_at,
-        "source_updated_at": updated,
-        "super_task_ids": json.dumps(sorted(set(parents)), separators=(",", ":")) if parents is not None else "",
-        "account_id": account_id, "run_id": run_id,
-        "general_status": status, "workflow_status": "", "task_updated_at": updated,
-        "general_status_changed_at": "", "workflow_status_changed_at": "",
-        "status_change_time_source": UNKNOWN_STATUS_TIME,
-        "general_status_last_change_observed_at": "", "workflow_status_last_change_observed_at": "",
-        "task_created_at": optional_text(record, "createdDate"),
-        "task_completed_at": optional_text(record, "completedDate"),
-        "task_type": optional_text(dates or {}, "type"),
-        "importance": optional_text(record, "importance"),
-        "custom_item_type_id": optional_text(record, "customItemTypeId"),
-        "custom_fields_json": json.dumps(custom_fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if custom_fields is not None else "",
-        "additional_status_fields_json": json.dumps(extra_status_fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-    }
-    return row
-
-
-def add_observed_change_times(previous, current):
-    """Keep detection times separate for general status and raw custom status ID.
-
-    A same-value rerun cannot prove the value was constant between observations.
-    Loss of visibility or custom-ID coverage resets the relevant detection time.
-    """
-    for task_id, row in current.items():
-        row["workflow_status"] = row.get("custom_status_name", "")
-        old = previous.get(task_id)
-        for value_key, time_key in (
-            ("status", "general_status_last_change_observed_at"),
-            ("custom_status_id", "workflow_status_last_change_observed_at"),
-        ):
-            row[time_key] = ""
-            if not old or not old.get(value_key) or not row.get(value_key):
-                continue
-            row[time_key] = (row["observed_at"] if old[value_key] != row[value_key]
-                             else old.get(time_key, ""))
-
-
-def collect_tasks(client, identity, run_id, rows, stats, now=utcnow):
-    params = {"pageSize": 1000, "subTasks": "true",
-              "fields": json.dumps(TASK_OPTIONAL_FIELDS, separators=(",", ":"))}
-    tokens = set()
-    while True:
-        response = client.get("/tasks", params)
-        observed_at = timestamp(now())
-        data = response.get("data")
-        if response.get("kind") != "tasks" or not isinstance(data, list):
-            raise SnapshotError("Wrike task response has an invalid kind or data collection.")
-        stats["pages_received"] += 1
-        stats["records_received"] += len(data)
-        before = len(rows)
-        for record in data:
-            row = task_row(record, observed_at, identity["account_id"], run_id)
-            old = rows.get(row["task_id"])
-            if old:
-                stats["duplicate_records"] += 1
-                if (old["status"], old["custom_status_id"]) != (row["status"], row["custom_status_id"]):
-                    stats["conflicting_duplicate_records"] += 1
-                    raise SnapshotError("A duplicate task ID had different statuses within this scan; retry for a consistent snapshot.")
-            # Deduplicate by the exact opaque ID, keeping the last observation.
-            rows[row["task_id"]] = row
-        print("Tasks: page %d, %d unique IDs (%d duplicate records)." % (
-            stats["pages_received"], len(rows), stats["duplicate_records"]), flush=True)
-        token = response.get("nextPageToken")
-        if token is None or token == "":
-            break
-        if not isinstance(token, str) or not token.strip():
-            raise SnapshotError("Wrike returned an invalid nextPageToken.")
-        if token in tokens:
-            raise SnapshotError("Wrike repeated a nextPageToken; capture is incomplete.")
-        if not data or len(rows) == before:
-            raise SnapshotError("Pagination made no progress while more pages were indicated; capture is incomplete.")
-        tokens.add(token)
-        params = dict(params, nextPageToken=token)
-
-
-def previous_complete(output):
-    candidates = []
-    for path in (output / "runs").glob("*/summary.json"):
-        try:
-            manifest = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise SnapshotError("An existing run summary is unreadable; check the local runs folder before continuing.") from exc
-        if not isinstance(manifest, dict) or manifest.get("status") not in ("RUNNING", "INCOMPLETE", "COMPLETE"):
-            raise SnapshotError("An existing run summary has an invalid status.")
-        if manifest["status"] != "COMPLETE":
-            continue
-        if manifest.get("schema_version") not in SNAPSHOT_SCHEMAS or manifest.get("csv_encoding") != "apostrophe_v1":
-            raise SnapshotError("A completed snapshot uses an unsupported schema or CSV encoding.")
-        candidates.append((parse_timestamp(manifest.get("finished_at")), path, manifest))
-    if not candidates:
-        return None, {}
-    _, summary_path, manifest = max(candidates, key=lambda entry: (entry[0], str(entry[1])))
-    try:
-        name = manifest["files"]["snapshot"]
-        if not isinstance(name, str) or Path(name).name != name or not name.endswith(".csv"):
-            raise SnapshotError("Invalid previous snapshot filename.")
-        snapshot_path = summary_path.parent / name
-        if snapshot_path.resolve().parent != summary_path.parent.resolve():
-            raise SnapshotError("Previous snapshot is outside its run folder.")
-        data = snapshot_path.read_bytes()
-        if hashlib.sha256(data).hexdigest() != manifest["snapshot_sha256"]:
-            raise SnapshotError("The previous complete snapshot was edited or corrupted; its checksum does not match.")
-        reader = csv.DictReader(io.StringIO(data.decode("utf-8"), newline=""))
-        expected_fields = SNAPSHOT_SCHEMAS[manifest["schema_version"]]
-        if reader.fieldnames != expected_fields:
-            raise SnapshotError("Previous snapshot columns do not match this script.")
-        rows = {}
-        for raw in reader:
-            if None in raw or any(value is None for value in raw.values()):
-                raise SnapshotError("Previous snapshot has a malformed CSV row.")
-            row = {key: csv_decode(value) for key, value in raw.items()}
-            if manifest["schema_version"] == 1:
-                row.update({key: "" for key in LABEL_FIELDS})
-                row["status_name_resolution"] = "NOT_CAPTURED_V1"
-            if manifest["schema_version"] < 3:
-                row.update({key: "" for key in DETAIL_FIELDS})
-                # Aliases of fields actually captured then; no historical lookup.
-                row["general_status"] = row["status"]
-                row["workflow_status"] = row["custom_status_name"]
-                row["task_updated_at"] = row["source_updated_at"]
-                row["status_change_time_source"] = UNKNOWN_STATUS_TIME
-            task_id = row["task_id"]
-            if not task_id or task_id in rows or not row["status"]:
-                raise SnapshotError("Previous snapshot has invalid or duplicate task IDs or missing statuses.")
-            if row["run_id"] != manifest["run_id"] or row["account_id"] != manifest["identity"]["account_id"]:
-                raise SnapshotError("Previous snapshot identity does not match its summary.")
-            parse_timestamp(row["observed_at"])
-            for key in ("general_status_last_change_observed_at", "workflow_status_last_change_observed_at"):
-                if row[key] and parse_timestamp(row[key]) > parse_timestamp(row["observed_at"]):
-                    raise SnapshotError("Previous snapshot has a status detection time later than its observation.")
-            rows[task_id] = row
-        if len(rows) != manifest["counts"]["unique_tasks"]:
-            raise SnapshotError("Previous snapshot row count does not match its summary.")
-    except (KeyError, OSError, UnicodeError, csv.Error, TypeError) as exc:
-        raise SnapshotError("Could not validate the previous complete snapshot; no new baseline will be committed.") from exc
-    return manifest, rows
-
-
-def compare(previous, current, previous_run_id, current_run_id, first_baseline=False):
-    changes, coverage, newly_visible, missing = [], [], [], []
-    for task_id in sorted(current.keys() - previous.keys()):
-        newly_visible.append(dict(current[task_id], comparison_run_id=current_run_id,
-                                  reason="FIRST_BASELINE" if first_baseline else "NEWLY_VISIBLE_NOT_NECESSARILY_NEW"))
-    for task_id in sorted(previous.keys() - current.keys()):
-        missing.append(dict(previous[task_id], comparison_run_id=current_run_id,
-                            reason="NOT_IN_CURRENT_SNAPSHOT_CAUSE_UNKNOWN"))
-    for task_id in sorted(previous.keys() & current.keys()):
-        old, new = previous[task_id], current[task_id]
-        general_changed = old["status"] != new["status"]
-        comparable = bool(old["custom_status_id"] and new["custom_status_id"])
-        custom_changed = comparable and old["custom_status_id"] != new["custom_status_id"]
-        row = {
-            "task_id": task_id,
-            "general_status_changed": str(general_changed).lower(),
-            "custom_status_changed": str(custom_changed).lower(),
-            "custom_status_comparable": str(comparable).lower(),
-            "previous_run_id": previous_run_id, "current_run_id": current_run_id,
-        }
-        for key in ("title", "status", "custom_status_id", "observed_at", "source_updated_at"):
-            row["previous_" + key] = old[key]
-            row["current_" + key] = new[key]
-        for key in LABEL_FIELDS + DETAIL_FIELDS:
-            row["previous_" + key] = old.get(key, "")
-            row["current_" + key] = new.get(key, "")
-        if general_changed or custom_changed:
-            changes.append(dict(row, reason="STATUS_DIFFERED_BETWEEN_OBSERVATIONS"))
-        if bool(old["custom_status_id"]) != bool(new["custom_status_id"]):
-            reason = "CUSTOM_STATUS_BECAME_AVAILABLE" if new["custom_status_id"] else "CUSTOM_STATUS_NO_LONGER_AVAILABLE"
-            coverage.append(dict(row, reason=reason))
-    return {"status_changes": changes, "newly_visible": newly_visible,
-            "missing_from_current": missing, "status_coverage_changes": coverage}
-
-
-def capture(output, client, now=utcnow):
-    output = Path(output).expanduser().resolve()
-    with output_lock(output):
-        started = now()
-        run_id = started.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "_" + uuid.uuid4().hex[:8]
-        run_dir = output / "runs" / run_id
-        run_dir.mkdir(parents=True)
-        client.log_path = run_dir / "requests.jsonl"
-        stats = {"pages_received": 0, "records_received": 0, "duplicate_records": 0,
-                 "conflicting_duplicate_records": 0}
-        rows = {}
-        manifest = {
-            "schema_version": SCHEMA_VERSION, "csv_encoding": "apostrophe_v1",
-            "status": "RUNNING", "run_id": run_id, "started_at": timestamp(started),
-            "finished_at": None, "identity": None, "previous_run_id": None,
-            "counts": stats, "files": {"request_log": "requests.jsonl"},
-            "errors": [], "warnings": [], "limitations": LIMITATIONS,
-            "timestamp_semantics": {
-                "task_updated_at": "Wrike task updatedDate; alias of source_updated_at, NOT a per-status timestamp.",
-                "observed_at": "UTC time the task page was received; covers the task's general status, custom status ID and other returned attributes.",
-                "workflow_observed_at": "UTC time the workflow definition was fetched for name resolution, NOT the task's status change time.",
-                "general_status_changed_at": "Unknown: blank, never inferred from task updatedDate or completedDate.",
-                "workflow_status_changed_at": "Unknown: blank, never inferred from task updatedDate or completedDate.",
-                "last_change_observed_at": "Most recent comparison detection time for that status within consecutive comparable observations; blank on baseline or after coverage gaps.",
-                "task_created_at": "Wrike createdDate as returned, if available.",
-                "task_completed_at": "Wrike completedDate as returned, if available; retained separately from status-change timestamps.",
-            },
-            "captured_attribute_scope": "Task objects from /tasks plus workflow definitions. Raw customFields and extra top-level status/state keys are retained; separate approvals, timelogs and projects are not queried.",
-            "task_optional_fields": TASK_OPTIONAL_FIELDS,
-        }
-        write_json(run_dir / "summary.json", manifest)
-        try:
-            previous_manifest, previous_rows = previous_complete(output)
-            if previous_manifest and parse_timestamp(previous_manifest["finished_at"]) > started:
-                raise SnapshotError("The previous run is dated in the future; correct the computer clock before capturing.")
-            manifest["previous_run_id"] = previous_manifest["run_id"] if previous_manifest else None
-            identity = fetch_identity(client)
-            manifest["identity"] = identity
-            if previous_manifest and previous_manifest["identity"] != identity:
-                raise SnapshotError("Account, requesting user, host or capture scope differs from the previous baseline. Use a separate --output folder for a different identity.")
-            collect_tasks(client, identity, run_id, rows, stats, now=now)
-            manifest["task_capture_finished_at"] = timestamp(now())
-            print("Task capture finished. Looking up account and space workflow labels...", flush=True)
-            catalog, label_report = fetch_workflow_catalog(client, now=now)
-            unresolved, resolved_count, conflict_count = add_workflow_labels(rows, catalog)
-            add_observed_change_times(previous_rows, rows)
-            manifest["workflow_lookup"] = label_report
-            label_report["conflicting_custom_status_ids"] = conflict_count
-            if conflict_count:
-                label_report["status"] = "PARTIAL"
-                manifest["warnings"].append("Conflicting workflow catalog entries were not used to label tasks.")
-            stats["tasks_with_resolved_workflow_status"] = resolved_count
-            stats["tasks_with_unresolved_workflow_status"] = len(rows) - resolved_count
-            if label_report["status"] != "COMPLETE":
-                manifest["warnings"].append("Workflow catalog lookup is PARTIAL. Task capture and raw-ID comparisons remain valid; see workflow_lookup.errors.")
-            if unresolved:
-                manifest["warnings"].append("Some workflow labels are unresolved or inconsistent; see unresolved_status_ids.csv. Raw task statuses and custom status IDs are retained.")
-            write_csv(run_dir / "workflow_statuses.csv", CATALOG_FIELDS, catalog)
-            manifest["files"]["workflow_statuses"] = "workflow_statuses.csv"
-            write_csv(run_dir / "unresolved_status_ids.csv", UNRESOLVED_FIELDS, unresolved)
-            manifest["files"]["unresolved_status_ids"] = "unresolved_status_ids.csv"
-            result = compare(previous_rows, rows, manifest["previous_run_id"], run_id,
-                             first_baseline=previous_manifest is None)
-            snapshot_name = "tasks_" + run_id + ".csv"
-            write_csv(run_dir / snapshot_name, SNAPSHOT_FIELDS, (rows[key] for key in sorted(rows)))
-            manifest["files"]["snapshot"] = snapshot_name
-            manifest["snapshot_sha256"] = hashlib.sha256((run_dir / snapshot_name).read_bytes()).hexdigest()
-            for name, records in result.items():
-                fields = DIFF_FIELDS if name in ("status_changes", "status_coverage_changes") else VISIBILITY_FIELDS
-                write_csv(run_dir / (name + ".csv"), fields, records)
-                manifest["files"][name] = name + ".csv"
-                stats[name] = len(records)
-            common = previous_rows.keys() & rows.keys()
-            stats["compared_tasks"] = len(common)
-            stats["no_status_difference_observed"] = len(common) - len(result["status_changes"])
-            stats["common_tasks_without_comparable_custom_status"] = sum(
-                not (previous_rows[key]["custom_status_id"] and rows[key]["custom_status_id"]) for key in common)
-            stats["tasks_without_custom_status_id"] = sum(not row["custom_status_id"] for row in rows.values())
-            stats["tasks_without_task_updated_at"] = sum(not row["task_updated_at"] for row in rows.values())
-            stats["tasks_without_custom_fields_metadata"] = sum(row["custom_fields_json"] == "" for row in rows.values())
-            stats["tasks_with_additional_status_fields"] = sum(row["additional_status_fields_json"] != "{}" for row in rows.values())
-            stats["tasks_with_exact_general_status_change_time"] = 0
-            stats["tasks_with_exact_workflow_status_change_time"] = 0
-            if stats["tasks_without_task_updated_at"]:
-                manifest["warnings"].append("Some tasks have no updatedDate; their task_updated_at is blank.")
-            if stats["tasks_without_custom_fields_metadata"]:
-                manifest["warnings"].append("Some task responses omitted customFields despite the request. Blank means not returned; [] means an empty returned list.")
-            stats["tasks_with_super_task_ids"] = sum(row["super_task_ids"] not in ("", "[]") for row in rows.values())
-            stats["tasks_without_subtask_metadata"] = sum(row["super_task_ids"] == "" for row in rows.values())
-            if stats["tasks_without_custom_status_id"]:
-                manifest["warnings"].append("Some tasks have no custom status ID; changes within the same general status may be unobservable for them.")
-            if not rows:
-                manifest["warnings"].append("Wrike returned zero tasks. Verify this token's account and task visibility before interpreting missing tasks.")
-            if previous_rows and len(result["missing_from_current"]) > 0:
-                manifest["warnings"].append("Some prior tasks are absent. Visibility, permissions, deletion or changes during scanning may be involved; the cause is unknown.")
-            if stats["duplicate_records"]:
-                manifest["warnings"].append("Duplicate task IDs were returned and deduplicated. The scan is not atomic.")
-            manifest["baseline"] = previous_manifest is None
-            manifest["status"] = "COMPLETE"
-        except (SnapshotError, OSError, KeyboardInterrupt) as exc:
-            manifest["status"] = "INCOMPLETE"
-            error = str(exc) if isinstance(exc, SnapshotError) else (
-                "Capture interrupted by user." if isinstance(exc, KeyboardInterrupt) else "Local file operation failed; check available disk space and folder permissions.")
-            manifest["errors"].append(error)
-            # Do not leave a failed run's comparison files looking usable.
-            for key, name in list(manifest["files"].items()):
-                if key != "request_log":
-                    try:
-                        (run_dir / name).unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    del manifest["files"][key]
-            manifest.pop("snapshot_sha256", None)
-            if rows:
-                partial_name = "partial_tasks_" + run_id + ".csv"
-                write_csv(run_dir / partial_name, SNAPSHOT_FIELDS, (rows[key] for key in sorted(rows)))
-                manifest["files"]["partial_snapshot"] = partial_name
-        stats["unique_tasks"] = len(rows)
-        stats["requests_attempted"] = len(client.events)
-        stats["failed_request_attempts"] = sum(event.get("outcome") != "success" for event in client.events)
-        stats["retries_scheduled"] = sum("retry_in_seconds" in event for event in client.events)
-        if stats["failed_request_attempts"] and manifest["status"] == "COMPLETE":
-            if manifest.get("workflow_lookup", {}).get("errors"):
-                manifest["warnings"].append("API failures are logged in requests.jsonl; unresolved workflow lookup errors are listed separately in this summary.")
-            else:
-                manifest["warnings"].append("Some API requests failed but recovered through retries; see requests.jsonl.")
-        manifest["finished_at"] = timestamp(now())
-        # The COMPLETE manifest is the commit marker. Only committed runs are future baselines.
-        write_json(run_dir / "summary.json", manifest)
-        return manifest, run_dir
-
-
-def print_result(manifest, run_dir):
-    counts = manifest["counts"]
-    print("\n%s | %d unique tasks | %d pages | %d duplicate records" % (
-        manifest["status"], counts["unique_tasks"], counts["pages_received"], counts["duplicate_records"]))
-    print("Failed API attempts: %d | retries scheduled: %d" % (
-        counts["failed_request_attempts"], counts["retries_scheduled"]))
-    if manifest["status"] == "COMPLETE":
-        print("First baseline." if manifest["baseline"] else "Compared with: " + manifest["previous_run_id"])
-        print("Status differences: %d | newly visible: %d | missing: %d | custom-status coverage differences: %d" % (
-            counts["status_changes"], counts["newly_visible"], counts["missing_from_current"], counts["status_coverage_changes"]))
-        labels = manifest["workflow_lookup"]
-        print("Workflow catalog: %s | %d workflows | %d custom status IDs | %d distinct status names" % (
-            labels["status"], labels.get("workflow_count", 0), labels.get("custom_status_id_count", 0),
-            labels.get("distinct_status_name_count", 0)))
-        print("Tasks with resolved workflow status: %d | unresolved or inconsistent: %d" % (
-            counts["tasks_with_resolved_workflow_status"], counts["tasks_with_unresolved_workflow_status"]))
-        print("Tasks without updatedDate: %d | without customFields metadata: %d" % (
-            counts["tasks_without_task_updated_at"], counts["tasks_without_custom_fields_metadata"]))
+def resolve_file(requested, root, filename, fallback=None):
+    if requested:
+        path = Path(requested).expanduser().resolve()
     else:
-        print("No complete snapshot committed; this run will not be used as a comparison baseline.")
-    for message in manifest["errors"]:
-        print("ERROR: " + message)
-    for message in manifest["warnings"]:
-        print("WARNING: " + message)
-    print("Access: only tasks visible to this user in this Wrike account; no independent total is available.")
-    print("Observation times are not exact status-change times; changes between runs can be missed.")
-    print("task_updated_at is the entire task's last update. Exact status-change columns are blank; *_last_change_observed_at records detection only.")
-    print("Files: " + str(run_dir))
-    print("Run report: " + str(run_dir / "summary.json"))
+        candidates = [root / filename]
+        if fallback:
+            candidates.append(root / fallback)
+        path = next((p for p in candidates if p.is_file()), candidates[0])
+    if not path.is_file():
+        raise ValueError("File not found: " + str(path) + "\n"
+                         "Place it in the script's folder or supply its path with --evidence / --missing.")
+    return path.resolve()
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--version", action="version", version="Wrike task snapshots 3 (status/timestamp detail; reads v1 and v2 baselines)")
-    commands = parser.add_subparsers(dest="command", required=True)
-    command = commands.add_parser("capture", help="Capture all token-visible tasks and compare with the last complete run.")
-    command.add_argument("--output", type=Path, default=Path("output/task_snapshots"),
-                         help="Local output folder; reuse the same folder for each run (default: output/task_snapshots).")
-    command.add_argument("--host", choices=HOSTS, default=HOSTS[0], help="Wrike API host for this account.")
-    args = parser.parse_args(argv)
+def read_missing(path):
+    before = fingerprint(path)
+    result = {}
+    required = ("project_id", "snowflake_name", "is_confirmed_project_in_snowflake",
+                "in_akash_reference", "outcome", "http_status")
+    for row in rows_from(path, required):
+        pid = identifier(row["project_id"])
+        if not pid or pid in result:
+            raise ValueError("Missing-items CSV has a blank/placeholder or repeated project_id")
+        flags = {}
+        for field in ("is_confirmed_project_in_snowflake", "in_akash_reference"):
+            kind, value = number(row[field])
+            if kind != "number" or value not in (Decimal(0), Decimal(1)):
+                raise ValueError("Expected a 0/1 flag for " + pid + " in " + field)
+            flags[field] = int(value)
+        kind, status = number(row["http_status"])
+        if clean(row["outcome"]) != "NOT_FOUND" or kind != "number" or status != 404:
+            raise ValueError("Expected the saved NOT_FOUND / 404 result for " + pid)
+        result[pid] = {"name": clean(row["snowflake_name"]),
+                       "project": flags["is_confirmed_project_in_snowflake"],
+                       "reference": flags["in_akash_reference"]}
+    if not result:
+        raise ValueError("The missing-items CSV contains no data rows")
+    return result, audit(path, before, len(result))
+
+
+class FieldProfile:
+    def __init__(self):
+        self.counts = Counter()
+        self.invalid_examples = []
+        self.raw_sum = Decimal(0)
+
+    def add(self, text):
+        kind, value = number(text)
+        self.counts[kind] += 1
+        if kind == "number":
+            self.raw_sum += value
+            self.counts["positive" if value > 0 else "negative" if value < 0 else "zero"] += 1
+        elif kind == "invalid" and len(self.invalid_examples) < 3:
+            sample = clean(text)[:100]
+            if sample not in self.invalid_examples:
+                self.invalid_examples.append(sample)
+        return kind, value
+
+    def report(self):
+        return {**dict(self.counts), "raw_physical_row_sum_not_a_valid_total": fmt(self.raw_sum),
+                "invalid_examples": self.invalid_examples}
+
+
+class Grain:
+    """Candidate grouping diagnostics, NOT permission to deduplicate the data."""
+    def __init__(self, description):
+        self.description = description
+        self.groups = {}
+        self.unkeyed = Counter()
+
+    def add(self, key, parsed):
+        kind, value = parsed
+        if not all(key):
+            self.unkeyed[kind] += 1
+            if kind == "number" and value != 0:
+                self.unkeyed["nonzero_number"] += 1
+            return
+        # count, non-null numeric values, null count, invalid count
+        entry = self.groups.setdefault(key, [0, set(), 0, 0])
+        entry[0] += 1
+        if kind == "number":
+            entry[1].add(value)
+        elif kind == "null":
+            entry[2] += 1
+        else:
+            entry[3] += 1
+
+    def report(self):
+        counts = Counter()
+        for count, values, nulls, invalid in self.groups.values():
+            counts["groups"] += 1
+            counts["extra_rows_at_candidate_grain"] += count - 1
+            counts["conflicting_numeric_groups"] += len(values) > 1
+            counts["mixed_null_numeric_groups"] += bool(values) and nulls > 0
+            counts["invalid_value_groups"] += invalid > 0
+            counts["no_numeric_value_groups"] += not values
+        return {"candidate_grain": self.description, **dict(counts),
+                "rows_without_complete_grain": dict(self.unkeyed)}
+
+
+def profile_raw_allocation(text, daily, counts, samples):
+    if not present(text):
+        counts["null"] += 1
+        return
+    text = clean(text)
+    if len(text) > 65536:
+        counts["too_large_to_parse"] += 1
+        return
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", getpass.GetPassWarning)
-            token = getpass.getpass("Wrike token (hidden; used only for this run): ").strip()
-        client = WrikeClient(token, host=args.host)
-        manifest, run_dir = capture(args.output, client)
-        print_result(manifest, run_dir)
-        return 0 if manifest["status"] == "COMPLETE" else 1
-    except getpass.GetPassWarning:
-        print("ERROR: A terminal with a hidden password prompt is required. Run this command in Terminal.", file=sys.stderr)
-    except (EOFError, KeyboardInterrupt):
-        print("Capture cancelled.", file=sys.stderr)
-    except SnapshotError as exc:
-        print("ERROR: " + str(exc), file=sys.stderr)
-    except OSError:
-        print("ERROR: Could not write local files. Check folder permissions and disk space.", file=sys.stderr)
-    return 1
+        obj = json.loads(text, parse_float=Decimal)
+    except (ValueError, RecursionError):
+        try:
+            # literal_eval accepts Python literals only; never execute CSV text.
+            obj = ast.literal_eval(text)
+        except (ValueError, SyntaxError, RecursionError, MemoryError):
+            counts["unparsed"] += 1
+            return
+    if isinstance(obj, str) and len(obj) <= 65536:
+        counts["serialized_string_outer_layer"] += 1
+        try:
+            obj = json.loads(obj, parse_float=Decimal)
+        except (ValueError, RecursionError):
+            try:
+                obj = ast.literal_eval(obj)
+            except (ValueError, SyntaxError, RecursionError, MemoryError):
+                counts["unparsed_inner_string"] += 1
+                return
+    counts[type(obj).__name__] += 1
+    if isinstance(obj, list):
+        counts["nonempty_list"] += bool(obj)
+        return
+    if not isinstance(obj, dict):
+        return
+    if len(samples) < 3:
+        sample = {k: str(obj[k])[:100] for k in ("date", "effortMinutes") if k in obj}
+        if sample not in samples:
+            samples.append(sample)
+    if "effortMinutes" in obj:
+        raw_kind, raw_value = number(str(obj["effortMinutes"]))
+        if daily[0] == raw_kind == "number":
+            counts["raw_effort_matches_flat_column" if raw_value == daily[1]
+                   else "raw_effort_differs_from_flat_column"] += 1
+        else:
+            counts["raw_effort_not_comparable"] += 1
+
+
+def project_bucket():
+    return {"direct_rows": 0, "hierarchy_rows": 0, "union_rows": 0, "own_rows": 0,
+            "direct_keys": set(), "union_keys": set(), "own_flags": set(),
+            "own_titles": set(), "daily_numeric_rows": 0, "daily_nonzero_rows": 0,
+            "daily_null_rows": 0, "daily_invalid_rows": 0,
+            "daily_incomplete_grain_rows": 0, "multi_missing_project_rows": 0}
+
+
+def scan_evidence(path, missing):
+    before = fingerprint(path)
+    required = ("evidence_exported_at", "evidence_total_rows", "Data refresh", "id", "key",
+                "title", "is_project", "Owner_userid", "Responsible_userId",
+                "owner_dailyAllocation", "owner_dailyAllocation_date",
+                "effortAllocation_mode") + FOLDERS + TASKS + EFFORT
+    fields = {name: FieldProfile() for name in EFFORT}
+    grains = {
+        "effortAllocation_totalEffort": Grain("key (entity), regardless of container/owner/date"),
+        "effortAllocation_allocatedEffort": Grain("key (entity), regardless of container/owner/date"),
+        OWNER_TOTAL: Grain("key + Owner_userid, regardless of container/date"),
+        DAILY: Grain("key + Owner_userid + raw owner_dailyAllocation_date, regardless of container"),
+    }
+    scoped_daily = Grain("id + key + Owner_userid + raw owner_dailyAllocation_date")
+    counts = Counter()
+    exported = Counter()
+    refreshed = Counter()
+    date_shapes = Counter()
+    date_samples = []
+    modes = Counter()
+    mode_coverage = defaultdict(Counter)
+    allocation_shapes = Counter()
+    allocation_samples = []
+    container_ids = set()
+    entity_keys = set()
+    task_keys = set()
+    folder_keys = set()
+    key_containers = defaultdict(set)
+    key_scopes = defaultdict(set)
+    own_projects = set()
+    baseline_projects = {pid for pid, item in missing.items() if item["project"]}
+    projects = {pid: project_bucket() for pid in missing}
+    expected_rows = None
+    extra_effort_headers = []
+    absent_custom_headers = []
+    incomplete_daily_owners = set()
+    row_count = 0
+    for row in rows_from(path, required):
+        row_count += 1
+        if row_count == 1:
+            extra_effort_headers = [h for h in row if h not in EFFORT and h not in required
+                                    and any(s in h.lower() for s in ("effort", "hour", "allocat"))]
+            absent_custom_headers = [h for h in ("[xa] effort h/d", "[xa] effort total p/d",
+                                     "[xa] mission control effort") if h not in row]
+        expected = clean(row["evidence_total_rows"])
+        if not re.fullmatch(r"\d+", expected) or int(expected) < 1:
+            raise ValueError("Invalid evidence_total_rows at CSV data row " + str(row_count))
+        if expected_rows is None:
+            expected_rows = int(expected)
+        elif int(expected) != expected_rows:
+            raise ValueError("Mixed evidence_total_rows values; do not combine separate exports")
+        export_mark = clean(row["evidence_exported_at"])
+        if not present(export_mark):
+            raise ValueError("Blank evidence_exported_at at CSV data row " + str(row_count))
+        exported[export_mark] += 1
+        refreshed[clean(row["Data refresh"])] += 1
+        cid, key = identifier(row["id"]), identifier(row["key"])
+        owner, responsible = identifier(row["Owner_userid"]), identifier(row["Responsible_userId"])
+        raw_date = clean(row["owner_dailyAllocation_date"])
+        date = raw_date if present(raw_date) else ""
+        folder_ids = {identifier(row[f]) for f in FOLDERS} - {""}
+        task_ids = {identifier(row[f]) for f in TASKS} - {""}
+        counts["blank_or_placeholder_container_rows"] += not cid
+        counts["blank_or_placeholder_entity_rows"] += not key
+        counts["owner_responsible_mismatch_rows"] += bool(owner and responsible and owner != responsible)
+        counts["owner_present_responsible_blank_rows"] += bool(owner and not responsible)
+        if cid:
+            container_ids.add(cid)
+        if key:
+            entity_keys.add(key)
+            if cid:
+                key_containers[key].add(cid)
+            if key in task_ids:
+                task_keys.add(key)
+            if key in folder_ids or (cid and key == cid):
+                folder_keys.add(key)
+            key_scopes[key].update(folder_ids | ({cid} if cid else set()))
+        own = bool(cid and key == cid)
+        if own and clean(row["is_project"]).upper() == "Y":
+            own_projects.add(cid)
+        task_path = [identifier(row[f]) for f in TASKS]
+        deepest_task = next((value for value in reversed(task_path) if value), "")
+        if not own:
+            if not deepest_task:
+                counts["non_own_rows_without_any_task_id"] += 1
+            elif key == deepest_task:
+                counts["non_own_rows_key_matches_deepest_task_id"] += 1
+            elif key and key in task_ids:
+                counts["non_own_rows_key_matches_earlier_task_id_only"] += 1
+            else:
+                counts["non_own_rows_with_task_ids_but_key_matches_none"] += 1
+        mode = clean(row["effortAllocation_mode"])
+        modes[mode] += 1
+        if not date:
+            date_shapes["null"] += 1
+        elif re.fullmatch(r"[+-]?\d+", date):
+            date_shapes["integer_text_" + str(len(date.lstrip("+-"))) + "_digits"] += 1
+        elif NUMERIC.fullmatch(date):
+            date_shapes["decimal_or_scientific_text_review_precision"] += 1
+        else:
+            date_shapes["other_text"] += 1
+        if date and date not in date_samples and len(date_samples) < 5:
+            date_samples.append(date)
+        parsed = {name: fields[name].add(row[name]) for name in EFFORT}
+        for field in ("effortAllocation_totalEffort", OWNER_TOTAL, DAILY):
+            kind, value = parsed[field]
+            mode_coverage[mode][field + ":" + kind] += 1
+            if kind == "number" and value != 0:
+                mode_coverage[mode][field + ":nonzero"] += 1
+        grains["effortAllocation_totalEffort"].add((key,), parsed["effortAllocation_totalEffort"])
+        grains["effortAllocation_allocatedEffort"].add((key,), parsed["effortAllocation_allocatedEffort"])
+        grains[OWNER_TOTAL].add((key, owner), parsed[OWNER_TOTAL])
+        grains[DAILY].add((key, owner, date), parsed[DAILY])
+        scoped_daily.add((cid, key, owner, date), parsed[DAILY])
+        if key and owner and not date:
+            incomplete_daily_owners.add((key, owner))
+        profile_raw_allocation(row["owner_dailyAllocation"], parsed[DAILY],
+                               allocation_shapes, allocation_samples)
+        direct = {cid} & missing.keys()
+        hierarchy = folder_ids & missing.keys()
+        hits = direct | hierarchy
+        counts["rows_with_multiple_missing_confirmed_project_matches"] += len(hits & baseline_projects) > 1
+        for pid in hits:
+            bucket = projects[pid]
+            bucket["direct_rows"] += pid in direct
+            bucket["hierarchy_rows"] += pid in hierarchy
+            bucket["union_rows"] += 1
+            if key:
+                bucket["union_keys"].add(key)
+                if pid in direct:
+                    bucket["direct_keys"].add(key)
+            if cid == key == pid:
+                bucket["own_rows"] += 1
+                bucket["own_flags"].add(clean(row["is_project"]))
+                if present(row["title"]):
+                    bucket["own_titles"].add(clean(row["title"]))
+            kind, value = parsed[DAILY]
+            bucket["daily_numeric_rows"] += kind == "number"
+            bucket["daily_nonzero_rows"] += kind == "number" and value != 0
+            bucket["daily_null_rows"] += kind == "null"
+            bucket["daily_invalid_rows"] += kind == "invalid"
+            bucket["daily_incomplete_grain_rows"] += kind == "number" and not all((key, owner, date))
+            bucket["multi_missing_project_rows"] += len(hits & baseline_projects) > 1
+        if row_count % 50000 == 0:
+            print("Checked {:,} CSV rows...".format(row_count), flush=True)
+    if not row_count or row_count != expected_rows:
+        raise ValueError("Incomplete CSV: parsed {:,} data rows; source evidence_total_rows={!r}. "
+                         "Download the complete result before using it.".format(row_count, expected_rows))
+    if len(exported) != 1:
+        raise ValueError("Multiple evidence_exported_at values: mixed exports cannot be validated together")
+    # Compare owner-level totals with their candidate daily groups. This tests
+    # structure, not whether every Wrike task or allocation was fetched.
+    daily_by_owner = defaultdict(lambda: {"sum": Decimal(0), "usable": True})
+    for (key, owner, date), (_, values, nulls, invalid) in grains[DAILY].groups.items():
+        bucket = daily_by_owner[(key, owner)]
+        if len(values) != 1 or nulls or invalid:
+            bucket["usable"] = False
+        else:
+            bucket["sum"] += next(iter(values))
+    owner_check = Counter()
+    for owner_key, (_, values, nulls, invalid) in grains[OWNER_TOTAL].groups.items():
+        daily = daily_by_owner.get(owner_key)
+        if len(values) != 1 or nulls or invalid:
+            owner_check["owner_total_ambiguous_or_missing"] += 1
+        elif owner_key in incomplete_daily_owners:
+            owner_check["daily_rows_with_missing_date"] += 1
+        elif daily is None:
+            owner_check["no_fully_keyed_daily_groups"] += 1
+        elif not daily["usable"]:
+            owner_check["daily_groups_ambiguous_or_missing"] += 1
+        elif next(iter(values)) == daily["sum"]:
+            owner_check["numeric_values_match_at_candidate_grains"] += 1
+        else:
+            owner_check["numeric_values_differ_at_candidate_grains"] += 1
+    owner_check["daily_owner_groups_without_owner_total_group"] = len(
+        set(daily_by_owner) - grains[OWNER_TOTAL].groups.keys())
+    task_only = task_keys - folder_keys
+    folder_only = folder_keys - task_keys
+    profile = {
+        "evidence": audit(path, before, row_count), "source_row_count": expected_rows,
+        "export_markers": dict(exported), "data_refresh_values": dict(refreshed),
+        "unique_container_ids": len(container_ids), "unique_entity_keys": len(entity_keys),
+        "own_row_confirmed_project_ids": len(own_projects),
+        "entity_key_classification": {"task_column_match_only": len(task_only),
+            "folder_or_own_row_match_only": len(folder_only),
+            "both_task_and_folder_match": len(task_keys & folder_keys),
+            "neither_match": len(entity_keys - task_keys - folder_keys)},
+        "entity_keys_in_multiple_containers": sum(len(c) > 1 for c in key_containers.values()),
+        "entity_keys_in_missing_and_other_direct_containers": sum(
+            bool(c & baseline_projects) and bool(c - baseline_projects) for c in key_containers.values()),
+        "entity_keys_in_multiple_current_project_scopes": sum(
+            len(c & own_projects) > 1 for c in key_scopes.values()),
+        "entity_keys_in_missing_and_other_project_scopes": sum(
+            bool(c & baseline_projects) and bool(c & (own_projects - baseline_projects))
+            for c in key_scopes.values()),
+        "row_diagnostics": dict(counts), "effort_fields": {k: v.report() for k, v in fields.items()},
+        "candidate_grains": {k: v.report() for k, v in grains.items()},
+        "daily_candidate_grain_with_container": scoped_daily.report(),
+        "owner_total_vs_daily_diagnostic": dict(owner_check),
+        "date_representation": dict(date_shapes), "raw_date_samples": date_samples,
+        "effort_modes": dict(modes), "raw_allocation_shapes": dict(allocation_shapes),
+        "effort_coverage_by_mode": {k: dict(v) for k, v in mode_coverage.items()},
+        "raw_allocation_samples": allocation_samples,
+        "extra_effort_headers_not_profiled": extra_effort_headers,
+        "not_in_this_export": absent_custom_headers,
+    }
+    project_rows = []
+    for pid, item in missing.items():
+        bucket = projects[pid]
+        keys = bucket["union_keys"]
+        project_rows.append({"project_id": pid, "baseline_name": item["name"],
+            "baseline_confirmed_project": item["project"], "in_akash_reference": item["reference"],
+            "current_own_row_confirmed_project": int(pid in own_projects),
+            "current_own_row_names": " | ".join(sorted(bucket["own_titles"])),
+            "current_own_row_flags": " | ".join(sorted(bucket["own_flags"])),
+            "direct_entity_keys": len(bucket["direct_keys"]), "union_entity_keys": len(keys),
+            "union_task_column_match_only_keys": len(keys & task_only),
+            "union_folder_or_own_row_match_only_keys": len(keys & folder_only),
+            "union_ambiguous_or_unclassified_keys": len(keys - task_only - folder_only),
+            **{k: v for k, v in bucket.items() if not isinstance(v, set)},
+            "scope_note": "union = id matches OR any of five folder IDs matches; overlapping scopes, not additive",
+            "hours_status": "NOT CALCULATED: metric, grouping and project attribution require review"})
+    return profile, project_rows
+
+
+def save_reports(root, profile, project_rows):
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    out = root / "output" / "effort_check" / timestamp
+    out.mkdir(parents=True, exist_ok=False)
+    project_only = [row for row in project_rows if row["baseline_confirmed_project"]]
+    excluded = [row for row in project_rows if not row["baseline_confirmed_project"]]
+    profile["excluded_items"] = excluded
+    profile["project_cohort"] = {
+        "missing_items": len(project_rows), "confirmed_projects": len(project_only),
+        "not_confirmed_projects": len(excluded),
+        "projects_absent_from_direct_id_scope": sum(not r["direct_rows"] for r in project_only),
+        "projects_absent_from_direct_and_hierarchy_scope": sum(not r["union_rows"] for r in project_only),
+        "projects_without_numeric_daily_effort": sum(not r["daily_numeric_rows"] for r in project_only)}
+    warnings = [
+        "This is a field/grain diagnostic. No final effort hours or token reconciliation are established.",
+        "The current Snowflake snapshot and saved September 24 token exports are different snapshots.",
+        "Null effort is unknown/missing; it is not treated as zero. No effort fields are added together.",
+        "Project attribution and overlapping project/task scopes must be reviewed before summing projects.",
+        "The 56-project cohort comes from the saved baseline flag, not flags inherited by task rows.",
+        "The four confirmed folders and one unclassified missing item need separate scope review.",
+        "Owner-total/daily matches alone do not establish that all tasks or allocations were fetched.",
+        "Status fields are absent from this export; no active-project/open-task filter was applied.",
+    ]
+    if (len(project_rows), len(project_only)) != (61, 56):
+        warnings.insert(0, "COHORT MISMATCH: expected 61 missing items / 56 confirmed projects; review the selected CSV.")
+    if len(profile["data_refresh_values"]) != 1 or any(not present(v) for v in profile["data_refresh_values"]):
+        warnings.insert(0, "DATA REFRESH REVIEW: blank or multiple Data refresh values were found.")
+    profile["warnings"] = warnings
+    details = out / "effort_check_details.json"
+    details.write_text(json.dumps(profile, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    projects_path = out / "missing_projects_effort_check.csv"
+    if project_only:
+        with projects_path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(project_only[0]))
+            writer.writeheader()
+            writer.writerows(project_only)
+    lines = ["WRIKE EFFORT EVIDENCE CHECK — DIAGNOSTICS ONLY", "",
+             "Evidence: " + profile["evidence"]["path"],
+             "Missing list: " + profile["missing_input"]["path"],
+             "Full CSV check: PASS — {:,} parsed data rows = source count".format(profile["source_row_count"]),
+             "Export marker: " + next(iter(profile["export_markers"])),
+             "Data refresh values: " + json.dumps(profile["data_refresh_values"], ensure_ascii=False),
+             "Missing items: {}; confirmed projects: {}; other items: {}".format(
+                 len(project_rows), len(project_only), len(excluded)),
+             "Unique container IDs: {:,}; entity keys: {:,}".format(
+                 profile["unique_container_ids"], profile["unique_entity_keys"]), "",
+             "EFFORT FIELDS (physical rows; counts only)",
+             "field | numeric | null | positive | zero | negative | non-numeric"]
+    for field, stats in profile["effort_fields"].items():
+        lines.append(field + " | " + " | ".join(str(stats.get(k, 0)) for k in
+                     ("number", "null", "positive", "zero", "negative", "invalid")))
+    lines += ["", "CANDIDATE GROUPING CHECKS (extra rows are not automatically erroneous duplicates)"]
+    for field, stats in profile["candidate_grains"].items():
+        lines += [field + ": " + stats["candidate_grain"],
+                  "  groups={}; extra rows={}; conflicting groups={}; mixed null/numeric={}; invalid groups={}".format(
+                      *(stats.get(k, 0) for k in ("groups", "extra_rows_at_candidate_grain",
+                      "conflicting_numeric_groups", "mixed_null_numeric_groups", "invalid_value_groups"))),
+                  "  incomplete grain rows=" + json.dumps(stats["rows_without_complete_grain"])]
+    lines += ["", "Owner total vs daily: " + json.dumps(profile["owner_total_vs_daily_diagnostic"]),
+              "Daily grouping WITH container: " + json.dumps(profile["daily_candidate_grain_with_container"]),
+              "Raw allocation checks: " + json.dumps(profile["raw_allocation_shapes"]),
+              "Raw date representation: " + json.dumps(profile["date_representation"]),
+              "Raw date samples (no conversion): " + json.dumps(profile["raw_date_samples"]),
+              "Entity classification: " + json.dumps(profile["entity_key_classification"]),
+              "Keys in multiple containers: " + str(profile["entity_keys_in_multiple_containers"]),
+              "Keys in missing-project AND other DIRECT containers: " + str(profile["entity_keys_in_missing_and_other_direct_containers"]),
+              "Keys in multiple current project scopes (ID or ancestor match): " + str(profile["entity_keys_in_multiple_current_project_scopes"]),
+              "Keys in missing AND other current project scopes: " + str(profile["entity_keys_in_missing_and_other_project_scopes"]),
+              "Project coverage: " + json.dumps(profile["project_cohort"]),
+              "Row diagnostics: " + json.dumps(profile["row_diagnostics"]), "", "REVIEW NOTES"]
+    lines += ["- " + note for note in warnings]
+    lines += ["", "Small files to share:", "  " + str(out / "effort_check_summary.txt"),
+              "  " + str(projects_path), "  " + str(details),
+              "", "Input files were not changed. No API calls were made. No token is needed."]
+    summary = out / "effort_check_summary.txt"
+    summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return out, summary
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--evidence", help="Path to the complete Snowflake evidence CSV")
+    parser.add_argument("--missing", help="Path to missing_items.csv (the saved lookup result)")
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parent
+    try:
+        evidence = resolve_file(args.evidence, root, "snowflake_effort_evidence.csv")
+        missing_path = resolve_file(args.missing, root, "missing_items.csv", Path(
+            "output/akash_comparison/20260925T002311_148327Z_73a909/"
+            "targeted_check_20260925T005523_170267Z/lookup_results.csv"))
+        if evidence == missing_path:
+            raise ValueError("Evidence and missing-items inputs must be different files")
+        print("Evidence: " + str(evidence), flush=True)
+        print("Missing list: " + str(missing_path), flush=True)
+        print("Reading local CSV files only; no token or network needed.", flush=True)
+        missing, missing_audit = read_missing(missing_path)
+        profile, project_rows = scan_evidence(evidence, missing)
+        profile["missing_input"] = missing_audit
+        out, summary = save_reports(root, profile, project_rows)
+        print("\nFull CSV check passed: {:,} data rows.".format(profile["source_row_count"]))
+        print("Missing list: {} items; {} confirmed projects.".format(
+            len(missing), sum(item["project"] for item in missing.values())))
+        print("Diagnostic reports saved to: " + str(out))
+        print("Share the small file: " + str(summary))
+        print("Final effort hours are not yet established. Do not send these diagnostics as final totals.")
+        return 0
+    except (ValueError, OSError, csv.Error, UnicodeError) as exc:
+        print("\nCHECK STOPPED: " + str(exc), file=sys.stderr)
+        print("No validated report was produced. Keep the original input CSVs unchanged.", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
