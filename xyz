@@ -1,6 +1,2 @@
-
-find "$HOME/Downloads" "$HOME/Desktop" -type f \( \
--name 'build_wrike_workbook*.py' -o \
--name 'wrike_report_analysis*.py' -o \
--name 'Wrike_Workbook_Builder*.zip' \
-\) -print
+cd ~/Desktop/wrike-local-baseline
+python3 build_wrike_workbook.py --snapshot snowflake_snapshot.csv --case output/project_access_today/20260930T161721_018375Z
