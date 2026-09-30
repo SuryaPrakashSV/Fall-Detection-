@@ -1,22 +1,2 @@
 cd ~/Desktop/wrike-local-baseline
-python3 - <<'PY'
-import ast
-import copy
-from pathlib import Path
-
-source = Path("Wrike_Data_local_validation.py").read_text()
-tree = ast.parse(source)
-
-class HideLiterals(ast.NodeTransformer):
-    def visit_Constant(self, node):
-        return ast.copy_location(ast.Constant(value="<hidden>"), node)
-
-for node in ast.walk(tree):
-    if isinstance(node, ast.Assign):
-        names = [t.id for t in node.targets if isinstance(t, ast.Name)]
-        if "TOKEN" in names or "WRIKE_TOKEN" in names:
-            value = HideLiterals().visit(copy.deepcopy(node.value))
-            print(f"Line {node.lineno}: {', '.join(names)} = {ast.unparse(value)}")
-
-print("Local CSV export marker:", "LOCAL CSV EXPORT" in source)
-PY
+python3 run_wrike_comparison_export.py --case output/aligned_comparison/20260930T054149_860457Z_surya
