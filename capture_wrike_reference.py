@@ -15,6 +15,11 @@ All statuses are requested by omitting status filters, matching the extractor.
 Raw API pages, request times, hashes, membership and conflicting observations
 are retained. Missing effort is never silently converted to a numeric zero.
 
+Recovery after observed folder drift: --record-folder-drift is AFTER-only.
+It retains the original root IDs, records folder/relationship differences and
+always requires review. Root changes still block. It does not establish equal
+scope, repair historical snapshots, or rerun the extraction.
+
 Requires the reviewed prepare_wrike_comparison.py delivered with this workflow.
 The helper is loaded only after checking its bytes or normalized Python AST.
 Line endings, comments and formatting may differ; Python code must match. The
@@ -327,14 +332,42 @@ def compare_scope(body, frozen, helper):
     return current, changed
 
 
+def folder_drift(before_rows, after_rows, frozen, current):
+    def project(rows):
+        return {r["id"]: {"id": r["id"], "title": r.get("title"),
+                "scope": r.get("scope"), "has_project": "project" in r,
+                "childIds": sorted(r.get("childIds", []))} for r in rows}
+    old, new = project(before_rows), project(after_rows)
+    return {
+        "added_scope_folder_ids": sorted(set(current["folder_ids"]) - set(frozen["folder_ids"])),
+        "removed_scope_folder_ids": sorted(set(frozen["folder_ids"]) - set(current["folder_ids"])),
+        "added_inventory_folders": [new[k] for k in sorted(new.keys() - old.keys())],
+        "removed_inventory_folders": [old[k] for k in sorted(old.keys() - new.keys())],
+        "changed_inventory_folders": [
+            {"id": k, "before": old[k], "after": new[k]}
+            for k in sorted(old.keys() & new.keys()) if old[k] != new[k]],
+        "validation_complete": False,
+    }
+
+
+def enforce_start_scope(changed, record_drift):
+    if "root_ids" in changed or (changed and not record_drift):
+        raise ValueError("Folder scope changed since preparation: " + ", ".join(changed))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--case", type=Path, required=True)
     parser.add_argument("--phase", choices=["before", "after"], required=True)
     parser.add_argument("--source", type=Path, default=Path("Wrike_Data_local_validation.py"))
+    parser.add_argument("--record-folder-drift", action="store_true",
+                        help="AFTER-only evidence recovery; fixed roots, mandatory review")
     args = parser.parse_args()
+    if args.record_folder_drift and args.phase != "after":
+        raise ValueError("Folder-drift recovery is only permitted for the AFTER capture")
     helper = load_helper()
     frozen, preparation = read_case(args.case, helper)
+    prepared_rows = json.loads((args.case / "folder_tree.json").read_text())["data"]
     raw_source = args.source.read_bytes()
     if sha(raw_source) != frozen["source_sha256"]:
         raise ValueError("Extraction source differs from preparation; review before any API call")
@@ -366,6 +399,7 @@ def main():
         "token_identity": "operator-supplied same-token requirement; no credential fingerprint retained",
         "scope": "independent descendant/subtask queries of frozen roots; no status filter",
         "not_an_atomic_snapshot": True,
+        "folder_drift_recovery": args.record_folder_drift,
     })
     index = TaskIndex()
     error = None
@@ -373,8 +407,11 @@ def main():
         body, _, _ = client.fetch(f"spaces/{frozen['space_id']}/folders")
         current, changed = compare_scope(body, frozen, helper)
         client.save("scope_at_start.json", current)
-        if changed:
-            raise ValueError("Folder scope changed since preparation: " + ", ".join(changed))
+        start_scope, start_rows, start_changes = current, body["data"], list(changed)
+        client.save("folder_drift_at_start.json", folder_drift(prepared_rows, start_rows, frozen, current))
+        enforce_start_scope(changed, args.record_folder_drift)
+        if args.record_folder_drift:
+            print("Recording folder drift under frozen roots; result MUST be reviewed.", flush=True)
         roots = frozen["root_ids"]
         for position, root in enumerate(roots, 1):
             collect_root(client, index, root, position, len(roots))
@@ -382,11 +419,19 @@ def main():
         body, _, _ = client.fetch(f"spaces/{frozen['space_id']}/folders")
         current, changed = compare_scope(body, frozen, helper)
         client.save("scope_at_end.json", current)
+        client.save("folder_drift_at_end.json", folder_drift(prepared_rows, body["data"], frozen, current))
+        client.save("folder_drift_during_capture.json", folder_drift(start_rows, body["data"], start_scope, current))
+        if "root_ids" in changed:
+            raise ValueError("Root IDs changed during capture; fixed-root comparison requires review")
         if sha(args.source.read_bytes()) != frozen["source_sha256"]:
             raise ValueError("Extraction source changed during reference capture")
         summary = index.summarize()
         reasons = []
-        if changed:
+        if args.record_folder_drift:
+            reasons.append("folder_drift_recovery_requires_scope_and_timing_review")
+        if start_changes:
+            reasons.append("folder_scope_changed_since_preparation")
+        if any(current[k] != start_scope[k] for k in ("root_ids", "folder_ids", "folder_structure_sha256")):
             reasons.append("folder_scope_changed_during_capture")
         for name in ("conflicting_task_ids", "missing_relationship_task_ids", "missing_timestamp_task_ids",
                      "unexpected_task_scope_ids", "referenced_subtask_ids_not_returned",
@@ -401,7 +446,9 @@ def main():
         client.manifest["status"] = "CAPTURE_COMPLETE_REVIEW_REQUIRED" if reasons else "CAPTURE_COMPLETE_NOT_COMPARED"
         summary.update({"status": client.manifest["status"], "review_reasons": reasons,
                         "completed_roots": len(client.manifest["completed_roots"]),
-                        "scope_changes": changed,
+                        "scope_changes": sorted(set(start_changes) | set(changed)),
+                        "scope_changes_at_start": start_changes,
+                        "scope_changes_at_end": changed,
                         "mode_none_policy": "kept separate from explicit numeric zero; no numeric value imputed",
                         "validation_complete": False})
         client.save("summary.json", summary)
