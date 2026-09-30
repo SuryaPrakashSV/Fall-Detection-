@@ -1,1 +1,185 @@
 python3 ~/Desktop/wrike-local-baseline/trim_wrike_columns.py
+
+
+"""Make a new copy: Missing Projects first, Snowflake Snapshot second.
+
+Offline Python standard library only. Reads the latest CONCISE.xlsx. Keeps all
+other tabs in their existing relative order, with their visibility unchanged.
+All worksheet cells, formulas, cached results and styles are preserved.
+"""
+import argparse
+import hashlib
+import json
+import re
+import shutil
+import sys
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+import xml.etree.ElementTree as ET
+
+NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+EP = 'http://schemas.openxmlformats.org/officeDocument/2006/extended-properties'
+VT = 'http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes'
+ET.register_namespace('', NS)
+ET.register_namespace('r', REL)
+ET.register_namespace('ep', EP)
+ET.register_namespace('vt', VT)
+FIRST = ('Missing Projects', 'Snowflake Snapshot')
+BLOCK = 1024 * 1024
+
+
+def q(tag):
+    return '{' + NS + '}' + tag
+
+
+def file_sha(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(BLOCK), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def selected_header(data, active):
+    def replace(match):
+        tag = re.sub(rb'\s+tabSelected="[^"]*"', b'', match.group(0))
+        ending = b'/>' if tag.endswith(b'/>') else b'>'
+        return tag[:-len(ending)] + b' tabSelected="' + (b'1' if active else b'0') + b'"' + ending
+    data, count = re.subn(rb'<sheetView\b[^>]*>', replace, data)
+    if not count:
+        raise ValueError('Worksheet view is missing.')
+    return data
+
+
+def reorder(source, destination):
+    before = file_sha(source)
+    expected = {}
+    with zipfile.ZipFile(source) as original:
+        members = original.infolist()
+        if len({m.filename for m in members}) != len(members):
+            raise ValueError('Duplicate workbook package entries.')
+        workbook = ET.fromstring(original.read('xl/workbook.xml'))
+        sheets = workbook.find(q('sheets'))
+        old_sheets = list(sheets)
+        old_names = [s.get('name') for s in old_sheets]
+        if not set(FIRST).issubset(old_names):
+            raise ValueError('Missing Projects or Snowflake Snapshot tab was not found.')
+        by_name = {s.get('name'): s for s in old_sheets}
+        if any(by_name[name].get('state', 'visible') != 'visible' for name in FIRST):
+            raise ValueError('Both requested first tabs must already be visible.')
+        new_names = list(FIRST) + [name for name in old_names if name not in FIRST]
+        for sheet in old_sheets:
+            sheets.remove(sheet)
+        for name in new_names:
+            sheets.append(by_name[name])
+        remap = {index: new_names.index(name) for index, name in enumerate(old_names)}
+        for defined in workbook.findall('./' + q('definedNames') + '/' + q('definedName')):
+            if 'localSheetId' in defined.attrib:
+                defined.set('localSheetId', str(remap[int(defined.get('localSheetId'))]))
+        for view in workbook.findall('./' + q('bookViews') + '/' + q('workbookView')):
+            view.set('activeTab', '0')
+            view.set('firstSheet', '0')
+        rels = ET.fromstring(original.read('xl/_rels/workbook.xml.rels'))
+        active_id = by_name[FIRST[0]].get('{' + REL + '}id')
+        target = next(r.get('Target') for r in rels if r.get('Id') == active_id)
+        active_path = target.lstrip('/') if target.startswith('/') else 'xl/' + target
+        overrides = {'xl/workbook.xml': ET.tostring(workbook, encoding='utf-8', xml_declaration=True)}
+        if 'docProps/app.xml' in original.namelist():
+            app = ET.fromstring(original.read('docProps/app.xml'))
+            vector = app.find('./{' + EP + '}TitlesOfParts/{' + VT + '}vector')
+            if vector is not None and [v.text for v in list(vector)[:len(old_names)]] == old_names:
+                for item, name in zip(list(vector), new_names):
+                    item.text = name
+                overrides['docProps/app.xml'] = ET.tostring(app, encoding='utf-8', xml_declaration=True)
+        with zipfile.ZipFile(destination, 'x', compression=zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as output:
+            for item in members:
+                member = item.filename
+                digest = hashlib.sha256()
+                with output.open(member, 'w', force_zip64=True) as writer:
+                    if member in overrides:
+                        data = overrides[member]
+                        writer.write(data)
+                        digest.update(data)
+                    else:
+                        with original.open(item) as reader:
+                            if re.fullmatch(r'xl/worksheets/sheet\d+\.xml', member):
+                                prefix = reader.read(BLOCK)
+                                start = prefix.find(b'<sheetData')
+                                if start < 0:
+                                    raise ValueError('Unexpected worksheet header: ' + member)
+                                data = selected_header(prefix[:start], member == active_path) + prefix[start:]
+                                writer.write(data)
+                                digest.update(data)
+                            for block in iter(lambda: reader.read(BLOCK), b''):
+                                writer.write(block)
+                                digest.update(block)
+                expected[member] = digest.hexdigest()
+    print('Checking saved workbook...', flush=True)
+    with zipfile.ZipFile(destination) as saved:
+        if set(saved.namelist()) != set(expected):
+            raise ValueError('Saved workbook parts differ unexpectedly.')
+        for member, wanted in expected.items():
+            digest = hashlib.sha256()
+            with saved.open(member) as reader:
+                for block in iter(lambda: reader.read(BLOCK), b''):
+                    digest.update(block)
+            if digest.hexdigest() != wanted:
+                raise ValueError('Saved workbook verification failed: ' + member)
+        confirmed = ET.fromstring(saved.read('xl/workbook.xml')).find(q('sheets'))
+        if [s.get('name') for s in confirmed] != new_names:
+            raise ValueError('Tab order verification failed.')
+    if file_sha(source) != before:
+        raise ValueError('Original workbook changed during copying. Close it and retry.')
+    return {'source_file': str(source), 'source_sha256': before,
+            'output_sha256': file_sha(destination), 'tab_order': new_names,
+            'visible_tab_order': [name for name in new_names if by_name[name].get('state', 'visible') == 'visible'],
+            'active_tab': FIRST[0], 'cells_formulas_styles_and_visibility': 'Unchanged'}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('workbook', nargs='?', help='Optional explicit CONCISE.xlsx path')
+    args = parser.parse_args()
+    base = Path.cwd()
+    script_folder = Path(__file__).resolve().parent
+    if not (base / 'output' / 'concise_workbook').exists() and (script_folder / 'output' / 'concise_workbook').exists():
+        base = script_folder
+    temporary = None
+    try:
+        if args.workbook:
+            source = Path(args.workbook).expanduser().resolve()
+        else:
+            candidates = sorted(p for p in (base / 'output' / 'concise_workbook').glob('*/*_CONCISE.xlsx')
+                                if p.is_file() and not p.name.startswith(('~$', '._')))
+            if not candidates:
+                raise ValueError('No CONCISE.xlsx found. Run trim_wrike_columns.py first.')
+            source = candidates[-1].resolve()
+        if not source.is_file() or source.name.startswith(('~$', '._')) or not zipfile.is_zipfile(source):
+            raise ValueError('Not a readable workbook: ' + str(source))
+        if shutil.disk_usage(base).free < max(1024 ** 3, source.stat().st_size * 5):
+            raise ValueError('At least 1 GB free space is needed.')
+        print('Using workbook: ' + str(source), flush=True)
+        folder = base / 'output' / 'delivery_workbook' / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')
+        folder.mkdir(parents=True, exist_ok=False)
+        stem = source.stem[:-8] if source.stem.endswith('_CONCISE') else source.stem
+        destination = folder / (stem + '_DELIVERY.xlsx')
+        temporary = folder / (stem + '_DELIVERY.building')
+        receipt = reorder(source, temporary)
+        temporary.rename(destination)
+        receipt['output_file'] = str(destination)
+        (folder / 'tab_order_receipt.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
+        print('DONE: Missing Projects first; Snowflake Snapshot second.')
+        print('VISIBLE TABS: ' + ' | '.join(receipt['visible_tab_order']))
+        print('NEW FILE: ' + str(destination))
+    except Exception as error:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+        print('STOPPED: ' + str(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
