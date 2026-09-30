@@ -1,25 +1,18 @@
 cd ~/Desktop/wrike-local-baseline
 python3 - <<'PY'
+import ast
 from pathlib import Path
 
-p = Path("output/akash_run_20260924_165946.log")
-if not p.is_file():
-    raise SystemExit(f"Log not found: {p}")
+tree = ast.parse(Path("Wrike_Data_local_validation.py").read_text())
+wanted = {"SPACE_ID", "TARGET_PROJECTS"}
 
-summary = []
-errors = []
-for n, line in enumerate(p.open(errors="replace"), 1):
-    if any(s in line for s in (
-        "Total tasks requested", "Total tasks fetched",
-        "Missing task IDs", "Final individual retries"
-    )):
-        summary.append(f"{n}: {line.strip()}")
-    if "Error fetching" in line or "Final Failure" in line:
-        errors.append(f"{n}: {line.strip()}")
-
-print("RETRIEVAL SUMMARIES")
-print("\n".join(summary) or "No matching summary lines.")
-print(f"\nRecorded worker/final failures: {len(errors)}")
-for line in errors[:10]:
-    print(line[:500])
+for node in ast.walk(tree):
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in wanted:
+                try:
+                    value = ast.literal_eval(node.value)
+                except (ValueError, TypeError):
+                    value = "(computed value; needs inspection)"
+                print(f"Line {node.lineno}: {target.id} = {value!r}")
 PY
