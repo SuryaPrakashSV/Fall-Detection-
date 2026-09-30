@@ -1,20 +1,40 @@
 cd ~/Desktop/wrike-local-baseline
 python3 - <<'PY'
-import ast
+import csv
 from pathlib import Path
 
-source = Path("Wrike_Data_local_validation.py").read_text()
-lines = source.splitlines()
+runs = {
+    "Surya": "20260924T213922_287354Z",
+    "Akash": "20260925T001910_967424Z",
+}
+hierarchy = [
+    "parent_task_id", "child_task_id", "grandchild_task_id",
+    "baby_task_id", "grandbaby_task_id", "great_grandbaby_task_id",
+]
+def clean(value):
+    value = (value or "").strip()
+    return "" if value.lower() in {"", "nan", "none", "null", "<na>"} else value
 
-for n in ast.walk(ast.parse(source)):
-    if (
-        isinstance(n, ast.Call)
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr == "dropna"
-        and isinstance(n.func.value, ast.Name)
-        and n.func.value.id == "df_tasks_final_complete_prep_renamed"
-    ):
-        for i in range(max(0, n.lineno - 19),
-                       min(len(lines), n.end_lineno + 5)):
-            print(f"{i + 1}: {lines[i]}")
+for name, run in runs.items():
+    path = Path("output/local_validation") / run / "wrike_local_full.csv"
+    references, records = set(), set()
+    with path.open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        required = set(hierarchy + ["key"])
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            print(f"{name}: missing columns: {sorted(missing)}")
+            continue
+        for row in reader:
+            ids = [clean(row[c]) for c in hierarchy]
+            references.update(x for x in ids if x)
+            deepest = next((x for x in reversed(ids) if x), "")
+            key = clean(row["key"])
+            if deepest and key == deepest:
+                records.add(key)
+    unmatched = sorted(references - records)
+    print(f"{name}: hierarchy task IDs={len(references):,}; "
+          f"own task records={len(records):,}")
+    print(f"Without own task record={len(unmatched):,}; "
+          f"first 10={unmatched[:10]}")
 PY
