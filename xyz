@@ -1,1 +1,13 @@
-sed -n '272,304p;355,375p' Wrike_Data_local_validation.py
+cd ~/Desktop/wrike-local-baseline
+python3 - <<'PY'
+from pathlib import Path
+
+p = Path("Wrike_Data_local_validation.py")
+patterns = (
+    "nextPageToken", "pageSize", "next_page",
+    "wrike_get(", "fetch_threaded("
+)
+for number, line in enumerate(p.read_text().splitlines(), 1):
+    if any(pattern in line for pattern in patterns):
+        print(f"{number}: {line.strip()}")
+PY
