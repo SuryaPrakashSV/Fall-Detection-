@@ -16,3 +16,6 @@ with files[-1].open(encoding="utf-8-sig", newline="") as f:
             print("Tasks:", row["task_count"])
             print("Signed hours:", row["baseline_minus_akash_hours"])
 PY
+
+
+
