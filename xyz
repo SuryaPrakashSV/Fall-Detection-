@@ -1,2 +1,5 @@
-cd ~/Desktop/wrike-local-baseline
-python3 capture_project_access_today.py --snapshot snowflake_snapshot.csv --expected-rows 213617
+python3 - <<'PY'
+import importlib.util
+for name in ("xlsxwriter", "openpyxl"):
+    print(name, "AVAILABLE" if importlib.util.find_spec(name) else "NOT INSTALLED")
+PY
