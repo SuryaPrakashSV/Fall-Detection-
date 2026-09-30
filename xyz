@@ -1,6 +1,9 @@
-4. Reconciliation
-This explains the full 4,783,705.88 hours. We combine accessible and missing project effort, subtract tasks shared between those groups and include tasks outside both project groups. The calculation balances using unrounded minutes.
+Measure	Hours
+Frozen Snowflake total	4,783,705.88
+Accessible projects, deduplicated	4,177,784.67
+Missing Projects column sum	365,281.50
+Missing projects, deduplicated	358,796.50
+Five extra projects, separately captured	46,794.00
 
-5. Extra Project Effort
-These are the five accessible projects absent from the snapshot. Their later Wrike capture returned 46,794 recorded hours. Those hours stay separate from the frozen reconciliation.
 
+The missing-project column sum includes 6,485 hours of repeated tasks across projects. That explains its difference from the deduplicated total.
