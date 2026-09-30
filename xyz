@@ -1,2 +1,2 @@
-cd ~/Desktop/wrike-local-baseline
-nl -ba Wrike_Data_local_validation.py | sed -n '170,265p'
+
+nl -ba Wrike_Data_local_validation.py | sed -n '145,169p'
