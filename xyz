@@ -1,10 +1,20 @@
 cd ~/Desktop/wrike-local-baseline
 python3 - <<'PY'
-import json
 from pathlib import Path
+from calculate_wrike_effort import Dataset
 
-p = Path("output/aligned_comparison/20260930T051554_923434Z_surya/endpoint_sample.json")
-task = json.loads(p.read_text())["data"][0]
-print("Task ID:", task["id"])
-print("effortAllocation:", json.dumps(task["effortAllocation"], indent=2))
+path = Path(
+    "output/local_validation/"
+    "20260925T001910_967424Z/wrike_local_full.csv"
+)
+
+data = Dataset("Akash export", path, {}, expected_rows=169002)
+total = data.total(data.tasks, data.unknown_identity_rows)
+
+print("\n--- AKASH EFFORT TOTAL ---")
+print("Unique tasks:", total["task_count"])
+print("Unknown effort tasks:", total["unknown_effort_task_count"])
+print("Ambiguous identity rows:", data.unknown_identity_rows)
+print("Planned effort hours:", total["hours"] or "UNKNOWN — review issues")
+print("Data refresh:", dict(data.refresh))
 PY
