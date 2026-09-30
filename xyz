@@ -1,35 +1,24 @@
 cd ~/Desktop/wrike-local-baseline
 python3 - <<'PY'
-import json
-from collections import Counter
+import subprocess
+import sys
 from pathlib import Path
 
-case = Path("output/aligned_comparison/20260930T051554_923434Z_surya")
-run = sorted(case.glob("reference_before_*"))[-1]
-manifest = json.loads((run / "manifest.json").read_text())
-response = manifest["requests"][0]["response_file"]
+base = Path("output/aligned_comparison")
+existing = set(base.glob("*_surya"))
 
-def load(path):
-    rows = json.loads(path.read_text())["data"]
-    return {
-        r["id"]: {
-            "title": r.get("title"),
-            "scope": r.get("scope"),
-            "has_project": "project" in r,
-            "childIds": sorted(r.get("childIds", [])),
-        } for r in rows
-    }
+result = subprocess.run([
+    sys.executable, "prepare_wrike_comparison.py", "--label", "surya"
+])
+if result.returncode:
+    sys.exit(result.returncode)
 
-old = load(case / "folder_tree.json")
-new = load(run / response)
-changes = [
-    (fid, [k for k in old[fid] if old[fid][k] != new[fid][k]])
-    for fid in sorted(old.keys() & new.keys())
-    if old[fid] != new[fid]
-]
-print("Added folder records:", len(new.keys() - old.keys()))
-print("Removed folder records:", len(old.keys() - new.keys()))
-print("Changed fields:", dict(Counter(k for _, fields in changes for k in fields)))
-for fid, fields in changes[:8]:
-    print(fid, ", ".join(fields))
+created = set(base.glob("*_surya")) - existing
+if len(created) != 1:
+    sys.exit("Could not identify exactly one new preparation.")
+
+sys.exit(subprocess.call([
+    sys.executable, "capture_wrike_reference.py",
+    "--case", str(created.pop()), "--phase", "before"
+]))
 PY
