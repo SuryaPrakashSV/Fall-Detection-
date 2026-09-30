@@ -1,10 +1,2 @@
 cd ~/Desktop/wrike-local-baseline
-python3 - <<'PY'
-from pathlib import Path
-
-run = sorted(Path("output/folder_scope_probe").glob("*_surya"))[-1]
-print("RUN:", run.name)
-for path in sorted(run.glob("task_*.json")):
-    print("\nFILE:", path.name)
-    print(path.read_text())
-PY
+cat output/folder_scope_probe/*_surya/task_*.json
