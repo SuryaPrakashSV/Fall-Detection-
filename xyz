@@ -1,6 +1,1 @@
-SELECT CURRENT_TIMESTAMP() AS query_checked_at, *
-FROM classified
-WHERE difference_type = 'BASELINE_ONLY_OUTSIDE_56'
-  AND creation_bucket = 'ON_OR_BEFORE_SAVED_AKASH_REFRESH'
-  AND saved_signed_hours = 0
-ORDER BY task_id;
+sed -n '272,304p;355,375p' Wrike_Data_local_validation.py
