@@ -15,8 +15,9 @@ All statuses are requested by omitting status filters, matching the extractor.
 Raw API pages, request times, hashes, membership and conflicting observations
 are retained. Missing effort is never silently converted to a numeric zero.
 
-Requires the exact prepare_wrike_comparison.py delivered with this workflow.
-The reviewed scope helper is imported only after checking its SHA256. The
+Requires the reviewed prepare_wrike_comparison.py delivered with this workflow.
+The helper is loaded only after checking its bytes or normalized Python AST.
+Line endings, comments and formatting may differ; Python code must match. The
 production/local extraction source is parsed as text and is NEVER executed.
 
 Official request parameters:
@@ -30,14 +31,15 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import getpass
 import hashlib
-import importlib.util
 import json
 from pathlib import Path
 import re
 import sys
 import time
+import types
 
 HELPER_SHA256 = "abaa98653440d7aead3730649cd2c3aa4317b0bad3290c92f3ce0ce90afcf93b"
+HELPER_CODE_SHA256 = "9a6b07d94dda227c9b34e03ac0b5fa26826831fde12b11c2ab4ac92edc2bed77"
 FIELDS = ["effortAllocation", "parentIds", "superParentIds", "superTaskIds", "subTaskIds"]
 RELATIONS = FIELDS[1:]
 ID_PATTERN = re.compile(r"[A-Za-z0-9_-]+\Z")
@@ -55,13 +57,38 @@ def encoded(value):
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
 
 
+def code_signature(tree):
+    def canonical(node):
+        if isinstance(node, ast.AST):
+            # Ignore empty optional fields added by newer Python versions.
+            return {"node": type(node).__name__, "fields": {
+                key: canonical(value) for key, value in ast.iter_fields(node)
+                if value is not None and value != []}}
+        if isinstance(node, list):
+            return [canonical(value) for value in node]
+        return node
+    return sha(json.dumps(canonical(tree), sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=True).encode())
+
+
+def verified_helper_tree(raw):
+    tree = ast.parse(raw)
+    actual_code = code_signature(tree)
+    if sha(raw) != HELPER_SHA256 and actual_code != HELPER_CODE_SHA256:
+        raise ValueError("Preparation helper Python code differs from reviewed version; "
+                         "no API calls made. Helper bytes SHA256=" + sha(raw) +
+                         "; helper code SHA256=" + actual_code)
+    return tree
+
+
 def load_helper():
     path = Path(__file__).resolve().with_name("prepare_wrike_comparison.py")
-    if sha(path.read_bytes()) != HELPER_SHA256:
-        raise ValueError("Preparation helper differs from the reviewed version; stop for review")
-    spec = importlib.util.spec_from_file_location("wrike_comparison_scope_helper", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    tree = verified_helper_tree(path.read_bytes())
+    module = types.ModuleType("wrike_comparison_scope_helper")
+    module.__file__ = str(path)
+    # Execute exactly the verified helper AST, avoiding stale bytecode or a reread.
+    # This is our preparation helper, never the user's extraction source.
+    exec(compile(tree, str(path), "exec"), module.__dict__)
     return module
 
 
