@@ -1,3 +1,1 @@
-Hi Akash, sorry for the delayed update. I know you wanted to share the output with the LOC team today.
-I’ve added effort hours for all 56 projects. The total is 328,782 planned hours, without counting shared tasks twice.
-The earlier comparison showed 11,575.17 fewer hours than Snowflake, but the files were from different dates. I’m now comparing fresh data from both tokens with Snowflake to check the remaining differences before sharing the final report.
+python3 review_wrike_differences.py --case output/aligned_comparison/20260930T054149_860457Z_surya
