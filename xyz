@@ -1,66 +1,80 @@
-SET akash_cutoff = 'PASTE_DATA_REFRESH_VALUE_FROM_AKASH_EXPORT';
+cd ~/Desktop/wrike-local-baseline
+python3 - <<'PY'
+import json
+from pathlib import Path
+from collections import Counter, defaultdict
+from decimal import Decimal
 
-WITH cutoff AS (
-    SELECT TO_TIMESTAMP_TZ(REGEXP_REPLACE($akash_cutoff, ' [A-Z]{3,4}', ' '),
-                           'YYYY-MM-DD HH24:MI:SS TZHTZM') AS ts
-),
-folder_keys AS (
-    SELECT DISTINCT "key" AS k
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE "key" = "id" AND "key" IS NOT NULL
-),
-per_task AS (
-    SELECT
-        "key",
-        MAX(TRY_TO_TIMESTAMP_TZ("createdDate"::VARCHAR)) AS created_at,
-        MAX(TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR)) AS updated_at,
-        MAX(CASE WHEN LOWER(TRIM("effortAllocation_totalEffort"::VARCHAR)) IN ('', 'nan', 'none', 'null') THEN NULL
-                 ELSE TRY_TO_DOUBLE("effortAllocation_totalEffort"::VARCHAR) END) AS effort_min
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE NULLIF(TRIM("key"), '') IS NOT NULL
-      AND "key" NOT IN (SELECT k FROM folder_keys)
-    GROUP BY "key"
-)
-SELECT
-    c.ts                                              AS akash_cutoff_parsed,
-    CASE
-        WHEN p.created_at IS NULL THEN '4. no created date'
-        WHEN p.created_at > c.ts  THEN '1. created after Akash snapshot (timing)'
-        WHEN p.updated_at > c.ts  THEN '2. existed, changed since (maybe timing)'
-        ELSE                           '3. unchanged since Akash snapshot'
-    END                                               AS timing_bucket,
-    COUNT(*)                                          AS tasks,
-    SUM(CASE WHEN p.effort_min > 0 THEN 1 ELSE 0 END) AS tasks_with_effort,
-    ROUND(COALESCE(SUM(p.effort_min), 0) / 60, 2)     AS effort_hours
-FROM per_task p
-CROSS JOIN cutoff c
-GROUP BY 1, 2
-ORDER BY 2;
+files = sorted(Path("output/remaining_196_access").glob(
+    "*/task_access_results.json"
+))
+if not files:
+    raise SystemExit("No task_access_results.json found.")
 
+data = json.loads(files[-1].read_text())
+targets = data["targets"]
+results = data["results"]
 
+if len(targets) != 196:
+    raise SystemExit("Expected 196 tasks. Stopping.")
 
+def ids(record, field):
+    value = record.get(field, [])
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) for item in value
+    ):
+        raise SystemExit("Unexpected parent-ID format.")
+    return set(value)
 
-WITH folder_keys AS (
-    SELECT DISTINCT "key" AS k
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE "key" = "id" AND "key" IS NOT NULL
-),
-per_task AS (
-    SELECT
-        "key",
-        MAX(CASE WHEN LOWER(TRIM("effortAllocation_totalEffort"::VARCHAR)) IN ('', 'nan', 'none', 'null') THEN NULL
-                 ELSE TRY_TO_DOUBLE("effortAllocation_totalEffort"::VARCHAR) END) AS effort_min
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE NULLIF(TRIM("key"), '') IS NOT NULL
-      AND "key" NOT IN (SELECT k FROM folder_keys)
-    GROUP BY "key"
-)
-SELECT
-    COUNT(*)                                                              AS tasks_with_effort,
-    ROUND(MEDIAN(effort_min) / 60, 2)                                     AS median_hours,
-    ROUND(APPROX_PERCENTILE(effort_min, 0.99) / 60, 2)                    AS p99_hours,
-    ROUND(MAX(effort_min) / 60, 2)                                        AS max_hours,
-    SUM(CASE WHEN effort_min >= 60000 THEN 1 ELSE 0 END)                  AS tasks_over_1000h,
-    ROUND(SUM(CASE WHEN effort_min >= 60000 THEN effort_min END) / 60, 2) AS hours_in_tasks_over_1000h
-FROM per_task
-WHERE effort_min > 0;
+for label in ("Surya", "Akash"):
+    if any(results[label].get(t, {}).get("outcome") != "RETRIEVED"
+           for t in targets):
+        raise SystemExit(f"{label}: not all 196 tasks were retrieved.")
+
+groups = defaultdict(lambda: {
+    "count": 0, "hours": Decimal(0),
+    "Surya_match": 0, "Akash_match": 0,
+    "has_super_task": 0
+})
+counts = Counter()
+
+for task_id, item in targets.items():
+    saved = set(item["saved_container_ids"])
+    group = groups[tuple(sorted(saved))]
+    group["count"] += 1
+    group["hours"] += Decimal(item["saved_hours"])
+    parents = {}
+    supers = {}
+
+    for label in ("Surya", "Akash"):
+        record = results[label][task_id]
+        parents[label] = ids(record, "api_parentIds")
+        supers[label] = ids(record, "api_superTaskIds")
+        matched = bool(saved & parents[label])
+        group[label + "_match"] += int(matched)
+        counts[label + ": saved container appears in parentIds"] += int(matched)
+        counts[label + ": empty or absent parentIds"] += int(not parents[label])
+        counts[label + ": has superTaskIds"] += int(bool(supers[label]))
+
+    group["has_super_task"] += int(bool(supers["Surya"] | supers["Akash"]))
+    counts["Different parentIds between tokens"] += int(
+        parents["Surya"] != parents["Akash"]
+    )
+    counts["Different superTaskIds between tokens"] += int(
+        supers["Surya"] != supers["Akash"]
+    )
+
+print("\nPARENT RELATIONSHIP SUMMARY")
+print("Tasks:", len(targets))
+for label, count in counts.items():
+    print(label + ":", count)
+
+print("\nBY SAVED CONTAINER")
+print("Container | Tasks | Saved hours | Surya matches | Akash matches | Has supertask")
+for containers, g in sorted(groups.items()):
+    print(
+        ",".join(containers) or "(none)",
+        g["count"], g["hours"], g["Surya_match"],
+        g["Akash_match"], g["has_super_task"], sep=" | "
+    )
+PY
