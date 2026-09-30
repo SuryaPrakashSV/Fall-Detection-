@@ -1,37 +1,75 @@
-cd ~/Desktop/wrike-local-baseline
-python3 - <<'PY'
-import json
-from decimal import Decimal
-from pathlib import Path
-
-case = Path("output/aligned_comparison/20260930T054149_860457Z_surya")
-review = sorted(case.glob("difference_review_*"))[-1]
-s = json.loads((review / "review_summary.json").read_text())
-evidence = json.loads((review / "task_evidence.json").read_text())
-by_id = {r["task_id"]: r for r in evidence}
-folders = {
-    r["id"]: r
-    for r in json.loads((case / "folder_tree.json").read_text())["data"]
-}
-
-print("Three tasks and omitted root links:")
-for item in s["root_membership_differences"]:
-    tid = item["task_id"]
-    minutes = by_id[tid]["comparison"]["csv_minutes"]
-    csv_roots = {r["id"] for r in item["csv_roots"]}
-    print("\nTask:", tid, "Hours:", Decimal(minutes) / 60)
-    for root in item["before_roots"]:
-        if root["id"] not in csv_roots:
-            folder = folders.get(root["id"])
-            print("Omitted:", root["title"], root["id"],
-                  "Marked as project:",
-                  ("project" in folder) if folder is not None else "unknown")
-
-print("\nFinal request error, including its ending:")
-logs = json.loads((review / "log_candidates.json").read_text())
-for row in logs:
-    if row["line_number"] == 580:
-        print(row["text"][-1000:])
-    if "missing task ids" in row["text"].lower():
-        print("Line", row["line_number"], row["text"])
-PY
+Wrike planned effort | 30 September 2026 1
+Wrike effort reconciliation
+Prepared for Akash | 30 September 2026
+56-project effort: 328,782 hours after deduplicating shared tasks. The historical 11,575.17-hour
+residual is mathematically reconciled. The September 30 checks support task-effort consistency for the
+observed baseline; they do not establish complete historical or folder-membership coverage.
+The project report
+Measure Result
+Confirmed projects in the report 56
+Sum of individual project rows 335,267 hours
+Shared-task overlap counted in the row sum 6,485 hours
+Deduplicated union: 4,715 task IDs 328,782 hours
+494 tasks occur in more than one project scope. Each project may include its shared tasks, but the combined total counts
+each task once. Of the 56 projects, 55 have calculated effort and one has no recorded tasks. The saved September 24 and
+September 29 unions contain the same 4,715 task IDs and effort values; this does not prove identical per-project
+memberships.
+Metric: planned task effort, effortAllocation_totalEffort / 60, across all statuses. This is not logged
+time. Task identity uses the record key and deepest populated task ID; folder-own rows are excluded.
+Historical snapshots and reconciliation
+The main bridge compares Akash's saved September 24, 7:19:07 p.m. CDT export with Snowflake's
+September 29, 9:44:07 a.m. CDT snapshot. They were not captured at the same time.
+Bridge to September 29 Snowflake Planned hours
+Akash's September 24 saved total 4,423,377.20
+Add: deduplicated 56-project union +328,782.00
+Add: 1,326 Snowflake-only tasks outside that union +56,304.63
+Subtract: 831 tasks only in saved Akash export -48,203.00
+Add: net effort changes on 31 shared tasks +3,473.53
+September 29 Snowflake total 4,763,734.37
+Residual after adding the 56-project union: +11,575.17 hours on the Snowflake side. It comprises the
+outside-union additions, Akash-only subtraction and shared-task effort changes above. It is not an unexplained access gap.
+Figures are displayed to two decimals; the reconciliation uses unrounded values.
+Companion project detail: missing_projects_effort_hours.csv. The existing 56-project CSV remains the project-level
+attachment. This note summarizes the saved reconciliation and subsequent validation outputs; it does not replace that
+CSV.
+Wrike planned effort | 30 September 2026 2
+September 30 validation
+Result: observed task effort reconciles; full extraction completeness remains qualified.
+Dataset Unique tasks Recorded numeric hours
+BEFORE reference 133,585 4,767,972.883333
+CSV export: 213,309 physical rows 133,586 4,767,972.883333
+AFTER reference 133,716 4,775,073.883333
+Every BEFORE task appears in the CSV. All 51,701 BEFORE tasks with explicit numeric effort match the CSV
+and AFTER values. Another 81,884 shared tasks have no effort configured in Wrike and appear as zero in
+the CSV; this representation is recorded separately from explicit zero. The CSV includes one additional
+zero-effort task found in AFTER.
+Differences observed during the run
+130 tasks present only in AFTER: all have creation timestamps within the extraction window. 123 are
+linked to the added project, "FR: Financing Disclaimer on rep ex", with 7,005 explicit hours and 49 tasks
+without numeric effort. The other seven contribute 96 hours. Together they account for the 7,101-hour
+AFTER increase. Their creation dates establish that they were created during the run, but do not prove
+when each relevant folder was queried.
+Three omitted direct root links: two zero-effort tasks lack their BAU links in the CSV. A third task lacks
+its Active Projects link and has 54 hours already included through its retained project path. Both omitted
+root containers are not marked as projects. These are folder-attribution omissions, not additional missing
+task hours.
+Two shared task records changed from Active to Completed between reference captures without an
+effort change. These are before/after observations, not a reconstructed transition history.
+Request handling: the logs show rate limiting, timeouts, proxy retries and invalid folders/nan requests.
+All three displayed task-fetch stages report zero missing requested IDs, including the stage after the final
+displayed retry. This supports task-batch recovery, not proof that every discovery request succeeded.
+Timing and evidence boundary
+All times below are CDT on September 30: BEFORE 12:42:03-12:46:44 a.m.; extraction 1:47:37-8:23:45 a.m.; AFTER
+8:41:57-8:46:15 a.m.. The extraction lasted 6 hours 36 minutes. Folder membership changed from 2,356 to 2,357 while
+the same 15 roots remained selected. File hashes, raw reference pages and pagination were checked by the offline
+comparator.
+Limits that remain
+Historical deletion dates are unverified. Both tokens returned RbTask for the 196 previously investigated tasks, which
+carried 4,771 saved hours; no UI corroboration or deletion-date proof was obtained. Two historical zero-effort omissions
+remain unexplained and do not change the hours.
+The new captures do not validate unseen tasks, historical permissions, every project membership or an atomic point in
+time. The three direct folder links remain uncorrected in the tested CSV. Accordingly, the defensible claim is task-effort
+consistency for the observed scope and baseline, not "100% validated extraction".
+Evidence basis: saved September 24/29 reconciliation documented in the continuation handoff, plus September 30 local
+comparison and review outputs shared as terminal screenshots. Raw datasets and request evidence remain in the local
+comparison case
