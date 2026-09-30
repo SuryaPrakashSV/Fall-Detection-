@@ -1,4 +1,1 @@
-cd ~/Desktop/wrike-local-baseline
-python3 capture_wrike_reference.py \
-  --case output/aligned_comparison/20260930T051554_923434Z_surya \
-  --phase before
+python3 capture_wrike_reference.py --case output/aligned_comparison/20260930T051554_923434Z_surya --phase before
