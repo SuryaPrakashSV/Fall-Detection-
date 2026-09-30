@@ -1,2 +1,17 @@
 cd ~/Desktop/wrike-local-baseline
-python3 compare_wrike_captures.py --case output/aligned_comparison/20260930T054149_860457Z_surya
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+case = Path("output/aligned_comparison/20260930T054149_860457Z_surya")
+path = sorted(case.glob("offline_comparison_*/summary.json"))[-1]
+s = json.loads(path.read_text())
+
+for section in (
+    "row_counts", "totals", "comparison_counts",
+    "review_flag_counts", "changed_folder_task_totals", "timing"
+):
+    print("\n" + section)
+    for key, value in s.get(section, {}).items():
+        print(key, ":", json.dumps(value))
+PY
