@@ -1,47 +1,27 @@
-cd ~/Desktop/wrike-local-baseline
 python3 - <<'PY'
 import json
 from pathlib import Path
-from collections import defaultdict, Counter
-from decimal import Decimal
 
-files = sorted(Path("output/remaining_196_access").glob(
-    "*/task_access_results.json"
+root = Path.home() / "Desktop/wrike-local-baseline"
+files = sorted(root.glob(
+    "output/remaining_196_access/*/task_access_results.json"
 ))
 if not files:
-    raise SystemExit("No saved results found.")
+    raise SystemExit("No saved task access results found.")
 
 data = json.loads(files[-1].read_text())
-groups = defaultdict(lambda: [0, Decimal(0)])
-relationships = Counter()
+print("Source:", files[-1])
+count = 0
 
 for task_id, item in data["targets"].items():
-    a = data["results"]["Surya"][task_id]
-    b = data["results"]["Akash"][task_id]
-    if a["outcome"] != "RETRIEVED" or b["outcome"] != "RETRIEVED":
-        raise SystemExit("Not all tasks were retrieved. Stopping.")
-
-    key = (
-        a.get("api_scope") or "(not supplied)",
-        b.get("api_scope") or "(not supplied)",
-        a.get("api_status") or "(not supplied)",
-        b.get("api_status") or "(not supplied)"
-    )
-    groups[key][0] += 1
-    groups[key][1] += Decimal(item["saved_hours"])
-
-    matched = bool(
-        set(item["saved_container_ids"]) & set(a["api_parentIds"])
-    )
-    has_super = bool(a["api_superTaskIds"])
-    relationships[(matched, has_super)] += 1
-
-print("\nSCOPE AND STATUS SUMMARY")
-print("Surya scope | Akash scope | Surya status | Akash status | Tasks | Saved hours")
-for key, values in sorted(groups.items()):
-    print(*key, *values, sep=" | ")
-
-print("\nPARENT OVERLAP SUMMARY")
-for (matched, has_super), count in sorted(relationships.items()):
-    print(f"Saved parent matches={matched}; has supertask={has_super}; tasks={count}")
+    a = data["results"]["Surya"].get(task_id, {})
+    b = data["results"]["Akash"].get(task_id, {})
+    if a.get("api_scope") == b.get("api_scope") == "RbTask":
+        print("\nID:", task_id)
+        print("Title:", a.get("api_title"))
+        print("Scope under both tokens:", a["api_scope"])
+        print("Saved hours:", item["saved_hours"])
+        count += 1
+        if count == 3:
+            break
 PY
