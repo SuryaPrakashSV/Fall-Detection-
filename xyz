@@ -1,2 +1,18 @@
 cd ~/Desktop/wrike-local-baseline
-python3 run_wrike_comparison_export.py --case output/aligned_comparison/20260930T054149_860457Z_surya
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+case = Path("output/aligned_comparison/20260930T054149_860457Z_surya")
+after = sorted(case.glob("reference_after_*"))[-1]
+before = json.loads((case / "frozen_scope.json").read_text())
+current = json.loads((after / "scope_at_start.json").read_text())
+
+print("AFTER capture:", after.name)
+for field in ("root_ids", "folder_ids"):
+    old, new = set(before[field]), set(current[field])
+    added, removed = sorted(new - old), sorted(old - new)
+    print(f"\n{field}: before={len(old)}, after={len(new)}")
+    print(f"Added ({len(added)}):", added[:30])
+    print(f"Removed ({len(removed)}):", removed[:30])
+PYs
