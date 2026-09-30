@@ -1,5 +1,910 @@
-ls -ld \
-"$HOME/Desktop/wrike-local-baseline/build_wrike_workbook.py" \
-"$HOME/Desktop/wrike-local-baseline/wrike_report_analysis.py" \
-"$HOME/Desktop/wrike-local-baseline/snowflake_snapshot.csv" \
-"$HOME/Desktop/wrike-local-baseline/output/project_access_today/20260930T161721_018375Z"
+#!/usr/bin/env python3
+"""Build the Wrike snapshot reconciliation on the user's Mac, entirely offline.
+
+Uses the locally installed XlsxWriter package in constant-memory mode.
+Inputs are read only. Output is a new timestamped directory. No API calls.
+"""
+import argparse
+import csv
+import hashlib
+import json
+import math
+import shutil
+import sys
+import zipfile
+from collections import defaultdict
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+import wrike_report_analysis as analysis
+
+START = 5  # zero-based first detail row; Excel row 6
+MAX_ROWS = 1048576
+
+
+def file_sha(path):
+    h = hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for chunk in iter(lambda: f.read(1048576), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def cell(col, row):
+    letters = ''
+    col += 1
+    while col:
+        col, n = divmod(col - 1, 26)
+        letters = chr(65+n) + letters
+    return letters + str(row + 1)
+
+
+class Writer:
+    def __init__(self, path):
+        import xlsxwriter
+        self.book = xlsxwriter.Workbook(str(path), {
+            'constant_memory': True, 'strings_to_formulas': False,
+            'strings_to_urls': False, 'strings_to_numbers': False,
+            'tmpdir': str(Path(path).parent)})
+        self.book.set_properties({'title': 'Wrike project access and planned effort',
+            'author': 'Surya', 'comments': 'Frozen Snowflake effort classified by observed project access.'})
+        self.book.set_calc_mode('auto')
+        self.base = self.book.add_format({'font_name': 'Arial', 'font_size': 10, 'valign': 'vcenter'})
+        self.title = self.book.add_format({'font_name': 'Arial', 'font_size': 16, 'bold': True, 'font_color': '#17365D'})
+        self.note = self.book.add_format({'font_name': 'Arial', 'font_size': 10, 'font_color': '#555555'})
+        self.head = self.book.add_format({'font_name': 'Arial', 'font_size': 10, 'bold': True,
+            'bg_color': '#24476A', 'font_color': '#FFFFFF', 'text_wrap': True,
+            'valign': 'vcenter', 'align': 'center'})
+        self.num = self.book.add_format({'font_name': 'Arial', 'font_size': 10, 'num_format': '#,##0.00;[Red](#,##0.00)'})
+        self.integer = self.book.add_format({'font_name': 'Arial', 'font_size': 10, 'num_format': '#,##0'})
+        self.warn = self.book.add_format({'font_name': 'Arial', 'font_size': 10, 'bg_color': '#FFF2CC', 'font_color': '#7F6000'})
+        self.sheets, self.ranges, self.overflow = {}, {}, []
+
+    def new_sheet(self, name):
+        s = self.book.add_worksheet(name)
+        self.sheets[name] = s
+        s.hide_gridlines(2)
+        s.set_default_row(15)
+        s.set_zoom(90)
+        s.set_column(0, 30, 20, self.base)
+        return s
+
+    def value(self, sheet, row, col, value, fmt=None):
+        if value is None or value == '':
+            return
+        if isinstance(value, bool):
+            result = sheet.write_number(row, col, int(value), fmt or self.integer)
+        elif isinstance(value, (int, float, Decimal)):
+            if not math.isfinite(float(value)):
+                raise ValueError('Nonfinite number in workbook input')
+            result = sheet.write_number(row, col, float(value), fmt or (self.integer if isinstance(value,int) else self.num))
+        else:
+            if isinstance(value, (list, dict, set, tuple)):
+                value = json.dumps(list(value) if isinstance(value, set) else value, ensure_ascii=False, default=str)
+            text = str(value)
+            # Excel's text limit is 32,767 characters. Preserve oversize values in chunks.
+            if len(text.encode('utf-16-le')) // 2 > 32767:
+                ref = len(self.overflow)+1
+                self.overflow.append((ref, sheet.name, row+1, col+1, text))
+                text = f'[Full value in Long Cell Values, reference {ref}; {len(text)} characters]'
+            result = sheet.write_string(row, col, text, fmt or self.base)
+        if result != 0:
+            raise ValueError(f'Excel write failed at {sheet.name}!{cell(col,row)}: {result}')
+
+    def formula(self, sheet, row, col, formula, cached, fmt=None):
+        result = sheet.write_formula(row, col, formula, fmt or self.num,
+                                    '' if cached is None else float(cached) if isinstance(cached,(int,float,Decimal)) else cached)
+        if result != 0:
+            raise ValueError('Formula write failed')
+
+    def heading(self, sheet, title, note, fields, widths=None):
+        self.value(sheet,1,0,title,self.title)
+        self.value(sheet,2,0,note,self.note)
+        sheet.set_row(1,23)
+        sheet.set_row(4,32)
+        for col, label in enumerate(fields):
+            self.value(sheet,4,col,label,self.head)
+            if widths:
+                sheet.set_column(col,col,widths[col],self.base)
+        sheet.freeze_panes(START, min(2,len(fields)))
+
+    def finish_table(self, sheet, count, columns):
+        if count + START > MAX_ROWS:
+            raise ValueError(f'{sheet.name} exceeds Excel row limit')
+        if count:
+            sheet.autofilter(START-1,0,START+count-1,columns-1)
+        self.ranges[sheet.name] = {'header_excel_row': START, 'data_rows': count, 'columns':columns}
+
+    def generic(self, name, rows, note, fields=None):
+        s=self.sheets.get(name) or self.new_sheet(name)
+        keys=fields or list(dict.fromkeys(k for item in rows for k in item)) or ['Result']
+        widths=[50 if ('name' in k or 'note' in k or 'reason' in k) else 25 for k in keys]
+        self.heading(s,name,note,[k.replace('_',' ').capitalize() for k in keys],widths)
+        for r,item in enumerate(rows,START):
+            for c,k in enumerate(keys):
+                self.value(s,r,c,item.get(k))
+        self.finish_table(s,len(rows),len(keys))
+        return s
+
+    def raw_snapshot(self, snapshot, expected_rows, expected_sha):
+        print('Writing the complete Snowflake snapshot...',flush=True)
+        s=self.sheets['Snowflake Snapshot']
+        csv.field_size_limit(sys.maxsize)
+        n=0
+        with Path(snapshot).open(encoding='utf-8-sig',newline='') as f:
+            reader=csv.reader(f)
+            headers=next(reader)
+            s.set_column(0,len(headers)-1,22,self.base)
+            s.freeze_panes(1,1)
+            s.set_row(0,42)
+            for c,h in enumerate(headers):
+                self.value(s,0,c,h,self.head)
+            numeric={c for c,h in enumerate(headers) if h.strip().lower() in (
+                'effortallocation_totaleffort','totaleffortminutes','owner_dailyallocation','owner_effortminutes_per_day')}
+            for n,row in enumerate(reader,1):
+                if len(row)!=len(headers):
+                    raise ValueError('Snapshot changed or malformed while writing')
+                if n>=MAX_ROWS:
+                    raise ValueError('Snapshot exceeds Excel row limit')
+                for c,v in enumerate(row):
+                    if not v:
+                        continue
+                    value=v
+                    if c in numeric:
+                        try:
+                            d=Decimal(v)
+                            if d.is_finite() and len(d.normalize().as_tuple().digits)<=15:
+                                value=d
+                        except InvalidOperation:
+                            pass
+                    self.value(s,n,c,value)
+                if n%25000==0:
+                    print(f'Snapshot rows written: {n:,}/{expected_rows:,}',flush=True)
+        if n!=expected_rows or file_sha(snapshot)!=expected_sha:
+            raise ValueError('Snapshot row count/hash changed; workbook invalid')
+        s.autofilter(0,0,n,len(headers)-1)
+        self.ranges[s.name]={'header_excel_row':1,'data_rows':n,'columns':len(headers)}
+
+    def write_overflow(self):
+        if not self.overflow:
+            return
+        s=self.new_sheet('Long Cell Values')
+        keys=['Reference','Source sheet','Excel row','Excel column','Chunk number','Full value SHA256','Text chunk']
+        self.heading(s,'Long cell values','Join chunks in chunk-number order to reconstruct the original text.',keys,[12,25,12,12,12,68,100])
+        row=START
+        for ref,sheet,sr,sc,text in list(self.overflow):
+            digest=hashlib.sha256(text.encode('utf-8')).hexdigest()
+            for offset in range(0,len(text),16000):
+                if row>=MAX_ROWS:
+                    raise ValueError('Long Cell Values exceeds Excel row limit')
+                for c,v in enumerate([ref,sheet,sr,sc,offset//16000+1,digest,text[offset:offset+16000]]):
+                    self.value(s,row,c,v)
+                row+=1
+        self.finish_table(s,row-START,len(keys))
+
+    def close(self):
+        self.book.close()
+
+
+def write_report(report, snapshot, path):
+    w=Writer(path)
+    for name in ['Reconciliation','Accessible Projects','Missing Projects','Other Projects',
+                 'Task Effort','Project Task Links','Access Evidence','Other Containers',
+                 'Review Issues','Snowflake Snapshot']:
+        w.new_sheet(name)
+    w.sheets['Reconciliation'].activate()
+    w.sheets['Reconciliation'].set_tab_color('#17365D')
+    for name in ['Accessible Projects','Missing Projects']:
+        w.sheets[name].set_tab_color('#557DA5')
+    task_rows=report['task_rows']
+    task_excel={r['task_id']:i+START+1 for i,r in enumerate(task_rows)}
+    source_headers=report['metadata']['snapshot_columns']
+    metric_col=[h.strip().lower() for h in source_headers].index('effortallocation_totaleffort')
+    s=w.sheets['Task Effort']
+    fields=['Task ID','Task name','Snapshot Excel row','Planned effort minutes','Planned effort hours',
+            'Partition','Calculation status','Physical rows','Accessible project IDs','Missing project IDs',
+            'All project IDs','All source Excel rows','Issues']
+    w.heading(s,'Task effort','One consistent value per own task ID. Hours = minutes / 60.',fields,
+              [25,60,18,22,22,23,22,15,40,40,40,30,45])
+    for n,t in enumerate(task_rows,START):
+        first=t.get('first_source_excel_row') or int(t['source_excel_rows'].split(';')[0])
+        values=[t['task_id'],t['task_name'],first,None,None,t['partition'],t['status'],t['physical_row_count'],
+                t['accessible_project_ids'],t['missing_project_ids'],t['all_project_ids'],t['source_excel_rows'],t['issues']]
+        for col,val in enumerate(values):
+            w.value(s,n,col,val)
+        if t['effort_minutes'] is not None:
+            rawref="'Snowflake Snapshot'!"+cell(metric_col,first-1)
+            w.formula(s,n,3,'='+rawref+'*1',t['effort_minutes'])
+            w.formula(s,n,4,'='+cell(3,n)+'/60',t['effort_hours'])
+        if (n-START+1)%50000==0:
+            print('Task effort rows written:',n-START+1,flush=True)
+    w.finish_table(s,len(task_rows),len(fields))
+    # Group membership links by project. Project totals reference contiguous ranges.
+    links=sorted(report['link_rows'],key=lambda x:(x['project_id'],x['task_id']))
+    link_ranges={}
+    s=w.sheets['Project Task Links']
+    fields=['Project ID','Task ID','Planned effort minutes','Planned effort hours','Task Effort Excel row','Source Excel rows']
+    w.heading(s,'Project task links','One project/task pair per row. A task can appear under several projects.',fields,[25,25,23,23,24,40])
+    for n,t in enumerate(links,START):
+        pid=t['project_id']; tr=task_excel[t['task_id']]
+        link_ranges.setdefault(pid,[n+1,n+1])[1]=n+1
+        for col,val in enumerate([pid,t['task_id'],None,None,tr,t['source_excel_rows']]):
+            w.value(s,n,col,val)
+        if t['effort_minutes'] is not None:
+            w.formula(s,n,2,f"='Task Effort'!D{tr}",t['effort_minutes'])
+            w.formula(s,n,3,f"='Task Effort'!E{tr}",t['effort_hours'])
+    w.finish_table(s,len(links),len(fields))
+    project_ranges={}
+    for sheetname,group in [('Accessible Projects','ACCESSIBLE'),('Missing Projects','MISSING'),('Other Projects','UNRESOLVED')]:
+        rows=[r for r in report['project_rows'] if r['access_group']==group]
+        s=w.sheets[sheetname]
+        fields=['Project ID','Project name','In snapshot','Unique tasks','Planned effort hours','Effort status',
+                'Akash retrieval','HTTP status','Access observed UTC','Unknown effort tasks','Ambiguous rows',
+                'Shared tasks','Project Task Links rows','Planned effort minutes','Snapshot/type conflict']
+        w.heading(s,sheetname,'Effort comes from frozen Snowflake. Project row sums include shared tasks.',fields,
+                  [25,65,14,15,23,25,19,12,30,20,18,16,26,23,22])
+        for n,p in enumerate(rows,START):
+            span=link_ranges.get(p['project_id'])
+            spantext=f'{span[0]}:{span[1]}' if span else ''
+            vals=[p['project_id'],p['project_name'],p['in_frozen_snapshot'],p['task_count'],None,p['effort_status'],
+                  p['akash_access'],p.get('akash_http_status'),p.get('akash_observed_at'),p['unknown_effort_task_count'],
+                  p['ambiguous_identity_row_count'],p['shared_task_count'],spantext,None,p['snapshot_type_conflict']]
+            for col,val in enumerate(vals):
+                w.value(s,n,col,val)
+            if p['effort_minutes'] is not None:
+                w.formula(s,n,13,(f"=SUM('Project Task Links'!C{span[0]}:C{span[1]})" if span else '=0'),p['effort_minutes'])
+                w.formula(s,n,4,'='+cell(13,n)+'/60',p['effort_hours'])
+        w.finish_table(s,len(rows),len(fields))
+        project_ranges[group]=(sheetname,len(rows))
+    # Summary cells expose the partition arithmetic and link to task-level formulas.
+    s=w.sheets['Reconciliation']
+    w.heading(s,'Wrike project access and planned effort','All effort uses one frozen Snowflake snapshot; access checks occurred afterward.',
+              ['Measure','Unique tasks','Planned effort hours','Unknown effort tasks','Ambiguous rows'],[72,18,24,22,20])
+    metrics={r['metric_id']:r for r in report['reconciliation_rows']}
+    metric_positions={r['metric_id']:START+i+1 for i,r in enumerate(report['reconciliation_rows'])}
+    task_end=START+len(task_rows)
+    hourrange=f"'Task Effort'!$E$6:$E${max(6,task_end)}"
+    grouprange=f"'Task Effort'!$F$6:$F${max(6,task_end)}"
+    for n,m in enumerate(report['reconciliation_rows'],START):
+        k=m['metric_id']; value=m['effort_hours']; formula=None
+        if k=='SNAPSHOT_UNIQUE_TASKS':
+            formula='=SUM('+hourrange+')'
+        elif k in ('ACCESSIBLE_ONLY','MISSING_ONLY','BOTH','NEITHER'):
+            formula=f'=SUMIFS({hourrange},{grouprange},"{k}")'
+        elif k in ('ACCESSIBLE_PROJECT_UNION','MISSING_PROJECT_UNION'):
+            part='ACCESSIBLE_ONLY' if k.startswith('ACCESSIBLE') else 'MISSING_ONLY'
+            formula=f'=SUMIFS({hourrange},{grouprange},"{part}")+SUMIFS({hourrange},{grouprange},"BOTH")'
+        elif k=='PARTITION_RESIDUAL':
+            pos=metric_positions
+            formula=f'=C{pos["SNAPSHOT_UNIQUE_TASKS"]}-C{pos["ACCESSIBLE_PROJECT_UNION"]}-C{pos["MISSING_PROJECT_UNION"]}+C{pos["BOTH"]}-C{pos["NEITHER"]}'
+        elif k.endswith('_PROJECT_ROW_SUM'):
+            group=k.removesuffix('_PROJECT_ROW_SUM'); sheetname,count=project_ranges[group]
+            formula=f"=SUM('{sheetname}'!E6:E{max(6,START+count)})"
+        elif k.endswith('_WITHIN_GROUP_OVERLAP'):
+            group=k.removesuffix('_WITHIN_GROUP_OVERLAP')
+            formula=f'=C{metric_positions[group+"_PROJECT_ROW_SUM"]}-C{metric_positions[group+"_PROJECT_UNION"]}'
+        vals=[m['label'],m.get('task_count'),None,m.get('unknown_effort_task_count'),m.get('ambiguous_identity_row_count')]
+        for c,v in enumerate(vals):w.value(s,n,c,v)
+        if value is None:
+            w.value(s,n,2,'UNAVAILABLE',w.warn)
+        elif formula:
+            w.formula(s,n,2,formula,value)
+        else:w.value(s,n,2,value)
+    row=START+len(metrics)+2
+    meta=report['metadata']; summary=report['summary']
+    info=[('Snapshot exported (recorded value)', '; '.join(meta['snapshot_timestamps'])),
+          ('Source Data refresh (recorded value)', '; '.join(meta['data_refresh_values'])),
+          ('Access capture began (UTC)',meta['capture_started_at']),('Access capture ended (UTC)',meta['capture_finished_at']),
+          ('Raw snapshot data rows',summary['snapshot_data_rows']),('Raw snapshot columns',summary['snapshot_column_count']),
+          ('Accessible baseline projects',summary['baseline_accessible_project_count']),
+          ('Missing baseline projects',summary['baseline_missing_project_count']),
+          ('API-only projects; snapshot effort unavailable',summary['api_only_project_count']),
+          ('Raw effort-column sum, minutes (repeated rows included)',summary['raw_numeric_row_sum_minutes']),
+          ('Raw cells with unknown effort',summary['raw_unknown_effort_cells']),
+          ('Task identity issues',summary['mapping_counts'].get('ambiguous_identity_rows',0)),
+          ('Snapshot/current project-type conflicts',summary['snapshot_current_type_conflict_count']),
+          ('Snapshot SHA256',meta['snapshot_sha256']),
+          ('Identity of tokens',meta['token_identity']),
+          ('Interpretation','Effort associated with currently retrievable/unavailable projects in the frozen snapshot.'),
+          ('Limit','Project retrieval does not establish that Akash can retrieve every associated task.'),
+          ('Reconciliation limit','A zero partition residual checks accounting, not independent extraction completeness.'),
+          ('Scope','All statuses. Task/subtask own records. Project scope uses id plus five folder hierarchy IDs.'),
+          ('Source preservation','All raw rows/columns retained. Oversized cell text, if any, is preserved in Long Cell Values.'),
+          ('Workbook use','Fixed evidence report. Rebuild from source to change scope, identities or access classifications.')]
+    for label,value in info:
+        w.value(s,row,0,label)
+        w.value(s,row,1,value)
+        row+=1
+    s.set_landscape();s.fit_to_pages(1,0);s.set_print_scale(75)
+    s.set_column(1,1,30,w.base)
+    s.set_column(2,2,24,w.base)
+    # Display long source notes in a wide ordinary text region, without shrinking fonts.
+    for label,value in [('Definitions','Accessible/missing labels describe observed project retrieval, not independently fetched task effort.')]:
+        w.value(s,row+1,0,label);w.value(s,row+1,1,value)
+    s.conditional_format(START,2,START+len(metrics)-1,2,{'type':'text','criteria':'containing','value':'UNAVAILABLE','format':w.warn})
+    w.ranges[s.name]={'metric_rows':len(metrics),'metadata_rows':len(info)}
+    case=Path(meta['case_path'])
+    with (case/'project_access_review.csv').open(encoding='utf-8-sig',newline='') as f:
+        access=list(csv.DictReader(f))
+    w.generic('Access Evidence',access,'Recorded project/container lookup results. HTTP 404 does not establish its historical cause.')
+    w.generic('Other Containers',report['other_container_rows'],'Nonproject or unverified containers; kept separate from project lists.')
+    w.generic('Review Issues',report['issues'],'Issues detected from saved evidence. Blank table means no listed analysis issues.',fields=None)
+    w.raw_snapshot(snapshot,summary['snapshot_data_rows'],meta['snapshot_sha256'])
+    w.write_overflow()
+    ranges=w.ranges; long_count=len(w.overflow)
+    print('Finalizing Excel file...',flush=True)
+    w.close()
+    return ranges,long_count
+
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--snapshot',default='snowflake_snapshot.csv')
+    p.add_argument('--case')
+    p.add_argument('--output')
+    args=p.parse_args()
+    import xlsxwriter
+    snapshot=Path(args.snapshot).resolve()
+    print('Validating saved evidence and calculating task effort...',flush=True)
+    report=analysis.analyze(snapshot,args.case)
+    stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')
+    output=Path(args.output).resolve() if args.output else snapshot.parent/'output'/'holistic_workbook'/stamp
+    output.mkdir(parents=True,exist_ok=False)
+    analysis.write_outputs(report,output/'supporting_calculations')
+    temporary=output/'Wrike_Project_Access_and_Effort_BUILDING.xlsx'
+    target=output/'Wrike_Project_Access_and_Effort_2026-09-30.xlsx'
+    try:
+        # XML may be several times the CSV size. Reserve working space for streaming output.
+        if shutil.disk_usage(output).free < max(2*1024**3,snapshot.stat().st_size*12):
+            raise ValueError('Insufficient disk space; at least 2 GB and 12x CSV size required')
+        ranges,long_count=write_report(report,snapshot,temporary)
+        with zipfile.ZipFile(temporary) as z:
+            bad=z.testzip()
+            if bad:raise ValueError('Workbook ZIP checksum error: '+bad)
+            if 'xl/workbook.xml' not in z.namelist():raise ValueError('Missing workbook content')
+        temporary.rename(target)
+        receipt={'status':'WORKBOOK_CREATED_REVIEW_REQUIRED','workbook':str(target),
+            'workbook_sha256':file_sha(target),'bytes':target.stat().st_size,'sheet_counts':ranges,
+            'oversized_cells_preserved_in_chunks':long_count,'source':report['metadata'],
+            'summary':report['summary'],'builder_sha256':file_sha(Path(__file__)),
+            'xlsxwriter_version':xlsxwriter.__version__,
+            'remaining_review':'Open in Excel and review summary, missing projects and supporting rows before sharing.'}
+        with (output/'workbook_receipt.json').open('x',encoding='utf-8') as f:
+            json.dump(receipt,f,indent=2,default=analysis.json_default)
+        print('\nWORKBOOK CREATED — review required')
+        for name in ['snapshot_data_rows','unique_task_count','baseline_accessible_project_count',
+                     'baseline_missing_project_count','api_only_project_count','global_effort_hours','partition_residual_minutes']:
+            print(name+':',report['summary'][name])
+        print('EFFORT RECONCILIATION (hours):')
+        for metric in report['reconciliation_rows']:
+            amount=metric['effort_hours']
+            print(metric['metric_id']+':', 'UNAVAILABLE' if amount is None else format(amount,',.2f'))
+        print('TASK ISSUES:', report['summary']['task_issue_counts'])
+        print('IDENTITY ISSUES:', report['summary']['mapping_counts'].get('ambiguous_identity_rows',0))
+        print('TYPE CONFLICTS:', report['summary']['snapshot_current_type_conflict_count'])
+        print('Oversized cells preserved separately:',long_count)
+        print('EXCEL FILE:',target)
+        print('RECEIPT:',output/'workbook_receipt.json')
+    except Exception:
+        print('Build did not finish. Keep the original CSV and access capture unchanged.')
+        print('Partial output:',output)
+        raise
+
+
+if __name__=='__main__':
+    try:main()
+    except (ValueError,OSError,KeyError,csv.Error,ImportError) as e:
+        raise SystemExit('WORKBOOK STOPPED: '+str(e))
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+"""Offline frozen-Snowflake project-access report analysis. No network calls.
+
+Project retrieval is NOT a task-access assertion. A balanced partition of a
+single snapshot is NOT independent extraction validation. Decimal minutes are
+authoritative; hours are displayed without changing the source metric.
+"""
+import argparse
+import csv
+import hashlib
+import json
+import re
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, getcontext
+from pathlib import Path
+
+getcontext().prec = 60
+csv.field_size_limit(sys.maxsize)
+FOLDERS = ('parent_folder_id', 'child_folder_id', 'grandchild_folder_id',
+           'baby_folder_id', 'grandbaby_folder_id')
+TASKS = ('parent_task_id', 'child_task_id', 'grandchild_task_id',
+         'baby_task_id', 'grandbaby_task_id', 'great_grandbaby_task_id')
+METRIC = 'effortallocation_totaleffort'
+NULLS = {'', 'null', 'none', 'nan', 'nat', '<na>', '\\n', 'placeholder'}
+MISSING = {'NOT_FOUND', 'FORBIDDEN'}
+
+
+def ident(value):
+    value = str(value or '').strip()
+    return '' if value.lower() in NULLS else value
+
+
+def sha(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load(path):
+    with Path(path).open(encoding='utf-8-sig') as f:
+        return json.load(f)
+
+
+def rows(path):
+    with Path(path).open(encoding='utf-8-sig', newline='') as f:
+        reader = csv.DictReader(f, strict=True)
+        headers = [str(v).strip().lower() for v in (reader.fieldnames or [])]
+        if not headers or '' in headers or len(set(headers)) != len(headers):
+            raise ValueError('Blank or duplicate CSV headers: ' + str(path))
+        reader.fieldnames = headers
+        for number, row in enumerate(reader, 2):
+            if None in row or any(v is None for v in row.values()):
+                raise ValueError(f'Malformed CSV record {number}: {path}')
+            yield number, row
+
+
+def numeric(value):
+    value = str(value or '').strip()
+    if value.lower() in NULLS:
+        return None, 'NULL_EFFORT'
+    if len(value) > 100 or not re.fullmatch(r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?', value):
+        return None, 'INVALID_EFFORT'
+    try:
+        result = Decimal(value)
+        if not result.is_finite() or (result and abs(result.adjusted()) > 30):
+            return None, 'INVALID_EFFORT'
+        if result < 0:
+            return None, 'NEGATIVE_EFFORT'
+        return result, ''
+    except InvalidOperation:
+        return None, 'INVALID_EFFORT'
+
+
+def hours(value):
+    return None if value is None else value / Decimal(60)
+
+
+def expect(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def utc_time(value):
+    try:
+        result = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError('Invalid capture evidence timestamp')
+    expect(result.tzinfo is not None, 'Capture timestamp has no timezone')
+    return result.astimezone(timezone.utc)
+
+
+def select_case(snapshot, case=None):
+    digest = sha(snapshot)
+    if case is not None:
+        candidates = [Path(case).resolve()]
+    else:
+        candidates = []
+        for path in (snapshot.parent / 'output' / 'project_access_today').glob('*/summary.json'):
+            record = load(path)
+            if (record.get('status') == 'ACCESS_CAPTURE_COMPLETE_REVIEW_REQUIRED'
+                    and record.get('snapshot', {}).get('sha256') == digest):
+                candidates.append(path.parent.resolve())
+    expect(len(candidates) == 1,
+           'Expected one completed access capture matching this snapshot; supply --case explicitly')
+    return candidates[0], digest
+
+
+def validate_case(case, snapshot_hash):
+    manifest = load(case / 'hashes.json')
+    expect(isinstance(manifest, dict) and manifest, 'Invalid capture hash manifest')
+    required = {'summary.json', 'snapshot_inventory.json', 'akash_access.json',
+                'supplemental_type_evidence.json', 'project_access_review.csv'}
+    expect(required <= set(manifest), 'Capture manifest does not cover required evidence files')
+    for name, digest in manifest.items():
+        path = Path(name)
+        expect(not path.is_absolute() and '..' not in path.parts and path.parts,
+               'Unsafe relative path in capture manifest')
+        target = (case / path).resolve()
+        expect(target.is_relative_to(case) and target.is_file(), 'Missing or unsafe evidence path: ' + name)
+        expect(re.fullmatch(r'[a-fA-F0-9]{64}', str(digest)) is not None, 'Invalid file hash: ' + name)
+        expect(sha(target) == digest.lower(), 'Evidence hash mismatch: ' + name)
+    actual_raw = {str(p.relative_to(case)) for p in (case / 'raw').glob('*.json')}
+    expect(actual_raw and actual_raw <= set(manifest), 'Raw API files missing or not hash-covered')
+    summary = load(case / 'summary.json')
+    inventory = load(case / 'snapshot_inventory.json')
+    access = load(case / 'akash_access.json')
+    supplemental = load(case / 'supplemental_type_evidence.json')
+    expect(summary.get('status') == 'ACCESS_CAPTURE_COMPLETE_REVIEW_REQUIRED', 'Capture is incomplete')
+    expect(summary['snapshot'] == inventory['audit'], 'Snapshot audit differs between capture files')
+    expect(summary['snapshot']['sha256'] == snapshot_hash, 'Snapshot hash does not match access capture')
+    entities = inventory['entities']
+    projects, folders, checks = (access[k] for k in ('projects', 'folders', 'direct_checks'))
+    expect(not set(projects) & set(folders), 'Project/folder inventories overlap')
+    expect(set(checks) == set(entities) - (set(projects) | set(folders)), 'Direct-check ID coverage mismatch')
+    expect(set(supplemental) <= {k for k, v in checks.items() if v['outcome'] != 'RETRIEVED'},
+           'Unexpected supplemental type-check ID')
+    expected_counts = {'visible_project_inventory_count': len(projects),
+                       'visible_folder_inventory_count': len(folders),
+                       'baseline_container_count': len(entities), 'direct_check_count': len(checks)}
+    for key, value in expected_counts.items():
+        expect(summary.get(key) == value, 'Capture summary count mismatch: ' + key)
+
+    # Verify each inventory page and the direct lookups against saved raw replies.
+    raw = [load(case / name) for name in sorted(actual_raw)]
+    capture_start, capture_end = utc_time(summary['started_at']), utc_time(summary['finished_at'])
+    expect(capture_start <= capture_end, 'Invalid capture time ordering')
+    for r in raw:
+        started, finished = utc_time(r.get('started_at')), utc_time(r.get('finished_at'))
+        expect(capture_start <= started <= finished <= capture_end, 'Raw request outside capture window')
+        expect(r.get('role_label') in ('akash', 'surya_type_only'), 'Unexpected token-role label')
+        endpoint = r.get('endpoint', '')
+        expect(endpoint == 'folders' or re.fullmatch(r'folders/[A-Za-z0-9_-]+', endpoint),
+               'Unexpected raw request endpoint')
+    successful = [r for r in raw if r.get('http_status') == 200]
+    for project_flag, saved in ((True, projects), (False, folders)):
+        pages = [r for r in successful if r.get('role_label') == 'akash'
+                 and r.get('endpoint') == 'folders'
+                 and (r.get('params') or {}).get('project') == ('true' if project_flag else 'false')]
+        expect(pages, 'Missing successful raw inventory pages')
+        found, cursor, cursors = {}, None, set()
+        for index, r in enumerate(pages):
+            params = r['params']
+            expect(params.get('deleted') == 'false' and params.get('pageSize') == 1000,
+                   'Unexpected inventory request parameters')
+            expect(params.get('nextPageToken') == cursor, 'Broken inventory pagination chain')
+            body = r.get('response') or {}
+            expect(body.get('kind') == 'folders' and isinstance(body.get('data'), list), 'Bad raw inventory response')
+            for item in body['data']:
+                fid = item.get('id')
+                expect(isinstance(fid, str) and fid not in found, 'Duplicate or invalid raw inventory ID')
+                expect(isinstance(item.get('project'), dict) == project_flag, 'Raw inventory type mismatch')
+                found[fid] = {'item': item, 'observed_at': r['finished_at'], 'via': 'inventory'}
+            cursor = body.get('nextPageToken') or None
+            if cursor:
+                expect(isinstance(cursor, str) and cursor not in cursors, 'Repeated pagination cursor')
+                cursors.add(cursor)
+            else:
+                expect(index == len(pages) - 1, 'Inventory has pages after final page')
+        expect(cursor is None and found == saved, 'Raw inventory differs from saved inventory')
+    for role, saved in (('akash', checks), ('surya_type_only', supplemental)):
+        for fid, result in saved.items():
+            matching = [r for r in raw if r.get('role_label') == role
+                        and r.get('endpoint') == 'folders/' + fid
+                        and r.get('finished_at') == result.get('observed_at')]
+            expect(len(matching) == 1, 'Missing or ambiguous raw direct lookup: ' + fid)
+            r = matching[0]
+            expect(r.get('params') is None and r.get('http_status') == result.get('http_status'),
+                   'Direct lookup request/result mismatch: ' + fid)
+            if result.get('item'):
+                body = r.get('response') or {}
+                expect(r['http_status'] == 200 and body.get('kind') == 'folders'
+                       and body.get('data') == [result['item']] and result['item'].get('id') == fid,
+                       'Direct lookup item differs from raw evidence: ' + fid)
+                expect(result.get('outcome') == 'RETRIEVED', 'Retrieved lookup outcome mismatch')
+            elif result.get('outcome') in MISSING:
+                expect(r['http_status'] == (404 if result['outcome'] == 'NOT_FOUND' else 403)
+                       and isinstance(r.get('api_error'), str), 'Missing-project outcome mismatch')
+            else:
+                expect(result.get('outcome') == 'UNRESOLVED', 'Unknown lookup outcome')
+    visible = {**projects, **folders}
+    review = {}
+    for _, row in rows(case / 'project_access_review.csv'):
+        fid = row['container_id']
+        expect(fid and fid not in review, 'Blank or duplicate review container ID')
+        review[fid] = row
+    expect(set(review) == set(entities) | set(projects), 'Review CSV ID coverage mismatch')
+    for fid, row in review.items():
+        sf = entities.get(fid, {})
+        a = visible.get(fid) or checks.get(fid, {})
+        item = a.get('item') or supplemental.get(fid, {}).get('item') or {}
+        aitem = a.get('item', {})
+        kind = ('PROJECT' if isinstance(item.get('project'), dict) else 'FOLDER') if item else 'UNVERIFIED'
+        scope = aitem.get('scope', '')
+        outcome = ('RECYCLE_BIN' if scope == 'RbFolder' else 'RETRIEVED') if aitem else a.get('outcome', 'UNRESOLVED')
+        expected = {'name': item.get('title') or ' | '.join(sf.get('names', [])),
+                    'current_type': kind, 'in_frozen_snapshot': str(int(fid in entities)),
+                    'akash_access': outcome, 'akash_scope': scope,
+                    'type_evidence': 'akash' if aitem else ('surya' if item else 'none'),
+                    'akash_http_status': str(a.get('http_status', 200 if aitem else '') or ''),
+                    'akash_observed_at': a.get('observed_at', ''),
+                    'akash_evidence_method': a.get('via', ''),
+                    'snapshot_own_project_flags': ' | '.join(sf.get('own_project_flags', []))}
+        for key, value in expected.items():
+            expect(row.get(key) == value, f'Review CSV differs from evidence for {fid}: {key}')
+    expect(dict(Counter(r['current_type'] + ' / ' + r['akash_access'] for r in review.values()))
+           == summary['classification_counts'], 'Review CSV classification counts mismatch')
+    return summary, inventory, review
+
+
+def analyze(snapshot_path, case_path=None):
+    snapshot = Path(snapshot_path).resolve()
+    case, snapshot_hash = select_case(snapshot, case_path)
+    capture, inventory, review = validate_case(case, snapshot_hash)
+    audit, entities = inventory['audit'], inventory['entities']
+    projects = {fid: r for fid, r in review.items() if r['current_type'] == 'PROJECT'}
+    accessible = {fid for fid, r in projects.items() if r['akash_access'] == 'RETRIEVED'}
+    missing = {fid for fid, r in projects.items() if r['akash_access'] in MISSING}
+    task_data, folder_keys, ambiguous_keys = {}, set(), set()
+    observed_entities, stamps, refreshes = set(), Counter(), Counter()
+    scope_rows, scope_ambiguous, direct_rows = Counter(), Counter(), Counter()
+    scope_ambiguous_rows = defaultdict(set)
+    row_issues, counters = [], Counter()
+    raw_known_minutes = Decimal(0)
+    raw_unknown_cells = 0
+    row_count = 0
+    required = {'id', 'key', 'title', METRIC, 'snapshot_exported_at', *FOLDERS, *TASKS}
+    for source_row, row in rows(snapshot):
+        if row_count == 0:
+            expect(required <= set(row), 'Required snapshot columns missing: ' + ', '.join(sorted(required-set(row))))
+            expect(len(row) == len(audit['columns']), 'Snapshot column count mismatch')
+        row_count += 1
+        stamps[row['snapshot_exported_at'].strip()] += 1
+        refreshes[row.get('data refresh', '').strip()] += 1
+        key, container = ident(row['key']), ident(row['id'])
+        scopes = {ident(row[c]) for c in FOLDERS} | {container}
+        scopes.discard('')
+        observed_entities.update(scopes)
+        scope_rows.update(scopes)
+        if container:
+            direct_rows[container] += 1
+        task_path = [ident(row[c]) for c in TASKS]
+        deepest = next((v for v in reversed(task_path) if v), '')
+        value, error = numeric(row[METRIC])
+        if error:
+            raw_unknown_cells += 1
+        else:
+            raw_known_minutes += value
+        folder_identity = bool(key and key in scopes)
+        contradictory = bool(folder_identity and key in task_path)
+        if folder_identity and not contradictory:
+            counters['folder_or_project_own_rows_excluded'] += 1
+            folder_keys.add(key)
+            continue
+        if contradictory or not key or not deepest or key != deepest:
+            counters['ambiguous_identity_rows'] += 1
+            scope_ambiguous.update(scopes)
+            for scope in scopes:
+                scope_ambiguous_rows[scope].add(source_row)
+            if key:
+                ambiguous_keys.add(key)
+            row_issues.append({'source_excel_row': source_row, 'task_key': key,
+                               'deepest_task_id': deepest, 'issue': 'AMBIGUOUS_IDENTITY',
+                               'container_ids': ';'.join(sorted(scopes))})
+            continue
+        counters['eligible_task_rows'] += 1
+        task = task_data.setdefault(key, {'values': set(), 'issues': set(), 'rows': [],
+                                        'names': set(), 'scopes': set(), 'project_rows': defaultdict(list),
+                                        'direct': set()})
+        task['rows'].append(source_row)
+        if row.get('title'):
+            task['names'].add(row['title'])
+        task['scopes'].update(scopes)
+        if container:
+            task['direct'].add(container)
+        for pid in scopes & projects.keys():
+            task['project_rows'][pid].append(source_row)
+        if error:
+            task['issues'].add(error)
+        else:
+            task['values'].add(value)
+    expect(row_count == audit['data_rows'], 'Snapshot row count differs from capture audit')
+    expect(dict(stamps) == audit['snapshot_timestamps'], 'Snapshot timestamp counts differ from audit')
+    expect(dict(refreshes) == audit['data_refresh_values'], 'Snapshot refresh counts differ from audit')
+    expect(observed_entities == set(entities), 'Snapshot container IDs differ from captured inventory')
+    for fid in entities:
+        expect(scope_rows[fid] == entities[fid]['scope_rows'], 'Snapshot scope count mismatch: ' + fid)
+    expect(sha(snapshot) == snapshot_hash, 'Snapshot changed during analysis')
+    project_tasks, direct_tasks = defaultdict(set), defaultdict(set)
+    partitions = {name: set() for name in ('ACCESSIBLE_ONLY', 'MISSING_ONLY', 'BOTH', 'NEITHER')}
+    task_rows, link_rows = [], []
+    for tid in sorted(task_data):
+        task = task_data[tid]
+        if len(task['values']) > 1:
+            task['issues'].add('CONFLICTING_EFFORT')
+        if tid in ambiguous_keys or tid in folder_keys:
+            task['issues'].add('AMBIGUOUS_IDENTITY')
+        task['minutes'] = next(iter(task['values'])) if len(task['values']) == 1 and not task['issues'] else None
+        pids = set(task['project_rows'])
+        a, m = pids & accessible, pids & missing
+        group = 'BOTH' if a and m else 'ACCESSIBLE_ONLY' if a else 'MISSING_ONLY' if m else 'NEITHER'
+        partitions[group].add(tid)
+        for pid in pids:
+            project_tasks[pid].add(tid)
+            link_rows.append({'project_id': pid, 'task_id': tid,
+                              'source_excel_rows': ';'.join(map(str, task['project_rows'][pid])),
+                              'effort_minutes': task['minutes'], 'effort_hours': hours(task['minutes'])})
+        for pid in task['direct'] & projects.keys():
+            direct_tasks[pid].add(tid)
+        task_rows.append({'task_id': tid, 'task_name': ' | '.join(sorted(task['names'])),
+                          'effort_minutes': task['minutes'], 'effort_hours': hours(task['minutes']),
+                          'partition': group, 'accessible_project_count': len(a),
+                          'missing_project_count': len(m), 'all_project_count': len(pids),
+                          'accessible_project_ids': ';'.join(sorted(a)),
+                          'missing_project_ids': ';'.join(sorted(m)),
+                          'all_project_ids': ';'.join(sorted(pids)),
+                          'physical_row_count': len(task['rows']),
+                          'first_source_excel_row': task['rows'][0],
+                          'source_excel_rows': ';'.join(map(str, task['rows'])),
+                          'status': 'REVIEW_REQUIRED' if task['issues'] else 'CALCULATED',
+                          'issues': ';'.join(sorted(task['issues']))})
+
+    def total(keys, identity_count=0):
+        keys = set(keys)
+        unknown = sum(task_data[k]['minutes'] is None for k in keys)
+        known = sum((task_data[k]['minutes'] for k in keys if task_data[k]['minutes'] is not None), Decimal(0))
+        value = None if unknown or identity_count else known
+        return {'task_count': len(keys), 'effort_minutes': value, 'effort_hours': hours(value),
+                'known_subtotal_minutes': known, 'known_subtotal_hours': hours(known),
+                'unknown_effort_task_count': unknown, 'ambiguous_identity_row_count': identity_count}
+
+    project_rows, other_rows, type_issues = [], [], []
+    for fid, item in sorted(review.items(), key=lambda kv: (kv[1]['name'].casefold(), kv[0])):
+        base = dict(item)
+        base['in_frozen_snapshot'] = int(base['in_frozen_snapshot'])
+        flags = set()
+        for v in entities.get(fid, {}).get('own_project_flags', []):
+            if v.strip().lower() in ('true', '1', '1.0', 'y', 'yes'):
+                flags.add(True)
+            elif v.strip().lower() in ('false', '0', '0.0', 'n', 'no'):
+                flags.add(False)
+        type_conflict = bool(len(flags) > 1 or (flags and item['current_type'] != 'UNVERIFIED'
+                                               and (item['current_type'] == 'PROJECT') not in flags))
+        base['snapshot_type_conflict'] = int(type_conflict)
+        if type_conflict:
+            type_issues.append({'container_id': fid, 'issue': 'SNAPSHOT_CURRENT_TYPE_CONFLICT'})
+        if fid not in projects:
+            other_rows.append(base)
+            continue
+        base['project_id'], base['project_name'] = fid, base['name']
+        base['access_group'] = 'ACCESSIBLE' if fid in accessible else 'MISSING' if fid in missing else 'UNRESOLVED'
+        data = total(project_tasks[fid], scope_ambiguous[fid])
+        if not base['in_frozen_snapshot']:
+            data['effort_minutes'] = data['effort_hours'] = None
+            status = 'NOT_IN_SNAPSHOT'
+        elif data['effort_minutes'] is None:
+            status = 'REVIEW_REQUIRED'
+        else:
+            status = 'CALCULATED' if data['task_count'] else 'NO_RECORDED_TASKS'
+        base.update(data)
+        base.update(effort_status=status, scope_physical_row_count=scope_rows[fid],
+                    direct_task_count=len(direct_tasks[fid]),
+                    shared_task_count=sum(len(task_data[t]['project_rows']) > 1 for t in project_tasks[fid]),
+                    metric_note='Frozen Snowflake planned effort; not independently fetched task access')
+        project_rows.append(base)
+    akeys = partitions['ACCESSIBLE_ONLY'] | partitions['BOTH']
+    mkeys = partitions['MISSING_ONLY'] | partitions['BOTH']
+    amb_total = counters['ambiguous_identity_rows']
+    # Ambiguous rows can hide tasks; conservatively block partition authority.
+    a_ambiguous_rows = set().union(*(scope_ambiguous_rows[p] for p in accessible))
+    m_ambiguous_rows = set().union(*(scope_ambiguous_rows[p] for p in missing))
+    measures = {'SNAPSHOT_UNIQUE_TASKS': total(task_data, amb_total),
+                'ACCESSIBLE_PROJECT_UNION': total(akeys, len(a_ambiguous_rows)),
+                'MISSING_PROJECT_UNION': total(mkeys, len(m_ambiguous_rows)),
+                **{name: total(keys, amb_total) for name, keys in partitions.items()}}
+    labels = {'SNAPSHOT_UNIQUE_TASKS': 'All eligible unique tasks in frozen snapshot',
+              'ACCESSIBLE_PROJECT_UNION': 'Unique tasks under retrievable projects',
+              'MISSING_PROJECT_UNION': 'Unique tasks under unavailable projects',
+              'ACCESSIBLE_ONLY': 'Tasks under retrievable projects only',
+              'MISSING_ONLY': 'Tasks under unavailable projects only',
+              'BOTH': 'Tasks shared by retrievable and unavailable projects',
+              'NEITHER': 'Tasks outside both project unions'}
+    recon = [{'metric_id': key, 'label': labels[key], **value, 'note': ''} for key, value in measures.items()]
+    global_minutes = measures['SNAPSHOT_UNIQUE_TASKS']['effort_minutes']
+    terms = [measures[k]['effort_minutes'] for k in ('ACCESSIBLE_PROJECT_UNION', 'MISSING_PROJECT_UNION', 'BOTH', 'NEITHER')]
+    residual = None if global_minutes is None or any(v is None for v in terms) else global_minutes-(terms[0]+terms[1]-terms[2]+terms[3])
+    expect(residual is None or residual == 0, 'Internal partition arithmetic failed')
+    recon.append({'metric_id': 'PARTITION_RESIDUAL', 'label': 'Snapshot minus accessible minus missing plus overlap minus remainder',
+                  'task_count': None, 'effort_minutes': residual, 'effort_hours': hours(residual),
+                  'known_subtotal_minutes': None, 'known_subtotal_hours': None,
+                  'unknown_effort_task_count': None, 'ambiguous_identity_row_count': amb_total,
+                  'note': 'An accounting identity from one input; not independent completeness validation'})
+    for group, ids, union_key in (('ACCESSIBLE', accessible, 'ACCESSIBLE_PROJECT_UNION'),
+                                  ('MISSING', missing, 'MISSING_PROJECT_UNION')):
+        included = [r for r in project_rows if r['project_id'] in ids and r['in_frozen_snapshot']]
+        value = None if any(r['effort_minutes'] is None for r in included) else sum((r['effort_minutes'] for r in included), Decimal(0))
+        union = measures[union_key]['effort_minutes']
+        for suffix, amount, label in (('PROJECT_ROW_SUM', value, 'Sum of baseline project rows; shared tasks repeat'),
+                                      ('WITHIN_GROUP_OVERLAP', None if value is None or union is None else value-union,
+                                       'Excess from tasks counted in multiple project rows in this group')):
+            recon.append({'metric_id': group+'_'+suffix, 'label': group.title()+' '+label,
+                          'task_count': None, 'effort_minutes': amount, 'effort_hours': hours(amount),
+                          'known_subtotal_minutes': None, 'known_subtotal_hours': None,
+                          'unknown_effort_task_count': None, 'ambiguous_identity_row_count': None,
+                          'note': 'API-only projects excluded because snapshot effort is unknown'})
+    notes = ['Effort uses one frozen Snowflake snapshot; access was checked afterward.',
+             'Project retrieval does not prove access to every associated task.',
+             '403/404 classify current retrieval outcomes, not proven historical permission causes.',
+             'API-only project effort is unknown, not zero.',
+             'Project scopes use the union of id and five stored folder hierarchy columns.',
+             'Snapshot zeros are retained; the source may have replaced missing effort with zero.',
+             'Partition equality is not independent validation of extraction completeness.',
+             'Source Excel row numbers include the header row and refer to the raw snapshot sheet.']
+    metadata = {'created_at': datetime.now(timezone.utc).isoformat(), 'snapshot_path': str(snapshot),
+                'snapshot_sha256': snapshot_hash, 'snapshot_bytes': snapshot.stat().st_size,
+                'case_path': str(case), 'capture_hash_manifest_sha256': sha(case/'hashes.json'),
+                'analysis_script_sha256': sha(Path(__file__)), 'capture_started_at': capture['started_at'],
+                'capture_finished_at': capture['finished_at'], 'snapshot_timestamps': dict(stamps),
+                'data_refresh_values': dict(refreshes), 'snapshot_columns': audit['columns'],
+                'token_identity': capture.get('token_identity', 'Role labels not independently verified'), 'notes': notes}
+    summary = {'status': 'OFFLINE_ANALYSIS_COMPLETE_REVIEW_REQUIRED', 'snapshot_data_rows': row_count,
+               'snapshot_column_count': len(audit['columns']), 'baseline_container_count': len(entities),
+               'review_record_count': len(review), 'classification_counts': capture['classification_counts'],
+               'baseline_accessible_project_count': sum(r['in_frozen_snapshot'] for r in project_rows if r['access_group']=='ACCESSIBLE'),
+               'baseline_missing_project_count': sum(r['in_frozen_snapshot'] for r in project_rows if r['access_group']=='MISSING'),
+               'api_only_project_count': sum(not r['in_frozen_snapshot'] for r in project_rows),
+               'unique_task_count': len(task_data), 'project_task_link_count': len(link_rows),
+               'mapping_counts': dict(counters), 'task_issue_counts': dict(Counter(v for t in task_data.values() for v in t['issues'])),
+               'snapshot_current_type_conflict_count': len(type_issues), 'global_effort_minutes': global_minutes,
+               'global_effort_hours': hours(global_minutes), 'partition_residual_minutes': residual,
+               'raw_numeric_row_sum_minutes': raw_known_minutes, 'raw_unknown_effort_cells': raw_unknown_cells,
+               'raw_sum_note': 'Diagnostic only: includes repeated task rows and non-task rows; not task effort total',
+               'independent_extraction_validation': False}
+    link_rows.sort(key=lambda row: (row['project_id'], row['task_id']))
+    return {'metadata': metadata, 'summary': summary, 'project_rows': project_rows,
+            'task_rows': task_rows, 'link_rows': link_rows, 'other_container_rows': other_rows,
+            'reconciliation_rows': recon, 'issues': row_issues + type_issues}
+
+
+def json_default(value):
+    if isinstance(value, Decimal):
+        return str(value)
+    raise TypeError(type(value).__name__)
+
+
+def write_outputs(report, output_dir):
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=False)
+    with (output/'analysis_summary.json').open('x', encoding='utf-8') as f:
+        json.dump({'metadata': report['metadata'], 'summary': report['summary'],
+                   'reconciliation': report['reconciliation_rows']}, f, indent=2, default=json_default)
+    for key, filename in (('project_rows', 'project_effort.csv'), ('task_rows', 'task_audit.csv'),
+                          ('link_rows', 'project_task_links.csv'), ('other_container_rows', 'other_containers.csv'),
+                          ('reconciliation_rows', 'reconciliation.csv'), ('issues', 'review_issues.csv')):
+        records = report[key]
+        headers = list(dict.fromkeys(k for row in records for k in row)) or ['no_records']
+        with (output/filename).open('x', encoding='utf-8-sig', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(records)
+    with (output/'output_hashes.json').open('x', encoding='utf-8') as f:
+        json.dump({p.name: sha(p) for p in output.iterdir() if p.is_file() and p.name != 'output_hashes.json'}, f, indent=2)
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--snapshot', default='snowflake_snapshot.csv')
+    parser.add_argument('--case')
+    parser.add_argument('--output')
+    args = parser.parse_args()
+    report = analyze(args.snapshot, args.case)
+    output = args.output or str(Path(args.snapshot).resolve().parent/'output'/'holistic_effort'/datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ'))
+    write_outputs(report, output)
+    print(json.dumps(report['summary'], indent=2, default=json_default))
+    print('OUTPUT:', str(Path(output).resolve()))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, OSError, KeyError, csv.Error) as error:
+        raise SystemExit('ANALYSIS STOPPED: ' + str(error))
