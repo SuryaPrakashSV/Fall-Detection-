@@ -5,19 +5,16 @@ from pathlib import Path
 
 tree = ast.parse(Path("Wrike_Data_local_validation.py").read_text())
 for n in sorted(ast.walk(tree), key=lambda x: getattr(x, "lineno", 0)):
-    if not (
-        isinstance(n, ast.Call)
-        and n.lineno >= 1450
-        and isinstance(n.func, ast.Attribute)
-        and n.func.attr in {"merge", "join"}
-    ):
+    if getattr(n, "lineno", 0) < 1450:
         continue
-    parts = [ast.unparse(a) for a in n.args[:2]]
-    parts += [
-        f"{k.arg}={ast.unparse(k.value)}"
-        for k in n.keywords
-        if k.arg in {"how", "on", "left_on", "right_on",
-                     "left_index", "right_index"}
-    ]
-    print(f"Line {n.lineno}: {ast.unparse(n.func)}({', '.join(parts)})")
+    if (
+        isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr in {"dropna", "query", "drop_duplicates"}
+    ):
+        print(f"Line {n.lineno}: {ast.unparse(n)}")
+    elif isinstance(n, ast.Assign) and isinstance(n.value, ast.Subscript):
+        condition = n.value.slice
+        if any(isinstance(x, ast.Compare) for x in ast.walk(condition)):
+            print(f"Line {n.lineno}: {ast.unparse(n)}")
 PY
