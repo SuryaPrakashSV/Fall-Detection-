@@ -1,32 +1,4 @@
 cd ~/Desktop/wrike-local-baseline
-python3 - <<'PY'
-from pathlib import Path
-from decimal import Decimal
-from calculate_wrike_effort import Dataset
-
-data = Dataset(
-    "Snowflake evidence",
-    Path("snowflake_effort_evidence.csv"),
-    {},
-    evidence=True
-)
-total = data.total(data.tasks, data.unknown_identity_rows)
-
-if total["minutes"] is None:
-    raise SystemExit("STOP: unresolved effort or task identity issues.")
-
-snowflake_hours = total["minutes"] / Decimal(60)
-akash_hours = Decimal("4423377.20")
-missing_project_hours = Decimal("328782.00")
-combined = akash_hours + missing_project_hours
-difference = snowflake_hours - combined
-
-print("\n--- EFFORT COMPARISON ---")
-print(f"Akash saved export:       {akash_hours:,.2f} hours")
-print(f"56 projects, deduplicated:{missing_project_hours:,.2f} hours")
-print(f"Combined:                {combined:,.2f} hours")
-print(f"Snowflake saved export:   {snowflake_hours:,.2f} hours")
-print(f"Snowflake minus combined: {difference:,.2f} hours")
-print("Result:", "MATCH" if abs(difference) < Decimal("0.005") else "DIFFERENCE")
-print("Snowflake refresh:", dict(data.refresh))
-PY
+python3 capture_wrike_reference.py \
+  --case output/aligned_comparison/20260930T051554_923434Z_surya \
+  --phase before
