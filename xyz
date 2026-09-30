@@ -1,38 +1,37 @@
 cd ~/Desktop/wrike-local-baseline
 python3 - <<'PY'
-import csv, json
-from collections import Counter
+import json
+from decimal import Decimal
 from pathlib import Path
 
 case = Path("output/aligned_comparison/20260930T054149_860457Z_surya")
 review = sorted(case.glob("difference_review_*"))[-1]
 s = json.loads((review / "review_summary.json").read_text())
 evidence = json.loads((review / "task_evidence.json").read_text())
-ids = {r["task_id"] for r in s["root_membership_differences"]}
+by_id = {r["task_id"]: r for r in evidence}
+folders = {
+    r["id"]: r
+    for r in json.loads((case / "folder_tree.json").read_text())["data"]
+}
 
-print("Previously omitted log patterns:")
-for row in s["log_groups"][12:]:
-    print(json.dumps(row))
+print("Three tasks and omitted root links:")
+for item in s["root_membership_differences"]:
+    tid = item["task_id"]
+    minutes = by_id[tid]["comparison"]["csv_minutes"]
+    csv_roots = {r["id"] for r in item["csv_roots"]}
+    print("\nTask:", tid, "Hours:", Decimal(minutes) / 60)
+    for root in item["before_roots"]:
+        if root["id"] not in csv_roots:
+            folder = folders.get(root["id"])
+            print("Omitted:", root["title"], root["id"],
+                  "Marked as project:",
+                  ("project" in folder) if folder is not None else "unknown")
 
-print("\nReference relationships for the three tasks:")
-for row in evidence:
-    if row["task_id"] in ids:
-        for variant in row["after"]["variants"]:
-            t = variant["task"]
-            print(json.dumps({k: t.get(k) for k in
-                  ("id", "parentIds", "superParentIds", "superTaskIds")}))
-
-cols = ("id", "parent_folder_id", "child_folder_id",
-        "grandchild_folder_id", "baby_folder_id", "grandbaby_folder_id")
-paths = {tid: Counter() for tid in ids}
-file = Path("output/local_validation/20260930T132340_154686Z/wrike_local_full.csv")
-with file.open(newline="", encoding="utf-8-sig") as f:
-    for row in csv.DictReader(f):
-        if row["key"] in ids:
-            paths[row["key"]][tuple(row.get(c, "") for c in cols)] += 1
-
-print("\nCSV folder paths:")
-for tid, combinations in sorted(paths.items()):
-    for values, count in combinations.items():
-        print(tid, "rows:", count, dict(zip(cols, values)))
+print("\nFinal request error, including its ending:")
+logs = json.loads((review / "log_candidates.json").read_text())
+for row in logs:
+    if row["line_number"] == 580:
+        print(row["text"][-1000:])
+    if "missing task ids" in row["text"].lower():
+        print("Line", row["line_number"], row["text"])
 PY
