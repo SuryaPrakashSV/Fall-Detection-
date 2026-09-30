@@ -1,1 +1,6 @@
 
+find "$HOME/Downloads" "$HOME/Desktop" -type f \( \
+-name 'build_wrike_workbook*.py' -o \
+-name 'wrike_report_analysis*.py' -o \
+-name 'Wrike_Workbook_Builder*.zip' \
+\) -print
