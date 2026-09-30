@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Make a plain display copy of the finished Wrike workbook, entirely offline.
+
+Python standard library only. No Excel installation, subscription, token, or
+package installation is required. All cell data, formulas, cached results,
+number formats, and supporting worksheets are preserved. Only presentation
+metadata changes. Large worksheets are streamed rather than loaded into RAM.
+"""
+import argparse
+import hashlib
+import json
+import re
+import shutil
+import sys
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+import xml.etree.ElementTree as ET
+
+VISIBLE = ('Report Guide', 'Reconciliation', 'Snowflake Snapshot',
+           'Accessible Projects', 'Missing Projects', 'Extra Project Effort')
+NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+ET.register_namespace('', NS)
+ET.register_namespace('r', REL)
+BLOCK = 1024 * 1024
+
+
+def q(name):
+    return '{' + NS + '}' + name
+
+
+def sha_file(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(BLOCK), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def plain_styles(data):
+    root = ET.fromstring(data)
+    for font in list(root.findall('./' + q('fonts') + '/' + q('font'))) + list(root.findall('.//' + q('dxf') + '/' + q('font'))):
+        for color in list(font.findall(q('color'))):
+            font.remove(color)
+        # Insert color before name/family, retaining SpreadsheetML child order.
+        color = ET.Element(q('color'), {'rgb': 'FF000000'})
+        index = next((i for i, item in enumerate(font)
+                      if item.tag in (q('name'), q('family'), q('charset'), q('scheme'))), len(font))
+        font.insert(index, color)
+        size = font.find(q('sz'))
+        if size is not None and float(size.get('val', '10')) > 11:
+            size.set('val', '11')
+    fills = root.find(q('fills'))
+    if fills is not None:
+        for index, fill in enumerate(fills):
+            if index == 1:  # Preserve Excel's reserved gray125 fill.
+                continue
+            fill.clear()
+            ET.SubElement(fill, q('patternFill'), {'patternType': 'none'})
+    for fill in root.findall('.//' + q('dxf') + '/' + q('fill')):
+        fill.clear()
+        ET.SubElement(fill, q('patternFill'), {'patternType': 'none'})
+    # Keep number formats, font/style indexes, alignment, wrapping and borders.
+    return ET.tostring(root, encoding='utf-8', xml_declaration=True)
+
+
+def display_workbook(data):
+    root = ET.fromstring(data)
+    sheets = root.find(q('sheets'))
+    if sheets is None:
+        raise ValueError('Workbook has no worksheets.')
+    names = [s.get('name') for s in sheets]
+    missing = set(VISIBLE) - set(names)
+    if missing:
+        raise ValueError('Required tabs are missing: ' + ', '.join(sorted(missing)))
+    active = names.index('Report Guide')
+    for sheet in sheets:
+        sheet.set('state', 'visible' if sheet.get('name') in VISIBLE else 'hidden')
+    # Keep the existing sheet order, IDs and local defined-name scopes intact.
+    for view in root.findall('./' + q('bookViews') + '/' + q('workbookView')):
+        view.set('activeTab', str(active))
+        view.set('firstSheet', str(active))
+    return ET.tostring(root, encoding='utf-8', xml_declaration=True), names, sheets[active].get('{' + REL + '}id')
+
+
+def edit_view_header(data, selected):
+    # Only the short XML prefix before <sheetData> is passed to this function.
+    data = re.sub(rb'<tabColor\b[^>]*/>', b'', data)
+    def change(match):
+        tag = match.group(0)
+        for attribute in (b'showGridLines', b'tabSelected'):
+            tag = re.sub(rb'\s+' + attribute + rb'="[^"]*"', b'', tag)
+        ending = b'/>' if tag.endswith(b'/>') else b'>'
+        return tag[:-len(ending)] + b' showGridLines="1" tabSelected="' + (b'1' if selected else b'0') + b'"' + ending
+    data, count = re.subn(rb'<sheetView\b[^>]*>', change, data)
+    if not count:
+        raise ValueError('Unexpected worksheet layout: sheetView not found before data.')
+    return data
+
+
+def select_source(base, explicit):
+    if explicit:
+        source = Path(explicit).expanduser().resolve()
+    else:
+        candidates = sorted((base / 'output' / 'holistic_final').glob('*/*_FINAL.xlsx'))
+        if not candidates:
+            raise ValueError('No finished workbook found under output/holistic_final. '
+                             'Run this script from wrike-local-baseline, or pass the FINAL.xlsx path.')
+        # Generated folder names are UTC timestamps. Use the latest finished file.
+        source = candidates[-1].resolve()
+    if not source.is_file() or source.suffix.lower() != '.xlsx':
+        raise ValueError('Input must be an existing .xlsx workbook.')
+    return source
+
+
+def make_copy(source, destination):
+    source_sha = sha_file(source)
+    expected, cell_sections = {}, {}
+    with zipfile.ZipFile(source) as original:
+        members = original.infolist()
+        if len({item.filename for item in members}) != len(members):
+            raise ValueError('Workbook contains duplicate package entries.')
+        workbook, sheet_names, active_rel = display_workbook(original.read('xl/workbook.xml'))
+        rels = ET.fromstring(original.read('xl/_rels/workbook.xml.rels'))
+        active_target = next(r.get('Target') for r in rels if r.get('Id') == active_rel)
+        active_path = active_target.lstrip('/') if active_target.startswith('/') else 'xl/' + active_target
+        styles = plain_styles(original.read('xl/styles.xml'))
+        overrides = {'xl/workbook.xml': workbook, 'xl/styles.xml': styles}
+        with zipfile.ZipFile(destination, 'x', compression=zipfile.ZIP_DEFLATED, compresslevel=1, allowZip64=True) as output:
+            for item in members:
+                member = item.filename
+                digest = hashlib.sha256()
+                with output.open(member, 'w', force_zip64=True) as target:
+                    if member in overrides:
+                        content = overrides[member]
+                        target.write(content)
+                        digest.update(content)
+                    else:
+                        with original.open(item) as stream:
+                            if re.fullmatch(r'xl/worksheets/sheet\d+\.xml', member):
+                                print('Formatting ' + member + '...', flush=True)
+                                prefix = stream.read(BLOCK)
+                                position = prefix.find(b'<sheetData')
+                                if position < 0:
+                                    raise ValueError('Unexpected worksheet header: ' + member)
+                                header = edit_view_header(prefix[:position], member == active_path)
+                                target.write(header)
+                                digest.update(header)
+                                content_hash = hashlib.sha256()
+                                tail = prefix[position:]
+                                target.write(tail)
+                                digest.update(tail)
+                                content_hash.update(tail)
+                                for block in iter(lambda: stream.read(BLOCK), b''):
+                                    target.write(block)
+                                    digest.update(block)
+                                    content_hash.update(block)
+                                cell_sections[member] = content_hash.hexdigest()
+                            else:
+                                for block in iter(lambda: stream.read(BLOCK), b''):
+                                    target.write(block)
+                                    digest.update(block)
+                expected[member] = digest.hexdigest()
+    print('Checking saved copy and preserved worksheet contents...', flush=True)
+    with zipfile.ZipFile(destination) as saved:
+        if set(saved.namelist()) != set(expected):
+            raise ValueError('Saved workbook package entries changed unexpectedly.')
+        for member, expected_sha in expected.items():
+            digest = hashlib.sha256()
+            with saved.open(member) as stream:
+                for block in iter(lambda: stream.read(BLOCK), b''):
+                    digest.update(block)
+            if digest.hexdigest() != expected_sha:
+                raise ValueError('Saved workbook verification failed: ' + member)
+        visible = [s.get('name') for s in ET.fromstring(saved.read('xl/workbook.xml')).find(q('sheets'))
+                   if s.get('state', 'visible') == 'visible']
+        if set(visible) != set(VISIBLE) or len(visible) != len(VISIBLE):
+            raise ValueError('Visible-tab verification failed.')
+    if sha_file(source) != source_sha:
+        raise ValueError('Original workbook changed during copying. Close it and retry.')
+    return {'created_at': datetime.now(timezone.utc).isoformat(),
+            'source_file': str(source), 'source_sha256': source_sha,
+            'output_file': str(destination), 'output_sha256': sha_file(destination),
+            'visible_sheets': visible, 'hidden_sheets': [s for s in sheet_names if s not in VISIBLE],
+            'worksheet_content_sha256': cell_sections,
+            'changes': 'Plain black text, no colored fills or tab colors, visible gridlines; six visible tabs.',
+            'preserved': 'All cells, formulas, cached results, number formats, source records and supporting sheets.'}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('workbook', nargs='?', help='Optional explicit path to the finished FINAL.xlsx')
+    args = parser.parse_args()
+    base = Path.cwd()
+    if not (base / 'output' / 'holistic_final').exists() and (Path(__file__).resolve().parent / 'output' / 'holistic_final').exists():
+        base = Path(__file__).resolve().parent
+    destination = None
+    try:
+        source = select_source(base, args.workbook)
+        if shutil.disk_usage(base).free < max(1024 ** 3, source.stat().st_size * 5):
+            raise ValueError('At least 1 GB of free disk space is needed for the new copy.')
+        print('Using finished workbook: ' + str(source), flush=True)
+        folder = base / 'output' / 'simple_workbook' / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')
+        folder.mkdir(parents=True, exist_ok=False)
+        stem = source.stem[:-6] if source.stem.endswith('_FINAL') else source.stem
+        destination = folder / (stem + '_SIMPLE.xlsx')
+        receipt = make_copy(source, destination)
+        (folder / 'simple_workbook_receipt.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
+        print('\nDONE: six visible tabs; supporting tabs hidden.')
+        print('Original workbook unchanged. No API calls were made.')
+        print('NEW FILE: ' + str(destination))
+    except Exception as error:
+        if destination is not None and destination.exists():
+            destination.unlink()
+        print('STOPPED: ' + str(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
