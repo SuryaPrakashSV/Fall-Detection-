@@ -2,79 +2,46 @@ cd ~/Desktop/wrike-local-baseline
 python3 - <<'PY'
 import json
 from pathlib import Path
-from collections import Counter, defaultdict
+from collections import defaultdict, Counter
 from decimal import Decimal
 
 files = sorted(Path("output/remaining_196_access").glob(
     "*/task_access_results.json"
 ))
 if not files:
-    raise SystemExit("No task_access_results.json found.")
+    raise SystemExit("No saved results found.")
 
 data = json.loads(files[-1].read_text())
-targets = data["targets"]
-results = data["results"]
+groups = defaultdict(lambda: [0, Decimal(0)])
+relationships = Counter()
 
-if len(targets) != 196:
-    raise SystemExit("Expected 196 tasks. Stopping.")
+for task_id, item in data["targets"].items():
+    a = data["results"]["Surya"][task_id]
+    b = data["results"]["Akash"][task_id]
+    if a["outcome"] != "RETRIEVED" or b["outcome"] != "RETRIEVED":
+        raise SystemExit("Not all tasks were retrieved. Stopping.")
 
-def ids(record, field):
-    value = record.get(field, [])
-    if not isinstance(value, list) or any(
-        not isinstance(item, str) for item in value
-    ):
-        raise SystemExit("Unexpected parent-ID format.")
-    return set(value)
-
-for label in ("Surya", "Akash"):
-    if any(results[label].get(t, {}).get("outcome") != "RETRIEVED"
-           for t in targets):
-        raise SystemExit(f"{label}: not all 196 tasks were retrieved.")
-
-groups = defaultdict(lambda: {
-    "count": 0, "hours": Decimal(0),
-    "Surya_match": 0, "Akash_match": 0,
-    "has_super_task": 0
-})
-counts = Counter()
-
-for task_id, item in targets.items():
-    saved = set(item["saved_container_ids"])
-    group = groups[tuple(sorted(saved))]
-    group["count"] += 1
-    group["hours"] += Decimal(item["saved_hours"])
-    parents = {}
-    supers = {}
-
-    for label in ("Surya", "Akash"):
-        record = results[label][task_id]
-        parents[label] = ids(record, "api_parentIds")
-        supers[label] = ids(record, "api_superTaskIds")
-        matched = bool(saved & parents[label])
-        group[label + "_match"] += int(matched)
-        counts[label + ": saved container appears in parentIds"] += int(matched)
-        counts[label + ": empty or absent parentIds"] += int(not parents[label])
-        counts[label + ": has superTaskIds"] += int(bool(supers[label]))
-
-    group["has_super_task"] += int(bool(supers["Surya"] | supers["Akash"]))
-    counts["Different parentIds between tokens"] += int(
-        parents["Surya"] != parents["Akash"]
+    key = (
+        a.get("api_scope") or "(not supplied)",
+        b.get("api_scope") or "(not supplied)",
+        a.get("api_status") or "(not supplied)",
+        b.get("api_status") or "(not supplied)"
     )
-    counts["Different superTaskIds between tokens"] += int(
-        supers["Surya"] != supers["Akash"]
-    )
+    groups[key][0] += 1
+    groups[key][1] += Decimal(item["saved_hours"])
 
-print("\nPARENT RELATIONSHIP SUMMARY")
-print("Tasks:", len(targets))
-for label, count in counts.items():
-    print(label + ":", count)
-
-print("\nBY SAVED CONTAINER")
-print("Container | Tasks | Saved hours | Surya matches | Akash matches | Has supertask")
-for containers, g in sorted(groups.items()):
-    print(
-        ",".join(containers) or "(none)",
-        g["count"], g["hours"], g["Surya_match"],
-        g["Akash_match"], g["has_super_task"], sep=" | "
+    matched = bool(
+        set(item["saved_container_ids"]) & set(a["api_parentIds"])
     )
+    has_super = bool(a["api_superTaskIds"])
+    relationships[(matched, has_super)] += 1
+
+print("\nSCOPE AND STATUS SUMMARY")
+print("Surya scope | Akash scope | Surya status | Akash status | Tasks | Saved hours")
+for key, values in sorted(groups.items()):
+    print(*key, *values, sep=" | ")
+
+print("\nPARENT OVERLAP SUMMARY")
+for (matched, has_super), count in sorted(relationships.items()):
+    print(f"Saved parent matches={matched}; has supertask={has_super}; tasks={count}")
 PY
