@@ -1,2 +1,2 @@
 cd ~/Desktop/wrike-local-baseline
-python3 capture_wrike_extra_projects.py
+python3 finalize_wrike_report.py
