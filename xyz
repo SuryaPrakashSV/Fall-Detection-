@@ -1,36 +1,26 @@
 cd ~/Desktop/wrike-local-baseline
 python3 - <<'PY'
-import json
+import ast
+import textwrap
 from pathlib import Path
 
-runs = sorted(
-    p for p in Path("output/folder_scope_probe").glob("*_surya")
-    if (p / "folder_tree.json").exists()
-)
-run = runs[-1]
-a = json.loads((run / "scope_analysis.json").read_text())
-rows = json.loads((run / "folder_tree.json").read_text())["data"]
-folders = {r["id"]: r for r in rows}
+tree = ast.parse(Path("Wrike_Data_local_validation.py").read_text())
+operations = {
+    "merge", "join", "concat", "dropna", "drop_duplicates",
+    "query", "groupby", "pivot", "pivot_table", "explode"
+}
 
-def walk(roots):
-    seen = set(roots)
-    frontier = set(roots)
-    for _ in range(4):
-        children = {
-            c for fid in frontier
-            for c in folders.get(fid, {}).get("childIds", [])
-        }
-        frontier = children - seen
-        seen.update(children)
-    return seen
-
-by_id = walk(a["original_selected_root_ids"])
-by_name = walk(a["roots_selected_by_later_title_match"])
-
-for fid in a["extra_roots_from_title_match"]:
-    print("EXTRA STARTING FOLDER:", fid, repr(folders[fid]["title"]))
-print("ADDITIONAL FOLDERS FROM NAME MATCHING:", len(by_name - by_id))
-print("LOST FOLDERS FROM NAME MATCHING:", len(by_id - by_name))
-for fid in sorted(by_name - by_id):
-    print("ADDED:", fid, repr(folders.get(fid, {}).get("title")))
+for node in sorted(ast.walk(tree), key=lambda n: getattr(n, "lineno", 0)):
+    if not isinstance(node, ast.Assign) or node.lineno < 1450:
+        continue
+    targets = " ".join(ast.unparse(t) for t in node.targets)
+    relevant = "df_" in targets or any(
+        isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr in operations
+        for n in ast.walk(node.value)
+    )
+    if relevant:
+        print(f"\nLine {node.lineno}:")
+        print(textwrap.fill(ast.unparse(node), width=110))
 PY
