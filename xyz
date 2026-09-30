@@ -1,9 +1,33 @@
-Measure	Hours
-Frozen Snowflake total	4,783,705.88
-Accessible projects, deduplicated	4,177,784.67
-Missing Projects column sum	365,281.50
-Missing projects, deduplicated	358,796.50
-Five extra projects, separately captured	46,794.00
+SELECT
+    ROUND(SUM("effortAllocation_totalEffort") / 60, 2)  AS naive_hours_overstated,
+    COUNT(*)                                            AS rows,
+    COUNT(DISTINCT "key")                               AS distinct_tasks
+FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG
+WHERE "Data refresh" = (SELECT MAX("Data refresh")
+                        FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG);
 
 
-The missing-project column sum includes 6,485 hours of repeated tasks across projects. That explains its difference from the deduplicated total.
+
+-- Total effort hours in Wrike_STG, counting each task once.
+-- effortAllocation_totalEffort is in MINUTES and is repeated on every owner row and every day row,
+-- so a plain SUM overstates badly. Take one value per task, then divide by 60.
+
+WITH latest AS (          -- only the most recent snapshot
+    SELECT MAX("Data refresh") AS refresh_ts
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG      -- confirm table name
+),
+one_row_per_task AS (
+    SELECT
+        s."key"                              AS task_key,
+        MAX(s."effortAllocation_totalEffort")     AS total_effort_min,
+        MAX(s."effortAllocation_allocatedEffort") AS allocated_effort_min
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP.WRIKE_STG s
+    JOIN latest l ON s."Data refresh" = l.refresh_ts
+    GROUP BY s."key"
+)
+SELECT
+    COUNT(*)                                        AS tasks,
+    COUNT_IF(total_effort_min > 0)                  AS tasks_with_effort,
+    ROUND(SUM(total_effort_min)     / 60, 2)        AS total_effort_hours,
+    ROUND(SUM(allocated_effort_min) / 60, 2)        AS allocated_effort_hours
+FROM one_row_per_task;
