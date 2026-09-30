@@ -1,67 +1,10 @@
-WITH scoped AS (
-    SELECT w.*
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" w
-    WHERE 'MQAAAAECSFJ4' IN (
-        w."id",
-        w."parent_folder_id",
-        w."child_folder_id",
-        w."grandchild_folder_id",
-        w."baby_folder_id",
-        w."grandbaby_folder_id"
-    )
-),
-task_rows AS (
-    SELECT
-        "key" AS task_id,
-        TRY_TO_DOUBLE(
-            TO_VARCHAR("effortAllocation_totalEffort")
-        ) AS effort_minutes,
-        IFF("id" = 'MQAAAAECSFJ4', 1, 0) AS direct_task
-    FROM scoped
-    WHERE "key" IN (
-        "parent_task_id",
-        "child_task_id",
-        "grandchild_task_id",
-        "baby_task_id",
-        "grandbaby_task_id",
-        "great_grandbaby_task_id"
-    )
-    AND "key" NOT IN (
-        COALESCE("id", ''),
-        COALESCE("parent_folder_id", ''),
-        COALESCE("child_folder_id", ''),
-        COALESCE("grandchild_folder_id", ''),
-        COALESCE("baby_folder_id", ''),
-        COALESCE("grandbaby_folder_id", '')
-    )
-),
-per_task AS (
-    SELECT
-        task_id,
-        MIN(effort_minutes) AS minutes,
-        MAX(direct_task) AS direct_task,
-        COUNT(*) AS source_rows,
-        IFF(
-            COUNT(effort_minutes) <> COUNT(*)
-            OR MIN(effort_minutes) < 0
-            OR MIN(effort_minutes) <> MAX(effort_minutes),
-            1, 0
-        ) AS effort_issue
-    FROM task_rows
-    GROUP BY task_id
-)
-SELECT
-    COUNT(*) AS unique_tasks,
-    SUM(source_rows) AS task_source_rows,
-    SUM(effort_issue) AS tasks_with_effort_issues,
-    SUM(direct_task) AS direct_tasks,
-    COUNT(*) - SUM(direct_task) AS hierarchy_only_tasks,
-    IFF(SUM(effort_issue) = 0,
-        SUM(minutes) / 60.0, NULL) AS total_effort_hours,
-    IFF(SUM(effort_issue) = 0,
-        SUM(IFF(direct_task = 1, minutes, 0)) / 60.0,
-        NULL) AS direct_effort_hours,
-    IFF(SUM(effort_issue) = 0,
-        SUM(IFF(direct_task = 0, minutes, 0)) / 60.0,
-        NULL) AS hierarchy_only_effort_hours
-FROM per_task;
+cd ~/Desktop/wrike-local-baseline
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+p = Path("output/aligned_comparison/20260930T051554_923434Z_surya/endpoint_sample.json")
+task = json.loads(p.read_text())["data"][0]
+print("Task ID:", task["id"])
+print("effortAllocation:", json.dumps(task["effortAllocation"], indent=2))
+PY
