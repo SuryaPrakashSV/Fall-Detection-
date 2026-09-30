@@ -1,2 +1,1 @@
-cd ~/Desktop/wrike-local-baseline
-cat output/folder_scope_probe/*_surya/task_*.json
+python3 check_wrike_folder_scope.py --label surya --reuse-folder-tree
