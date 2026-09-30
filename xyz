@@ -1,27 +1,10 @@
+cd ~/Desktop/wrike-local-baseline
 python3 - <<'PY'
-import json
 from pathlib import Path
 
-root = Path.home() / "Desktop/wrike-local-baseline"
-files = sorted(root.glob(
-    "output/remaining_196_access/*/task_access_results.json"
-))
-if not files:
-    raise SystemExit("No saved task access results found.")
-
-data = json.loads(files[-1].read_text())
-print("Source:", files[-1])
-count = 0
-
-for task_id, item in data["targets"].items():
-    a = data["results"]["Surya"].get(task_id, {})
-    b = data["results"]["Akash"].get(task_id, {})
-    if a.get("api_scope") == b.get("api_scope") == "RbTask":
-        print("\nID:", task_id)
-        print("Title:", a.get("api_title"))
-        print("Scope under both tokens:", a["api_scope"])
-        print("Saved hours:", item["saved_hours"])
-        count += 1
-        if count == 3:
-            break
+run = sorted(Path("output/folder_scope_probe").glob("*_surya"))[-1]
+print("RUN:", run.name)
+for path in sorted(run.glob("task_*.json")):
+    print("\nFILE:", path.name)
+    print(path.read_text())
 PY
