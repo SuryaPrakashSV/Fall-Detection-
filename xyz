@@ -1,24 +1,67 @@
-cd ~/Desktop/wrike-local-baseline
-python3 - <<'PY'
-import csv
-from pathlib import Path
-
-source = Path("output/effort_reconciliation/20260929T172437_318678Z/missing_projects_effort_hours.csv")
-destination = Path("missing_project_hours_for_akash.csv")
-
-with source.open(encoding="utf-8-sig", newline="") as f:
-    rows = list(csv.DictReader(f))
-
-assert len(rows) == 56, f"Expected 56 projects; found {len(rows)}"
-assert len({r["project_id"] for r in rows}) == 56, "Duplicate project IDs"
-assert all(r["effort_hours"].strip() and r["status"] in
-           {"CALCULATED", "NO_RECORDED_TASKS"} for r in rows), "Review incomplete calculations"
-
-columns = ["project_id", "project_name", "effort_hours"]
-with destination.open("x", encoding="utf-8-sig", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
-    writer.writeheader()
-    writer.writerows(rows)
-
-print(f"Saved 56 projects: {destination.resolve()}")
-PY
+WITH scoped AS (
+    SELECT w.*
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG" w
+    WHERE 'MQAAAAECSFJ4' IN (
+        w."id",
+        w."parent_folder_id",
+        w."child_folder_id",
+        w."grandchild_folder_id",
+        w."baby_folder_id",
+        w."grandbaby_folder_id"
+    )
+),
+task_rows AS (
+    SELECT
+        "key" AS task_id,
+        TRY_TO_DOUBLE(
+            TO_VARCHAR("effortAllocation_totalEffort")
+        ) AS effort_minutes,
+        IFF("id" = 'MQAAAAECSFJ4', 1, 0) AS direct_task
+    FROM scoped
+    WHERE "key" IN (
+        "parent_task_id",
+        "child_task_id",
+        "grandchild_task_id",
+        "baby_task_id",
+        "grandbaby_task_id",
+        "great_grandbaby_task_id"
+    )
+    AND "key" NOT IN (
+        COALESCE("id", ''),
+        COALESCE("parent_folder_id", ''),
+        COALESCE("child_folder_id", ''),
+        COALESCE("grandchild_folder_id", ''),
+        COALESCE("baby_folder_id", ''),
+        COALESCE("grandbaby_folder_id", '')
+    )
+),
+per_task AS (
+    SELECT
+        task_id,
+        MIN(effort_minutes) AS minutes,
+        MAX(direct_task) AS direct_task,
+        COUNT(*) AS source_rows,
+        IFF(
+            COUNT(effort_minutes) <> COUNT(*)
+            OR MIN(effort_minutes) < 0
+            OR MIN(effort_minutes) <> MAX(effort_minutes),
+            1, 0
+        ) AS effort_issue
+    FROM task_rows
+    GROUP BY task_id
+)
+SELECT
+    COUNT(*) AS unique_tasks,
+    SUM(source_rows) AS task_source_rows,
+    SUM(effort_issue) AS tasks_with_effort_issues,
+    SUM(direct_task) AS direct_tasks,
+    COUNT(*) - SUM(direct_task) AS hierarchy_only_tasks,
+    IFF(SUM(effort_issue) = 0,
+        SUM(minutes) / 60.0, NULL) AS total_effort_hours,
+    IFF(SUM(effort_issue) = 0,
+        SUM(IFF(direct_task = 1, minutes, 0)) / 60.0,
+        NULL) AS direct_effort_hours,
+    IFF(SUM(effort_issue) = 0,
+        SUM(IFF(direct_task = 0, minutes, 0)) / 60.0,
+        NULL) AS hierarchy_only_effort_hours
+FROM per_task;
