@@ -3,18 +3,18 @@ python3 - <<'PY'
 import ast
 from pathlib import Path
 
-tree = ast.parse(Path("Wrike_Data_local_validation.py").read_text())
-for n in sorted(ast.walk(tree), key=lambda x: getattr(x, "lineno", 0)):
-    if getattr(n, "lineno", 0) < 1450:
-        continue
+source = Path("Wrike_Data_local_validation.py").read_text()
+lines = source.splitlines()
+
+for n in ast.walk(ast.parse(source)):
     if (
         isinstance(n, ast.Call)
         and isinstance(n.func, ast.Attribute)
-        and n.func.attr in {"dropna", "query", "drop_duplicates"}
+        and n.func.attr == "dropna"
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == "df_tasks_final_complete_prep_renamed"
     ):
-        print(f"Line {n.lineno}: {ast.unparse(n)}")
-    elif isinstance(n, ast.Assign) and isinstance(n.value, ast.Subscript):
-        condition = n.value.slice
-        if any(isinstance(x, ast.Compare) for x in ast.walk(condition)):
-            print(f"Line {n.lineno}: {ast.unparse(n)}")
+        for i in range(max(0, n.lineno - 19),
+                       min(len(lines), n.end_lineno + 5)):
+            print(f"{i + 1}: {lines[i]}")
 PY
