@@ -2,56 +2,52 @@ cd ~/Desktop/wrike-local-baseline
 python3 - <<'PY'
 import json
 from pathlib import Path
-import review_wrike_effort_gaps as g
+from decimal import Decimal
+import calculate_wrike_effort as c
 
-reviews = sorted(Path("output/effort_reconciliation").glob(
-    "*/gap_review_*/review_inputs.json"
+reports = sorted(Path("output/effort_reconciliation").glob(
+    "*/effort_reconciliation_details.json"
 ))
-if not reviews:
-    raise SystemExit("No saved gap review found.")
+if not reports:
+    raise SystemExit("No effort report found.")
+details = json.loads(reports[-1].read_text())
 
-review = reviews[-1].parent
-report = review.parent
-details = json.loads(
-    (report / "effort_reconciliation_details.json").read_text()
-)
+cohort, audit = c.read_cohort(Path(details["cohort_input"]["path"]))
+if audit["sha256"] != details["cohort_input"]["sha256"]:
+    raise SystemExit("Cohort file changed. Stopping.")
 
-data = {}
-for name in (g.OLD, g.NEW):
-    comparison = details["comparisons"][name]
-    data[name], _ = g.read_differences(
-        report / comparison["task_difference_file"], comparison
+projects = {p for p, item in cohort.items() if item["confirmed_project"]}
+datasets = {}
+for name in ("surya", "snowflake"):
+    saved = details["datasets"][name]["input"]
+    path = Path(saved["path"])
+    if c.fingerprint(path)["sha256"] != saved["sha256"]:
+        raise SystemExit(name + " source changed. Stopping.")
+    datasets[name] = c.Dataset(
+        name, path, cohort, evidence=(name == "snowflake"),
+        expected_rows=saved["data_rows"]
     )
 
-old_ids = {r["task_id"] for r in data[g.OLD]}
-new_exceptions = [
-    r for r in data[g.NEW] if r["task_id"] not in old_ids
+old, new = datasets["surya"], datasets["snowflake"]
+old_scope = set().union(*(old.scope_tasks[p] for p in projects))
+new_scope = set().union(*(new.scope_tasks[p] for p in projects))
+shared = old_scope & new_scope
+unknown = sum(
+    old.tasks[k]["minutes"] is None or new.tasks[k]["minutes"] is None
+    for k in shared
+)
+changed = [
+    k for k in shared
+    if old.tasks[k]["minutes"] != new.tasks[k]["minutes"]
 ]
 
-names = {"snowflake": {}, "akash": {}}
-group_file = review / ("container_groups_" + g.NEW + ".csv")
-for row in g.rows_from(group_file):
-    for side, source in (("baseline", "snowflake"), ("akash", "akash")):
-        names[source].update(
-            json.loads(row[side + "_container_names_json"])
-        )
-
-groups = g.group_rows(new_exceptions, names, "snowflake")
-
-for kind in g.KINDS:
-    tasks = [r for r in new_exceptions if r["difference_type"] == kind]
-    if not tasks:
-        continue
-    print(f"\n{kind}: {len(tasks)} tasks; {g.display(g.total(tasks))} hours")
-    selected = [r for r in groups if r["difference_type"] == kind]
-    print(f"Container groups: {len(selected)}; showing largest five")
-    for row in selected[:5]:
-        side = "akash" if kind == "AKASH_ONLY" else "baseline"
-        labels = json.loads(row[side + "_container_names_json"])
-        title = "; ".join(
-            " / ".join(values) or key for key, values in labels.items()
-        )
-        print(f"  {row['task_count']} tasks | "
-              f"{g.display(g.number(row['baseline_minus_akash_hours']))} h | "
-              f"{title}")
+print("\n56-PROJECT SNAPSHOT CHECK")
+print("September 24 task count:", len(old_scope))
+print("September 29 task count:", len(new_scope))
+print("Only September 24:", len(old_scope - new_scope))
+print("Only September 29:", len(new_scope - old_scope))
+print("Shared tasks with unknown effort:", unknown)
+print("Shared tasks with changed effort:", len(changed))
+print("September 24 hours:", old.total(old_scope)["hours"])
+print("September 29 hours:", new.total(new_scope)["hours"])
 PY
