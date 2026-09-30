@@ -1,5 +1,2 @@
-python3 - <<'PY'
-import importlib.util
-for name in ("xlsxwriter", "openpyxl"):
-    print(name, "AVAILABLE" if importlib.util.find_spec(name) else "NOT INSTALLED")
-PY
+cd ~/Desktop/wrike-local-baseline
+python3 build_wrike_workbook.py --snapshot snowflake_snapshot.csv --case output/project_access_today/20260930T161721_018375Z
