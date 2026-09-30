@@ -2,6 +2,7 @@
 """Read-only current scope probe. Never imports/runs the extraction source.
 
 Uses one space folder-tree GET and one GET for each of two known tasks.
+With --reuse-folder-tree, verifies/reuses the last saved tree and makes two GETs.
 Writes only a new local evidence directory. No Snowflake connection or writes.
 This is NOT a full task extraction or historical completeness validation.
 """
@@ -156,6 +157,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--label", required=True, choices=["surya", "akash"])
     parser.add_argument("--source", default="Wrike_Data_local_validation.py")
+    parser.add_argument("--reuse-folder-tree", action="store_true",
+                        help="Reuse the latest verified folder inventory for this label; fetch only two tasks")
     parser.add_argument("--proxy-mode", choices=["source", "environment", "direct"], default="source")
     args = parser.parse_args()
     source = Path(args.source).read_bytes()
@@ -167,6 +170,27 @@ def main():
     if proxies is not None and (not isinstance(proxies, dict) or
             any(k not in ("http", "https") or not isinstance(v, str) for k, v in proxies.items())):
         raise ValueError("Unexpected PROXIES setting")
+    reused = None
+    if args.reuse_folder_tree:
+        runs = sorted(p for p in Path("output/folder_scope_probe").glob(f"*_{args.label}")
+                      if (p / "folder_tree.json").is_file() and (p / "manifest.json").is_file())
+        if not runs:
+            raise ValueError("No saved folder tree found for this label")
+        previous = runs[-1]
+        prior_manifest = json.loads((previous / "manifest.json").read_text())
+        if prior_manifest.get("space_id") != space_id or prior_manifest.get("label") != args.label:
+            raise ValueError("Saved inventory space/label does not match")
+        if prior_manifest.get("source_sha256") != hashlib.sha256(source).hexdigest():
+            raise ValueError("Extraction source changed since saved folder inventory")
+        capture = next((r for r in prior_manifest.get("requests", [])
+                        if r.get("endpoint") == f"spaces/{space_id}/folders"
+                        and r.get("status") == 200 and r.get("response_file") == "folder_tree.json"), None)
+        raw_tree = (previous / "folder_tree.json").read_bytes()
+        if capture is None or hashlib.sha256(raw_tree).hexdigest() != capture.get("sha256"):
+            raise ValueError("Saved folder-tree hash/capture could not be verified")
+        reused = {"path": str(previous / "folder_tree.json"),
+                  "sha256": capture["sha256"], "capture_started_utc": capture["started_utc"]}
+        reused_body = json.loads(raw_tree)
     import requests
     token = getpass.getpass(f"Paste {args.label}'s Wrike token (hidden): ").strip()
     if not token:
@@ -183,6 +207,8 @@ def main():
                 "source_sha256": hashlib.sha256(source).hexdigest(),
                 "probe_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                 "proxy_mode": args.proxy_mode, "requests": []}
+    if reused:
+        manifest["reused_folder_tree"] = reused
 
     def save(name, value):
         (out / name).write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
@@ -212,7 +238,7 @@ def main():
             save("manifest.json", manifest)
 
     try:
-        body = fetch(f"spaces/{space_id}/folders", "folder_tree.json")
+        body = reused_body if reused else fetch(f"spaces/{space_id}/folders", "folder_tree.json")
         if body.get("kind") != "folderTree" or body.get("nextPageToken"):
             raise ValueError("Unexpected folder-tree mode/pagination; stop for review")
         result = analyse(body["data"])
@@ -222,7 +248,7 @@ def main():
             item = {"requested_id": task_id}
             try:
                 task_body = fetch(f"tasks/{task_id}", f"task_{task_id}.json",
-                                  {"fields": json.dumps(["effortAllocation", "subTaskIds"])})
+                                  {"fields": json.dumps(["effortAllocation"])})
                 item["records"] = task_body["data"]
                 item["direct_parents_in_modeled_folder_scope"] = sorted({
                     p for row in task_body["data"] for p in row.get("parentIds", [])
@@ -238,6 +264,7 @@ def main():
             "all_parent_variant_removed_roots", "within_four_levels_ids",
             "beyond_four_levels_ids", "selected_closure_ids_absent_from_inventory")}
         brief = {"label": args.label, "kind": result["response_kind"],
+                 "reused_folder_tree": reused,
                  "folder_records": result["folder_records"], "counts": counts,
                  "tasks": [{"requested_id": t["requested_id"],
                             "http_status": t.get("http_status", 200),
