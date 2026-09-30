@@ -4,15 +4,26 @@ import ast
 from pathlib import Path
 
 tree = ast.parse(Path("Wrike_Data_local_validation.py").read_text())
-wanted = {"SPACE_ID", "TARGET_PROJECTS"}
+parents = {
+    child: parent
+    for parent in ast.walk(tree)
+    for child in ast.iter_child_nodes(parent)
+}
 
 for node in ast.walk(tree):
-    if isinstance(node, ast.Assign):
-        for target in node.targets:
-            if isinstance(target, ast.Name) and target.id in wanted:
-                try:
-                    value = ast.literal_eval(node.value)
-                except (ValueError, TypeError):
-                    value = "(computed value; needs inspection)"
-                print(f"Line {node.lineno}: {target.id} = {value!r}")
+    if not isinstance(node, ast.Assign):
+        continue
+    if not any(isinstance(t, ast.Name) and t.id == "TARGET_PROJECTS"
+               for t in node.targets):
+        continue
+    print(f"\nLine {node.lineno}: {ast.unparse(node)}")
+    child = node
+    while child in parents:
+        parent = parents[child]
+        if isinstance(parent, ast.If):
+            branch = "IF" if child in parent.body else "ELSE"
+            print(f"  {branch}: {ast.unparse(parent.test)}")
+        elif isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            print(f"  Function: {parent.name}")
+        child = parent
 PY
