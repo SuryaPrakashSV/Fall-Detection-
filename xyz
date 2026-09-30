@@ -1,2 +1,5 @@
-cd ~/Desktop/wrike-local-baseline
-python3 build_wrike_workbook.py --snapshot snowflake_snapshot.csv --case output/project_access_today/20260930T161721_018375Z
+ls -ld \
+"$HOME/Desktop/wrike-local-baseline/build_wrike_workbook.py" \
+"$HOME/Desktop/wrike-local-baseline/wrike_report_analysis.py" \
+"$HOME/Desktop/wrike-local-baseline/snowflake_snapshot.csv" \
+"$HOME/Desktop/wrike-local-baseline/output/project_access_today/20260930T161721_018375Z"
