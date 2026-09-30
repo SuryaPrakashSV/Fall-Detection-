@@ -1,1 +1,36 @@
-python3 check_wrike_folder_scope.py --label surya --reuse-folder-tree
+cd ~/Desktop/wrike-local-baseline
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+runs = sorted(
+    p for p in Path("output/folder_scope_probe").glob("*_surya")
+    if (p / "folder_tree.json").exists()
+)
+run = runs[-1]
+a = json.loads((run / "scope_analysis.json").read_text())
+rows = json.loads((run / "folder_tree.json").read_text())["data"]
+folders = {r["id"]: r for r in rows}
+
+def walk(roots):
+    seen = set(roots)
+    frontier = set(roots)
+    for _ in range(4):
+        children = {
+            c for fid in frontier
+            for c in folders.get(fid, {}).get("childIds", [])
+        }
+        frontier = children - seen
+        seen.update(children)
+    return seen
+
+by_id = walk(a["original_selected_root_ids"])
+by_name = walk(a["roots_selected_by_later_title_match"])
+
+for fid in a["extra_roots_from_title_match"]:
+    print("EXTRA STARTING FOLDER:", fid, repr(folders[fid]["title"]))
+print("ADDITIONAL FOLDERS FROM NAME MATCHING:", len(by_name - by_id))
+print("LOST FOLDERS FROM NAME MATCHING:", len(by_id - by_name))
+for fid in sorted(by_name - by_id):
+    print("ADDED:", fid, repr(folders.get(fid, {}).get("title")))
+PY
