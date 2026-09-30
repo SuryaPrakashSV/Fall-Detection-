@@ -1,53 +1,10 @@
-WITH folder_keys AS (
-    SELECT DISTINCT "key" AS k
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE "key" = "id" AND "key" IS NOT NULL
+SET akash_cutoff = 'PASTE_DATA_REFRESH_VALUE_FROM_AKASH_EXPORT';
+
+WITH cutoff AS (
+    SELECT TO_TIMESTAMP_TZ(REGEXP_REPLACE($akash_cutoff, ' [A-Z]{3,4}', ' '),
+                           'YYYY-MM-DD HH24:MI:SS TZHTZM') AS ts
 ),
-rows_ AS (
-    SELECT
-        "key",
-        "Owner_userid",
-        "owner_dailyAllocation_date",
-        CASE WHEN LOWER(TRIM("effortAllocation_totalEffort"::VARCHAR)) IN ('', 'nan', 'none', 'null') THEN NULL
-             ELSE TRY_TO_DOUBLE("effortAllocation_totalEffort"::VARCHAR) END AS total_effort_min,
-        CASE WHEN LOWER(TRIM("totalEffortMinutes"::VARCHAR)) IN ('', 'nan', 'none', 'null') THEN NULL
-             ELSE TRY_TO_DOUBLE("totalEffortMinutes"::VARCHAR) END AS owner_total_min,
-        CASE WHEN LOWER(TRIM("owner_effortMinutes_per_day"::VARCHAR)) IN ('', 'nan', 'none', 'null') THEN NULL
-             ELSE TRY_TO_DOUBLE("owner_effortMinutes_per_day"::VARCHAR) END AS owner_day_min
-    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-    WHERE NULLIF(TRIM("key"), '') IS NOT NULL
-      AND "key" NOT IN (SELECT k FROM folder_keys)
-)
-SELECT '0. snapshot: ' || MAX("Data refresh") AS check_name, NULL AS value
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-UNION ALL
-SELECT '1. CORRECT: totalEffort once per task (hours)', ROUND(SUM(t) / 60, 2)
-FROM (SELECT "key", MAX(total_effort_min) AS t FROM rows_ GROUP BY "key")
-UNION ALL
-SELECT '2. allocated: per-day minutes once per task/owner/day (hours)', ROUND(SUM(m) / 60, 2)
-FROM (SELECT "key", "Owner_userid", "owner_dailyAllocation_date", MAX(owner_day_min) AS m
-      FROM rows_ WHERE owner_day_min IS NOT NULL GROUP BY 1, 2, 3)
-UNION ALL
-SELECT '3. WRONG: totalEffort added across rows (hours)', ROUND(SUM(total_effort_min) / 60, 2) FROM rows_
-UNION ALL
-SELECT '4. WRONG: totalEffortMinutes added across rows (hours)', ROUND(SUM(owner_total_min) / 60, 2) FROM rows_
-UNION ALL
-SELECT '5. WRONG: owner_effortMinutes_per_day added across rows (hours)', ROUND(SUM(owner_day_min) / 60, 2) FROM rows_
-UNION ALL
-SELECT '6. tasks with conflicting totalEffort (must be 0)', COUNT(*)
-FROM (SELECT "key" FROM rows_ WHERE total_effort_min IS NOT NULL
-      GROUP BY "key" HAVING COUNT(DISTINCT total_effort_min) > 1)
-UNION ALL
-SELECT '7. tasks (distinct)', COUNT(DISTINCT "key") FROM rows_
-ORDER BY check_name;
-
-
-
-
-
-SET akash_cutoff = 'PASTE_AKASH_SNAPSHOT_TIME_HERE';
-
-WITH folder_keys AS (
+folder_keys AS (
     SELECT DISTINCT "key" AS k
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
     WHERE "key" = "id" AND "key" IS NOT NULL
@@ -65,19 +22,20 @@ per_task AS (
     GROUP BY "key"
 )
 SELECT
+    c.ts                                              AS akash_cutoff_parsed,
     CASE
-        WHEN created_at IS NULL                          THEN '4. no created date'
-        WHEN created_at > TO_TIMESTAMP_TZ($akash_cutoff) THEN '1. created after Akash snapshot (timing)'
-        WHEN updated_at > TO_TIMESTAMP_TZ($akash_cutoff) THEN '2. existed, changed since (maybe timing)'
-        ELSE                                                  '3. unchanged since Akash snapshot'
-    END                                             AS timing_bucket,
-    COUNT(*)                                        AS tasks,
-    SUM(CASE WHEN effort_min > 0 THEN 1 ELSE 0 END) AS tasks_with_effort,
-    ROUND(COALESCE(SUM(effort_min), 0) / 60, 2)     AS effort_hours
-FROM per_task
-GROUP BY 1
-ORDER BY 1;
-
+        WHEN p.created_at IS NULL THEN '4. no created date'
+        WHEN p.created_at > c.ts  THEN '1. created after Akash snapshot (timing)'
+        WHEN p.updated_at > c.ts  THEN '2. existed, changed since (maybe timing)'
+        ELSE                           '3. unchanged since Akash snapshot'
+    END                                               AS timing_bucket,
+    COUNT(*)                                          AS tasks,
+    SUM(CASE WHEN p.effort_min > 0 THEN 1 ELSE 0 END) AS tasks_with_effort,
+    ROUND(COALESCE(SUM(p.effort_min), 0) / 60, 2)     AS effort_hours
+FROM per_task p
+CROSS JOIN cutoff c
+GROUP BY 1, 2
+ORDER BY 2;
 
 
 
@@ -86,19 +44,23 @@ WITH folder_keys AS (
     SELECT DISTINCT "key" AS k
     FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
     WHERE "key" = "id" AND "key" IS NOT NULL
+),
+per_task AS (
+    SELECT
+        "key",
+        MAX(CASE WHEN LOWER(TRIM("effortAllocation_totalEffort"::VARCHAR)) IN ('', 'nan', 'none', 'null') THEN NULL
+                 ELSE TRY_TO_DOUBLE("effortAllocation_totalEffort"::VARCHAR) END) AS effort_min
+    FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
+    WHERE NULLIF(TRIM("key"), '') IS NOT NULL
+      AND "key" NOT IN (SELECT k FROM folder_keys)
+    GROUP BY "key"
 )
 SELECT
-    "key"                                                                     AS task_id,
-    LISTAGG(DISTINCT NULLIF(TRIM("id"), ''), '|')
-        WITHIN GROUP (ORDER BY NULLIF(TRIM("id"), ''))                        AS folder_ids,
-    COUNT(DISTINCT NULLIF(TRIM("id"), ''))                                    AS folder_count,
-    MAX(TRY_TO_TIMESTAMP_TZ("createdDate"::VARCHAR))                          AS created_at,
-    MAX(TRY_TO_TIMESTAMP_TZ("updatedDate"::VARCHAR))                          AS updated_at,
-    MAX(TRY_TO_TIMESTAMP_TZ("completedDate"::VARCHAR))                        AS completed_at,
-    MAX(CASE WHEN LOWER(TRIM("effortAllocation_totalEffort"::VARCHAR)) IN ('', 'nan', 'none', 'null') THEN NULL
-             ELSE TRY_TO_DOUBLE("effortAllocation_totalEffort"::VARCHAR) END) AS effort_min
-FROM GBI_RETAIL_BAP_DB.ASO_OPS_WSA_SNDBX_BIZ_APP."Wrike_STG"
-WHERE NULLIF(TRIM("key"), '') IS NOT NULL
-  AND "key" NOT IN (SELECT k FROM folder_keys)
-GROUP BY "key"
-ORDER BY "key";
+    COUNT(*)                                                              AS tasks_with_effort,
+    ROUND(MEDIAN(effort_min) / 60, 2)                                     AS median_hours,
+    ROUND(APPROX_PERCENTILE(effort_min, 0.99) / 60, 2)                    AS p99_hours,
+    ROUND(MAX(effort_min) / 60, 2)                                        AS max_hours,
+    SUM(CASE WHEN effort_min >= 60000 THEN 1 ELSE 0 END)                  AS tasks_over_1000h,
+    ROUND(SUM(CASE WHEN effort_min >= 60000 THEN effort_min END) / 60, 2) AS hours_in_tasks_over_1000h
+FROM per_task
+WHERE effort_min > 0;
