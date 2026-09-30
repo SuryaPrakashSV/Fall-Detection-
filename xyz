@@ -1,18 +1,35 @@
 cd ~/Desktop/wrike-local-baseline
 python3 - <<'PY'
-import json
+import csv, json
 from pathlib import Path
 
 case = Path("output/aligned_comparison/20260930T054149_860457Z_surya")
-after = sorted(case.glob("reference_after_*"))[-1]
-before = json.loads((case / "frozen_scope.json").read_text())
-current = json.loads((after / "scope_at_start.json").read_text())
+after = case / "reference_after_20260930T132901_372661Z"
+old = json.loads((case / "frozen_scope.json").read_text())
+new = json.loads((after / "scope_at_start.json").read_text())
+added = set(new["folder_ids"]) - set(old["folder_ids"])
+manifest = json.loads((after / "manifest.json").read_text())
 
-print("AFTER capture:", after.name)
-for field in ("root_ids", "folder_ids"):
-    old, new = set(before[field]), set(current[field])
-    added, removed = sorted(new - old), sorted(old - new)
-    print(f"\n{field}: before={len(old)}, after={len(new)}")
-    print(f"Added ({len(added)}):", added[:30])
-    print(f"Removed ({len(removed)}):", removed[:30])
-PYs
+for request in manifest["requests"]:
+    if request.get("status") != 200:
+        continue
+    body = json.loads((after / request["response_file"]).read_text())
+    if body.get("kind") != "folderTree":
+        continue
+    for folder in body["data"]:
+        if folder["id"] in added:
+            fields = ("id", "title", "scope", "createdDate", "updatedDate", "childIds")
+            print("Added folder:", {k: folder[k] for k in fields if k in folder})
+            print("Marked as project:", "project" in folder)
+    break
+
+path = Path("output/local_validation/20260930T132340_154686Z/wrike_local_full.csv")
+columns = ("id", "parent_folder_id", "child_folder_id",
+           "grandchild_folder_id", "baby_folder_id", "grandbaby_folder_id")
+matches = 0
+with path.open(newline="", encoding="utf-8-sig") as f:
+    for row in csv.DictReader(f):
+        if any(row.get(c, "").strip() in added for c in columns):
+            matches += 1
+print("CSV rows referencing the added folder:", matches)
+PY
