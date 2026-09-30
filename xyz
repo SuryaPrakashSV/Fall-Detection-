@@ -1,26 +1,23 @@
 cd ~/Desktop/wrike-local-baseline
 python3 - <<'PY'
 import ast
-import textwrap
 from pathlib import Path
 
 tree = ast.parse(Path("Wrike_Data_local_validation.py").read_text())
-operations = {
-    "merge", "join", "concat", "dropna", "drop_duplicates",
-    "query", "groupby", "pivot", "pivot_table", "explode"
-}
-
-for node in sorted(ast.walk(tree), key=lambda n: getattr(n, "lineno", 0)):
-    if not isinstance(node, ast.Assign) or node.lineno < 1450:
-        continue
-    targets = " ".join(ast.unparse(t) for t in node.targets)
-    relevant = "df_" in targets or any(
+for n in sorted(ast.walk(tree), key=lambda x: getattr(x, "lineno", 0)):
+    if not (
         isinstance(n, ast.Call)
+        and n.lineno >= 1450
         and isinstance(n.func, ast.Attribute)
-        and n.func.attr in operations
-        for n in ast.walk(node.value)
-    )
-    if relevant:
-        print(f"\nLine {node.lineno}:")
-        print(textwrap.fill(ast.unparse(node), width=110))
+        and n.func.attr in {"merge", "join"}
+    ):
+        continue
+    parts = [ast.unparse(a) for a in n.args[:2]]
+    parts += [
+        f"{k.arg}={ast.unparse(k.value)}"
+        for k in n.keywords
+        if k.arg in {"how", "on", "left_on", "right_on",
+                     "left_index", "right_index"}
+    ]
+    print(f"Line {n.lineno}: {ast.unparse(n.func)}({', '.join(parts)})")
 PY
