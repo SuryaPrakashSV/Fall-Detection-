@@ -1,2 +1,27 @@
+python3 - <<'PY'
+import json
+from pathlib import Path
 
-nl -ba Wrike_Data_local_validation.py | sed -n '145,169p'
+root = Path.home() / "Desktop/wrike-local-baseline"
+files = sorted(root.glob(
+    "output/remaining_196_access/*/task_access_results.json"
+))
+if not files:
+    raise SystemExit("No saved task access results found.")
+
+data = json.loads(files[-1].read_text())
+print("Source:", files[-1])
+count = 0
+
+for task_id, item in data["targets"].items():
+    a = data["results"]["Surya"].get(task_id, {})
+    b = data["results"]["Akash"].get(task_id, {})
+    if a.get("api_scope") == b.get("api_scope") == "RbTask":
+        print("\nID:", task_id)
+        print("Title:", a.get("api_title"))
+        print("Scope under both tokens:", a["api_scope"])
+        print("Saved hours:", item["saved_hours"])
+        count += 1
+        if count == 3:
+            break
+PY
